@@ -1,0 +1,87 @@
+# Personaplex MBG — VapGPT Backchannel (pretrained weights)
+# VapGPTBackchannelModule runs INSIDE LMModel, receiving z_s [B,T,lm_dim].
+# proj_user / proj_agent project z_s into two pseudo-speaker streams for GPTStereo.
+# ar_channel / ar / vap_head are loaded from the pretrained VapGPT checkpoint.
+#
+# 실행: torchrun --nproc_per_node=<N_GPUS> train.py config/ami_vap_pretrained.yaml
+
+data:
+  train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
+  shuffle: true
+  eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
+  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
+
+run_dir: ./output/personaplex_ami_vap_gpt_voice
+overwrite_run_dir: true
+
+# ── Personaplex 모델 경로 ────────────────────────────────────────────────
+moshi_paths:
+  hf_repo_id: nvidia/personaplex-7b-v1
+  # 로컬 경로 지정 시 HuggingFace 다운로드 생략:
+  # moshi_path:     /path/to/model.safetensors
+  # mimi_path:      /path/to/tokenizer-e351c8d8-checkpoint125.safetensors
+  # tokenizer_path: /path/to/tokenizer_spm_32k_3.model
+
+# ── W&B 로깅 ─────────────────────────────────────────────────────────────
+wandb:
+  project: "personaplex_finetune"
+  run_name: "ami_vap_gpt_voice"
+
+# ── 학습 설정 ─────────────────────────────────────────────────────────────
+max_steps: 50000
+batch_size: 4
+num_microbatches: 4
+duration_sec: 10
+
+# Full finetuning (LM + VapGPTBackchannelModule 전체 학습)
+lora:
+  enable: true
+  rank: 64
+  scaling: 2.0
+full_finetuning: false
+
+param_dtype: bfloat16
+gradient_checkpointing: true
+
+# ── 로깅 / 체크포인트 / 평가 ─────────────────────────────────────────────
+log_freq: 10
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 3
+save_adapters: true
+do_eval: true
+eval_freq: 100
+
+# ── 옵티마이저 ────────────────────────────────────────────────────────────
+optim:
+  lr: 1.0e-5        # full finetuning + pretrained VAP head → 낮은 lr 권장
+  weight_decay: 0.1
+  pct_start: 0.05
+
+# ── 손실 가중치 ───────────────────────────────────────────────────────────
+text_padding_weight: 0.5
+first_codebook_weight_multiplier: 1.0
+
+# ── Backchannel VAP (VapGPT, LM 내부) ────────────────────────────────────
+backchannel:
+  enable: true
+  module_type: vap_gpt                  # VapGPTBackchannelModule 사용  # option: mlp
+  pad_token_id: 3                       # existing_text_padding_id from loaders._lm_kwargs
+  epad_token_id: 0                      # end_of_text_padding_id (hardcoded in LMModel)
+
+  # VAP 공통 설정 (MLP head 크기 / Gumbel 스케줄)
+  vap_dim: 256                          # VapGPT GPT 레이어 hidden dim (체크포인트와 일치)
+  bc_hidden: 512                        # BC gate MLP hidden size
+  gumbel_temp_init: 1.0
+  gumbel_temp_min: 0.5
+  gumbel_anneal_rate: 0.0001
+  vap_loss_weight: 0.1                  # VAP 보조 손실 가중치
+
+  # VapGPT 아키텍처 (사전학습 체크포인트와 반드시 일치해야 함)
+  vap_gpt_repo_path: /home2/s20235100/Conversational-AI/VoiceActivityProjection
+  vap_gpt_checkpoint: /home2/s20235100/Conversational-AI/VoiceActivityProjection/example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt
+  vap_gpt_dim: 256
+  vap_gpt_channel_layers: 1
+  vap_gpt_cross_layers: 3
+  vap_gpt_num_heads: 4
+  vap_gpt_dropout: 0.1

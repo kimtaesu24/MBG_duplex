@@ -1,0 +1,70 @@
+# Personaplex MBG Finetuning 설정 예시
+# 실행: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml
+
+data:
+  # JSONL 파일 또는 JSONL을 포함한 디렉토리 경로
+  # 각 라인: {"path": "/path/to/audio.wav", "duration": 10.0}
+  # 오디오 파일과 같은 경로에 .json 파일 (word-alignment 정보)이 있어야 합니다.
+  train_data: ./daily-talk-contiguous/dailytalk.jsonl
+  shuffle: false
+  # eval_data: /path/to/your/eval.jsonl  # 평가 데이터 (선택)
+
+# 출력 디렉토리 (존재하면 안 됨, 또는 overwrite_run_dir: true 설정)
+run_dir: ./personaplex_testrun_lora
+overwrite_run_dir: true
+
+# ── Personaplex 모델 경로 ────────────────────────────────────────────────
+moshi_paths:
+  hf_repo_id: nvidia/personaplex-7b-v1
+  # 로컬 경로 지정 시 HuggingFace 다운로드 생략:
+  # moshi_path:     /path/to/model.safetensors
+  # mimi_path:      /path/to/tokenizer-e351c8d8-checkpoint125.safetensors
+  # tokenizer_path: /path/to/tokenizer_spm_32k_3.model
+
+# ── W&B 로깅 ─────────────────────────────────────────────────────────────
+wandb:
+  project: null           # null이면 wandb 미사용
+  # project: "personaplex_finetune"
+  # run_name: "experiment_01"
+
+# ── 학습 설정 ──────────────────────────────────────────────────────────
+max_steps: 100000
+batch_size: 64
+num_microbatches: 4       # 그래디언트 누적 횟수
+duration_sec: 15         # 학습 세그먼트 길이(초) - OOM 방지를 위해 단축
+
+# Personaplex: LoRA 파인튜닝 지원.
+lora:
+  enable: true
+  rank: 64
+  scaling: 2.0
+full_finetuning: false
+
+# ── Mixed precision ──────────────────────────────────────────────────────
+param_dtype: bfloat16
+
+# ── 그래디언트 체크포인팅 (메모리 절약) ──────────────────────────────────
+gradient_checkpointing: true
+
+# ── 로깅 ─────────────────────────────────────────────────────────────────
+log_freq: 10
+
+# ── 체크포인트 ────────────────────────────────────────────────────────────
+do_ckpt: true
+ckpt_freq: 100            # 0이면 마지막 스텝에만 저장
+num_ckpt_keep: 3
+save_adapters: true
+
+# ── 평가 ─────────────────────────────────────────────────────────────────
+do_eval: false
+eval_freq: 0
+
+# ── 옵티마이저 ────────────────────────────────────────────────────────────
+optim:
+  lr: 1.0e-5              # full finetuning은 낮은 lr 권장 (1e-5~5e-5)
+  weight_decay: 0.1
+  pct_start: 0.05
+
+# ── 손실 가중치 ───────────────────────────────────────────────────────────
+text_padding_weight: 0.5
+first_codebook_weight_multiplier: 1.0

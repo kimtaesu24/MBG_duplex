@@ -1,0 +1,137 @@
+# Personaplex MBG — VapGPT Backchannel + Face Generation (end-to-end)
+#
+# Face module: CausalSoftVQContinuousTransformer trained on AMI+DualTalk.
+# Training uses teacher-forcing; inference uses autoregressive streaming.
+# Inputs to the face module:
+#   - audio_feat: Mimi latent features decoded from agent audio tokens [B, T, 512] @ 12.5 fps
+#   - llm_feat:   Main transformer embedding z [B, T, 4096] @ 12.5 fps
+# Both are internally upsampled 2x inside the face module to match 25 fps face output.
+#
+# 실행: torchrun --nproc_per_node=<N_GPUS> train.py config/ami_vap_gpt_voice_face.yaml
+
+data:
+  train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
+  shuffle: true
+  eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
+  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
+
+run_dir: ./output/personaplex_ami_vap_gpt_voice_face
+overwrite_run_dir: true
+
+# ── Personaplex 모델 경로 ────────────────────────────────────────────────
+moshi_paths:
+  hf_repo_id: nvidia/personaplex-7b-v1
+
+# ── W&B 로깅 ─────────────────────────────────────────────────────────────
+wandb:
+  project: "personaplex_finetune"
+  run_name: "ami_vap_gpt_voice_face"
+
+# ── 학습 설정 ─────────────────────────────────────────────────────────────
+max_steps: 50000
+batch_size: 4
+num_microbatches: 4
+duration_sec: 10
+
+# Full finetuning (LM + VapGPT + FaceModule 전체 학습)
+lora:
+  enable: true
+  rank: 64
+  scaling: 2.0
+full_finetuning: false
+
+param_dtype: bfloat16
+gradient_checkpointing: true
+
+# ── 로깅 / 체크포인트 / 평가 ─────────────────────────────────────────────
+log_freq: 10
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 3
+save_adapters: true
+do_eval: true
+eval_freq: 100
+
+# ── 옵티마이저 ────────────────────────────────────────────────────────────
+optim:
+  lr: 1.0e-5
+  weight_decay: 0.1
+  pct_start: 0.05
+
+# ── 손실 가중치 ───────────────────────────────────────────────────────────
+text_padding_weight: 0.5
+first_codebook_weight_multiplier: 1.0
+
+# ── Backchannel VAP (VapGPT, LM 내부) ────────────────────────────────────
+backchannel:
+  enable: true
+  module_type: vap_gpt
+  pad_token_id: 3
+  epad_token_id: 0
+
+  vap_dim: 256
+  bc_hidden: 512
+  gumbel_temp_init: 1.0
+  gumbel_temp_min: 0.5
+  gumbel_anneal_rate: 0.0001
+  vap_loss_weight: 0.1
+
+  vap_gpt_repo_path: /home2/s20235100/Conversational-AI/VoiceActivityProjection
+  vap_gpt_checkpoint: /home2/s20235100/Conversational-AI/VoiceActivityProjection/example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt
+  vap_gpt_dim: 256
+  vap_gpt_channel_layers: 1
+  vap_gpt_cross_layers: 3
+  vap_gpt_num_heads: 4
+  vap_gpt_dropout: 0.1
+
+# ── Face Generation Module ────────────────────────────────────────────────
+# CausalSoftVQContinuousTransformer — end-to-end trained alongside the LM.
+# Training: teacher-forced (gt 3DMM shifted by 1 frame as prev_motion input).
+# Inference: autoregressive streaming via model.generate().
+face_gen:
+  enable: true
+
+  # Pretrained face model checkpoint (CausalSoftVQContinuousTransformer)
+  ckpt_path: /home6/duplex/personaplex/moshi/moshi/ARTalk/train_code/outputs/stream_talkingface_model_trained/checkpoint_epoch_1200.ckpt
+
+  # Architecture — read from ckpt["args"] when available; values below are fallbacks.
+  hidden_dim: 512
+  layers: 6
+  heads: 8
+  code_dim: 32
+  prior_warmup_frames: 10
+
+  # Autoregressive context window for streaming inference (face frames @ 25 fps)
+  max_context_frames: 25
+
+  # ── ARTalkCodec (VAE) — frozen, used only for z_target computation ──────
+  codec_ckpt_path: /home6/duplex/VAE_ami_dualtalk/checkpoints/iter_100000.pt
+  codec_stats_path: /home6/duplex/dataset/artalk_mimi54_stats.json
+  codec_hidden_dim: 512
+  codec_depth: 8
+  codec_heads: 8
+  # ── FLAME / 3DMM training data ────────────────────────────────────────
+  # Root dir: {flame_root}/{speaker}/{split}/{stem}_{speaker}.npy
+  # speaker ∈ {"bc", "ut"}, split ∈ {"train", "valid", "test"}
+  flame_root: /home6/duplex/dataset/ami_flame
+  flame_speaker: bc   # agent (moshi) = backchannel speaker in AMI
+
+  # ── Combined face loss weight ──────────────────────────────────────────
+  # Multiplied onto the sum of all face sub-losses below.
+  face_loss_weight: 1.0
+
+  # Sub-loss weights — match softvq_continuous_online_train.py defaults.
+  motion_weight: 1.0       # L1(pred_motion, gt)
+  prior_weight: 0.5        # L1(prior_motion, gt)
+  z_weight: 0.2            # MSE(z_pred, z_target)
+  z_bce_weight: 0.1        # BCE on z_pred bits vs z_target bits
+  jaw_weight: 2.0          # extra L1 weight on jaw dim [50:51]
+  vel_weight: 0.5          # MSE on frame-to-frame velocity
+  reg_weight: 0.02         # regularisation on delta and residual
+  gate_weight: 1.0         # gate target MSE
+  gate_target_expr: 0.45
+  gate_target_jaw: 0.25
+  gate_target_neck: 0.65
+  gate_loss_expr_weight: 4.0
+  gate_loss_jaw_weight: 4.0
+  gate_loss_neck_weight: 1.0

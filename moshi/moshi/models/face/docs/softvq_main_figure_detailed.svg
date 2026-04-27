@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1320" viewBox="0 0 2400 1320">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M1,1 L9,5 L1,9 Z" fill="#1f2933"/>
+    </marker>
+    <style>
+      .bg{fill:#fbfbf8}.panel{fill:#fff;stroke-width:2}.box{fill:#fff;stroke:#232a31;stroke-width:1.4;rx:8;ry:8}
+      .input{stroke:#6f4aa0}.audio{stroke:#1d5fa8}.motion{stroke:#3c873f}.dyn{stroke:#dd7d2d}.out{stroke:#7d59b0}.loss{stroke:#bd4a4a}
+      .inputFill{fill:#fbf7ff}.audioFill{fill:#f4f9ff}.motionFill{fill:#f5fff3}.dynFill{fill:#fff9f2}.outFill{fill:#fbf8ff}.lossFill{fill:#fff4f4}
+      .greenFill{fill:#f2fbef}.blueFill{fill:#f0f7ff}.orangeFill{fill:#fff3e8}.purpleFill{fill:#f7f1ff}.redFill{fill:#fff0f0}.grayFill{fill:#f6f7f8}
+      .line{fill:none;stroke:#1f2933;stroke-width:2.2;marker-end:url(#arrow)}.thin{fill:none;stroke:#1f2933;stroke-width:1.5;marker-end:url(#arrow)}
+      .dash{fill:none;stroke:#7b8490;stroke-width:1.7;stroke-dasharray:8 7;marker-end:url(#arrow)}.nodash{fill:none;stroke:#1f2933;stroke-width:2}
+      .title{font:700 29px Arial,Helvetica,sans-serif;fill:#1c2630}.sec{font:700 31px Arial,Helvetica,sans-serif}.label{font:700 18px Arial,Helvetica,sans-serif;fill:#111827}
+      .txt{font:16px Arial,Helvetica,sans-serif;fill:#111827}.small{font:14px Arial,Helvetica,sans-serif;fill:#27313f}.tiny{font:12px Arial,Helvetica,sans-serif;fill:#3b4552}.math{font:700 15px Arial,Helvetica,sans-serif;fill:#111827}
+    </style>
+  </defs>
+  <rect class="bg" width="2400" height="1320"/>
+
+  <!-- panels -->
+  <rect class="panel input inputFill" x="12" y="12" width="260" height="1055" rx="10"/>
+  <text class="sec" x="78" y="55" fill="#6f4aa0">1. INPUTS</text>
+
+  <rect class="panel audio audioFill" x="338" y="12" width="1018" height="520" rx="10"/>
+  <text class="sec" x="720" y="55" fill="#1d5fa8">2. AUDIO STREAM</text>
+
+  <rect class="panel motion motionFill" x="1370" y="12" width="1018" height="440" rx="10"/>
+  <text class="sec" x="1710" y="55" fill="#3c873f">3. MOTION STREAM</text>
+
+  <rect class="panel dyn dynFill" x="550" y="610" width="1460" height="575" rx="10"/>
+  <text class="sec" x="1087" y="653" fill="#dd7d2d">4. DYNAMICS + FUSION</text>
+
+  <rect class="panel out outFill" x="2070" y="515" width="318" height="336" rx="10"/>
+  <text class="sec" x="2160" y="558" fill="#7d59b0">5. OUTPUT</text>
+
+  <rect class="panel out outFill" x="2070" y="880" width="318" height="305" rx="10"/>
+  <text class="sec" x="2140" y="923" fill="#7d59b0">6. TRAINING LOSSES</text>
+
+  <!-- input boxes -->
+  <rect class="box input inputFill" x="27" y="68" width="232" height="210"/>
+  <text class="label" x="72" y="102">Streaming Mimi</text><text class="label" x="81" y="130">Audio Feature</text>
+  <text class="txt" x="63" y="166">[B, T_audio, 512]</text>
+  <path d="M45 222 L50 210 L55 232 L60 202 L65 238 L70 213 L75 226 L80 218 L85 236 L90 198 L95 240 L100 214 L105 221 L110 205 L115 235 L120 219 L125 225 L130 210 L135 237 L140 204 L145 233 L150 216 L155 221 L160 211 L165 235 L170 207 L175 228 L180 215 L185 225 L190 208 L195 236 L200 214 L205 224 L210 213 L215 230 L220 202 L225 238" stroke="#2b7fff" stroke-width="2.3" fill="none"/>
+
+  <rect class="box input inputFill" x="27" y="298" width="232" height="215"/>
+  <text class="label" x="83" y="340">LLM Feature</text>
+  <text class="txt" x="50" y="376">[B, T_audio, 4096]</text>
+  <text class="txt" x="76" y="410">currently zero</text>
+  <text class="txt" x="69" y="439">dummy in dataset</text>
+  <rect x="46" y="474" width="22" height="25" rx="4" fill="#d8c8f2" stroke="#7d59b0"/><rect x="75" y="474" width="22" height="25" rx="4" fill="#d8c8f2" stroke="#7d59b0"/><rect x="104" y="474" width="22" height="25" rx="4" fill="#d8c8f2" stroke="#7d59b0"/>
+  <text class="label" x="142" y="493">...</text>
+  <rect x="190" y="474" width="22" height="25" rx="4" fill="#d8c8f2" stroke="#7d59b0"/><rect x="219" y="474" width="22" height="25" rx="4" fill="#d8c8f2" stroke="#7d59b0"/>
+
+  <rect class="box input inputFill" x="27" y="555" width="232" height="190"/>
+  <text class="label" x="60" y="600">External Inputs Only</text>
+  <text class="txt" x="48" y="640">No ground-truth motion is</text>
+  <text class="txt" x="55" y="670">fed as an external input.</text>
+  <text class="txt" x="51" y="710">Motion state is created</text>
+  <text class="txt" x="69" y="737">inside the model.</text>
+
+  <text class="txt" x="16" y="1105">B: batch size</text><text class="txt" x="16" y="1134">T_audio: audio token length</text><text class="txt" x="16" y="1163">T_face: FLAME frame length</text><text class="txt" x="16" y="1192">H: hidden dimension</text>
+
+  <!-- audio stream boxes -->
+  <rect class="box audio blueFill" x="365" y="95" width="160" height="90"/><text class="label" x="404" y="128">audio_feat</text><text class="txt" x="386" y="160">[B, T_audio, 512]</text>
+  <path class="line" d="M259 173 C295 173 320 140 365 140"/>
+  <rect class="box audio blueFill" x="650" y="88" width="130" height="95"/><text class="label" x="680" y="119">audio_proj</text><text class="txt" x="690" y="150">Linear</text><text class="txt" x="681" y="174">512 → H</text>
+  <text class="txt" x="558" y="118">repeat</text><text class="txt" x="548" y="146">interleave</text><text class="txt" x="584" y="178">×2</text>
+  <line class="line" x1="525" y1="140" x2="650" y2="136"/>
+
+  <rect class="box audio blueFill" x="365" y="235" width="160" height="90"/><text class="label" x="411" y="268">llm_feat</text><text class="txt" x="381" y="300">[B, T_audio, 4096]</text>
+  <path class="line" d="M259 405 C305 405 318 280 365 280"/>
+  <rect class="box audio blueFill" x="650" y="228" width="130" height="95"/><text class="label" x="685" y="259">llm_proj</text><text class="txt" x="690" y="290">Linear</text><text class="txt" x="676" y="314">4096 → H</text>
+  <text class="txt" x="558" y="258">repeat</text><text class="txt" x="548" y="286">interleave</text><text class="txt" x="584" y="318">×2</text>
+  <line class="line" x1="525" y1="280" x2="650" y2="276"/>
+
+  <rect class="box audio blueFill" x="850" y="88" width="120" height="110"/><text class="label" x="878" y="123">Pos + Phase</text><text class="txt" x="875" y="151">Embedding</text><text class="txt" x="865" y="181">[B,T_face,H]</text>
+  <circle cx="910" cy="278" r="20" fill="#fff" stroke="#1f2933" stroke-width="1.5"/><text class="label" x="903" y="285">+</text>
+  <line class="line" x1="780" y1="136" x2="820" y2="136"/><path class="nodash" d="M820 136 L820 278 L890 278"/><line class="line" x1="780" y1="276" x2="890" y2="278"/><line class="line" x1="910" y1="198" x2="910" y2="258"/>
+
+  <rect class="box audio blueFill" x="995" y="205" width="240" height="165"/>
+  <text class="label" x="1037" y="245">Causal Transformer Encoder</text><text class="txt" x="1060" y="278">(audio_encoder)</text><text class="txt" x="1060" y="313">L = 6, Hheads = 8</text>
+  <rect x="1020" y="318" width="190" height="28" fill="#86b4df" opacity=".65" rx="3"/><rect x="1030" y="308" width="190" height="28" fill="#86b4df" opacity=".65" rx="3"/><rect x="1040" y="298" width="190" height="28" fill="#86b4df" opacity=".65" rx="3"/><text class="label" x="1105" y="334">...</text>
+  <line class="line" x1="930" y1="278" x2="995" y2="288"/>
+
+  <rect class="box audio blueFill" x="1270" y="235" width="60" height="120"/><text class="txt" x="1284" y="278">Layer</text><text class="txt" x="1284" y="307">Norm</text>
+  <line class="line" x1="1235" y1="288" x2="1270" y2="295"/>
+
+  <rect class="box greenFill" x="720" y="430" width="165" height="90"/><text class="label" x="768" y="460">z_head</text><text class="txt" x="770" y="489">Linear</text><text class="txt" x="758" y="514">H → code_dim</text>
+  <rect class="box orangeFill" x="1038" y="430" width="220" height="90"/><text class="label" x="1101" y="460">prior_head</text><text class="txt" x="1057" y="489">Linear → GELU → Linear</text><text class="txt" x="1085" y="514">(H + code_dim) → 54</text>
+  <line class="thin" x1="1300" y1="355" x2="1300" y2="390"/><path class="nodash" d="M1300 390 L805 390 L805 430"/><path class="nodash" d="M1300 390 L1148 390 L1148 430"/>
+  <rect class="box greenFill" x="720" y="535" width="165" height="60"/><text class="label" x="777" y="560">z latent</text><text class="txt" x="745" y="585">[B,T_face,code_dim]</text>
+  <rect class="box orangeFill" x="1038" y="535" width="220" height="60"/><text class="label" x="1092" y="560">prior_motion (54D)</text><text class="txt" x="1094" y="585">[B,T_face,54]</text>
+  <line class="thin" x1="805" y1="520" x2="805" y2="535"/><line class="thin" x1="1148" y1="520" x2="1148" y2="535"/>
+
+  <!-- motion stream -->
+  <rect class="box motion greenFill" x="1405" y="160" width="190" height="245"/>
+  <text class="label" x="1468" y="190">concat</text>
+  <rect x="1420" y="215" width="160" height="80" fill="#f3eafa" stroke="#7d59b0" rx="5"/><text class="txt" x="1468" y="246">Motion State</text><text class="txt" x="1434" y="273">train: shifted GT, infer: pred</text><text class="txt" x="1449" y="305">[B,T_face,54]</text>
+  <rect x="1420" y="310" width="160" height="80" fill="#edf7ff" stroke="#1d5fa8" rx="5"/><text class="txt" x="1460" y="343">Audio Hidden</text><text class="txt" x="1494" y="371">(H)</text><text class="txt" x="1447" y="395">[B,T_face,H]</text>
+
+  <rect class="box motion greenFill" x="1630" y="245" width="165" height="85"/><text class="label" x="1676" y="278">motion_proj</text><text class="txt" x="1679" y="309">(54 + H) → H</text>
+  <rect class="box motion greenFill" x="1810" y="82" width="145" height="105"/><text class="label" x="1843" y="113">Pos + Phase</text><text class="txt" x="1847" y="143">Embedding</text><text class="txt" x="1831" y="174">[B,T_face,H]</text>
+  <circle cx="1882" cy="286" r="20" fill="#fff" stroke="#1f2933" stroke-width="1.5"/><text class="label" x="1875" y="293">+</text>
+  <rect class="box motion greenFill" x="1988" y="167" width="275" height="175"/>
+  <text class="label" x="2035" y="210">Causal Transformer Encoder</text><text class="txt" x="2077" y="244">(motion_encoder)</text><text class="txt" x="2068" y="278">L = 6, Hheads = 8</text>
+  <rect x="2015" y="291" width="210" height="31" fill="#7fbd74" opacity=".7" rx="3"/><rect x="2028" y="280" width="210" height="31" fill="#7fbd74" opacity=".7" rx="3"/><rect x="2041" y="269" width="210" height="31" fill="#7fbd74" opacity=".7" rx="3"/><text class="label" x="2115" y="308">...</text>
+  <rect class="box motion greenFill" x="2298" y="218" width="60" height="110"/><text class="txt" x="2312" y="260">Layer</text><text class="txt" x="2312" y="289">Norm</text>
+  <line class="line" x1="1595" y1="285" x2="1630" y2="287"/><line class="line" x1="1795" y1="287" x2="1862" y2="286"/><line class="line" x1="1882" y1="187" x2="1882" y2="266"/><line class="line" x1="1902" y1="286" x2="1988" y2="255"/><line class="line" x1="2263" y1="255" x2="2298" y2="273"/>
+  <path class="line" d="M1330 295 L1370 295 L1370 238 L1405 238"/>
+  <path class="dash" d="M2229 824 C2229 900 2070 890 1958 835 C1805 760 1625 610 1500 295"/>
+  <path class="dash" d="M2229 824 C2229 1240 780 1260 655 917"/>
+
+  <!-- dynamics -->
+  <rect class="box dyn greenFill" x="570" y="645" width="170" height="85"/><text class="label" x="630" y="674">motion_h</text><text class="txt" x="598" y="700">motion hidden</text><text class="txt" x="610" y="724">[B,T_face,H]</text>
+  <rect class="box dyn blueFill" x="570" y="745" width="170" height="85"/><text class="label" x="628" y="774">audio_h</text><text class="txt" x="613" y="800">= audio hidden</text><text class="txt" x="610" y="824">[B,T_face,H]</text>
+  <rect class="box dyn purpleFill" x="570" y="845" width="170" height="72"/><text class="label" x="609" y="874">prev_motion</text><text class="txt" x="617" y="902">[B,T_face,54]</text>
+  <rect class="box dyn orangeFill" x="570" y="930" width="170" height="72"/><text class="label" x="612" y="959">prior_motion</text><text class="txt" x="617" y="987">[B,T_face,54]</text>
+
+  <circle cx="787" cy="738" r="22" fill="#fff" stroke="#1f2933" stroke-width="1.4"/><text class="tiny" x="770" y="743">concat</text>
+  <rect class="box dyn orangeFill" x="855" y="680" width="145" height="80"/><text class="label" x="899" y="710">delta_head</text><text class="txt" x="895" y="739">2H → 54</text>
+  <rect class="box dyn redFill" x="865" y="785" width="145" height="80"/><text class="label" x="897" y="815">residual_head</text><text class="txt" x="905" y="844">2H → 54</text>
+  <rect class="box dyn redFill" x="1050" y="680" width="135" height="80"/><text class="label" x="1085" y="709">scale / tanh</text><text class="txt" x="1074" y="736">expr .08</text><text class="txt" x="1078" y="758">jaw .03</text>
+  <rect class="box dyn redFill" x="1050" y="785" width="135" height="80"/><text class="label" x="1085" y="814">scale / tanh</text><text class="txt" x="1074" y="841">expr .08</text><text class="txt" x="1078" y="863">jaw .03</text>
+  <rect class="box dyn purpleFill" x="1390" y="686" width="200" height="82"/><text class="label" x="1440" y="715">candidate_motion</text><text class="txt" x="1425" y="744">= prev_motion + delta</text><text class="txt" x="1438" y="765">[B,T_face,54]</text>
+  <line class="line" x1="740" y1="688" x2="765" y2="725"/><line class="line" x1="740" y1="788" x2="765" y2="751"/><line class="line" x1="809" y1="738" x2="855" y2="720"/><line class="line" x1="809" y1="738" x2="865" y2="825"/><line class="line" x1="1000" y1="720" x2="1050" y2="720"/><line class="line" x1="1010" y1="825" x2="1050" y2="825"/>
+  <path class="line" d="M1185 720 L1240 720 L1240 727 L1390 727"/><path class="thin" d="M740 881 L1260 881 L1260 745 L1390 745"/>
+
+  <circle cx="1702" cy="933" r="22" fill="#fff" stroke="#1f2933" stroke-width="1.5"/><text class="label" x="1695" y="940">×</text>
+  <circle cx="1960" cy="806" r="24" fill="#fff" stroke="#1f2933" stroke-width="1.5"/><text class="label" x="1953" y="813">+</text>
+
+  <circle cx="787" cy="985" r="22" fill="#fff" stroke="#1f2933" stroke-width="1.4"/><text class="tiny" x="770" y="990">concat</text>
+  <rect class="box dyn grayFill" x="845" y="925" width="220" height="150"/><text class="label" x="925" y="957">gate inputs</text><text class="txt" x="877" y="988">dyn_h = [motion_h,audio_h]</text><text class="txt" x="877" y="1018">prev, prior, candidate</text><text class="txt" x="877" y="1048">candidate - prior</text>
+  <rect class="box dyn orangeFill" x="1110" y="950" width="175" height="90"/><text class="label" x="1160" y="980">gate_head</text><text class="txt" x="1147" y="1011">Linear → GELU → Linear</text><text class="txt" x="1126" y="1035">(2H + 4×54) → 3</text>
+  <rect class="box dyn purpleFill" x="1330" y="925" width="130" height="130"/><text class="txt" x="1364" y="952">sigmoid</text><circle cx="1362" cy="983" r="15" fill="#ffdfe0" stroke="#bd4a4a"/><text class="txt" x="1387" y="990">g1 expr</text><circle cx="1362" cy="1020" r="15" fill="#ffefc7" stroke="#c78a2b"/><text class="txt" x="1387" y="1027">g2 jaw</text><circle cx="1362" cy="1057" r="15" fill="#dfefff" stroke="#4a86c5"/><text class="txt" x="1387" y="1064">g3 neck</text>
+  <rect class="box dyn grayFill" x="1500" y="930" width="205" height="95"/><text class="label" x="1547" y="958">expand to 54D</text><rect x="1520" y="985" width="20" height="42" fill="#ffaaaa" stroke="#bd4a4a"/><rect x="1545" y="985" width="20" height="42" fill="#ffaaaa" stroke="#bd4a4a"/><rect x="1570" y="985" width="20" height="42" fill="#ffaaaa" stroke="#bd4a4a"/><text class="label" x="1610" y="1012">...</text><rect x="1665" y="985" width="20" height="42" fill="#bcd8f5" stroke="#4a86c5"/><rect x="1690" y="985" width="20" height="42" fill="#bcd8f5" stroke="#4a86c5"/>
+  <rect class="box dyn grayFill" x="1500" y="1065" width="205" height="100"/><text class="label" x="1546" y="1095">warmup gate</text><text class="txt" x="1525" y="1123">(first prior_warmup_frames)</text><path d="M1535 1142 C1560 1142 1570 1110 1605 1108 S1665 1108 1690 1108" stroke="#1f77d0" fill="none" stroke-width="2.5"/><line x1="1535" y1="1150" x2="1690" y2="1150" stroke="#333"/><line x1="1535" y1="1150" x2="1535" y2="1100" stroke="#333"/>
+  <line class="thin" x1="740" y1="688" x2="765" y2="972"/><line class="thin" x1="740" y1="881" x2="765" y2="985"/><line class="thin" x1="740" y1="966" x2="765" y2="998"/><path class="thin" d="M1590 727 L1620 727 L1620 1010 L765 1010"/>
+  <line class="line" x1="809" y1="985" x2="845" y2="1000"/><line class="line" x1="1065" y1="1000" x2="1110" y2="995"/><line class="line" x1="1285" y1="995" x2="1330" y2="995"/><line class="line" x1="1460" y1="995" x2="1500" y2="990"/><line class="thin" x1="1602" y1="1025" x2="1602" y2="1065"/><line class="line" x1="1705" y1="1115" x2="1702" y2="955"/>
+
+  <rect class="box dynFill dyn" x="1760" y="910" width="240" height="80"/><text class="txt" x="1800" y="943">base = gate × candidate</text><text class="txt" x="1825" y="973">+ (1 - gate) × prior</text>
+  <rect class="box purpleFill dyn" x="1625" y="1085" width="170" height="58"/><text class="label" x="1680" y="1121">base (54D)</text>
+  <line class="line" x1="1702" y1="933" x2="1760" y2="950"/><path class="thin" d="M1590 727 L1905 727 L1905 910"/><path class="thin" d="M1258 565 L1880 565 L1880 910"/><line class="line" x1="1880" y1="990" x2="1880" y2="1085"/><path class="line" d="M1795 1114 L1960 1114 L1960 830"/><path class="line" d="M1185 825 L1932 825"/>
+
+  <!-- output/loss -->
+  <rect class="box out outFill" x="2084" y="574" width="290" height="250"/>
+  <text class="label" x="2132" y="610">pred_motion (54D continuous)</text><text class="txt" x="2176" y="642">(FLAME motion)</text><text class="txt" x="2161" y="674">[B, T_face, 54]</text>
+  <ellipse cx="2229" cy="748" rx="58" ry="74" fill="#d7d7d2" stroke="#8d8d88"/><circle cx="2210" cy="728" r="7" fill="#555"/><circle cx="2248" cy="728" r="7" fill="#555"/><path d="M2212 770 Q2229 785 2248 770" stroke="#555" fill="none" stroke-width="3"/><path d="M2229 704 Q2202 701 2193 715" stroke="#aaa" fill="none"/><path d="M2229 704 Q2257 701 2265 715" stroke="#aaa" fill="none"/>
+  <line class="line" x1="1984" y1="806" x2="2084" y2="700"/>
+  <rect class="box greenFill" x="2094" y="955" width="270" height="95"/><text class="label" x="2190" y="985">z loss (codec)</text><text class="txt" x="2160" y="1016">vs quant_to_sum_feat(gt)</text>
+  <rect class="box lossFill loss" x="2094" y="1076" width="270" height="95"/><text class="label" x="2164" y="1106" fill="#a92222">motion / jaw / vel losses</text><text class="txt" x="2181" y="1137">vs ground truth</text><text class="txt" x="2181" y="1164">(FLAME params)</text>
+  <path class="dash" d="M805 595 L805 1002 L2094 1002"/><path class="dash" d="M2229 824 L2229 1076"/>
+  <path class="dash" d="M2094 1135 C1750 1135 1605 960 1500 295"/>
+
+  <!-- bottom legend -->
+  <rect x="12" y="1202" width="2376" height="105" rx="10" fill="#fff" stroke="#cfd5db"/>
+  <text class="label" x="35" y="1232">LEGEND</text>
+  <circle cx="52" cy="1270" r="16" fill="#fff" stroke="#1f2933"/><text class="label" x="46" y="1277">+</text><text class="small" x="82" y="1275">Element-wise Add</text>
+  <circle cx="245" cy="1270" r="16" fill="#fff" stroke="#1f2933"/><text class="label" x="239" y="1277">×</text><text class="small" x="275" y="1275">Element-wise Multiply</text>
+  <rect x="430" y="1256" width="55" height="26" rx="5" fill="#fff" stroke="#1f2933"/><text class="tiny" x="440" y="1274">concat</text><text class="small" x="505" y="1275">Concatenation</text>
+  <rect x="660" y="1249" width="62" height="36" fill="none" stroke="#555"/><rect x="666" y="1243" width="62" height="36" fill="none" stroke="#555"/><rect x="672" y="1237" width="62" height="36" fill="none" stroke="#555"/><text class="small" x="755" y="1265">Causal Transformer Block</text>
+  <line x1="930" y1="1207" x2="930" y2="1302" stroke="#cfd5db"/>
+  <text class="label" x="965" y="1232">NOTES</text>
+  <text class="small" x="980" y="1263">• All transformer encoders are causal.</text>
+  <text class="small" x="980" y="1291">• Motion state is internal: shifted GT in training, previous prediction in inference.</text>
+  <text class="small" x="1430" y="1263">• SoftVQ supervises latent structure during training only.</text>
+  <text class="small" x="1430" y="1291">• Gate blends prior and candidate motion with warmup.</text>
+  <line x1="1930" y1="1207" x2="1930" y2="1302" stroke="#cfd5db"/>
+  <text class="label" x="1970" y="1232">DIMENSIONS</text>
+  <text class="small" x="1970" y="1263">H: hidden dimension</text>
+  <text class="small" x="1970" y="1291">Motion 54 = 50 expression + 1 jaw + 3 neck</text>
+</svg>

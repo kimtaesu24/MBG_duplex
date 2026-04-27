@@ -1,0 +1,83 @@
+PIPELINE: 'ar_trainer.ARTrainer'
+WANDB_ENTITY: 'seonghee'
+WANDB_PROJECT: 'NIPS_duplex_ARTalk_mimi54'
+DUMP_DIR: './outputs'
+
+DATASET:
+  NAME: 'MimiFlame54'
+  JAW_DIM: 1
+  LOADER: 'mimi_flame_data.MimiFlameData'
+  CLIP_LENGTH: 100
+  PREV_LENGTH: 100
+  STYLE_LENGTH: 100
+  STRIDE: 50
+  MOTION_FPS: 25
+  AUDIO_SAMPLE_RATE: 16000
+  MIMI_FEATURE_FPS: 12.5
+  LENGTH_TOLERANCE: 0
+  LENGTH_MISMATCH_CSV: '/home/s20225367/dataset/artalk_mimi54_length_mismatches.csv'
+  SOURCES:
+    - NAME: 'dualtalk'
+      DATA_ROOT: '/home/s20225367/dataset/dualtalk'
+      MIMI_ROOT: '/home/s20225367/dataset/mimi_emb'
+      SPLITS:
+        train: 'train'
+        val: 'ood'
+        test: 'test'
+      MIMI_SPLITS:
+        train: 'train'
+        val: 'ood'
+        test: 'test'
+      MIMI_STEM_PREFIX: ''
+    - NAME: 'candor_bc'
+      DATA_ROOT: '/home/s20225367/dataset/candor_flame/bc'
+      MIMI_ROOT: '/home/s20225367/dataset/mimi_emb/candor_bc'
+      SPLITS:
+        train: '.'
+        val: '.'
+        test: '.'
+      MIMI_SPLITS:
+        train: '.'
+        val: '.'
+        test: '.'
+      MIMI_STEM_PREFIX: 'candor_bc_'
+      VAL_RATIO: 0.05
+
+MODEL:
+  NAME: 'ARTalkGenMimi54'
+  LOADER: 'artalk_gen.ARTalkGen'
+  AUDIO_ENCODER: 'cached_mimi'
+  T_DEPTH: 8
+  T_NUM_HEAD: 8
+  T_EMBED_DIM: 512
+  FLIP_QUANT: 0.3
+  PREV_FREE: 0.1
+  AUDIO_FREE: 0.1
+  STYLE_FREE: 0.1
+  PRETRAIN_PATH: null
+  VAE_CONFIG:
+    LOADER: 'artalk_codec.ARTalkCodec'
+    MOTION_DIM: 54
+    V_CODE_DIM: 32
+    V_PATCH_NUMS: [1, 10, 20, 50, 100]
+    T_DEPTH: 8
+    T_NUM_HEADS: 8
+    T_HIDDEN_DIM: 512
+    STATS_PATH: '/home/s20225367/dataset/artalk_mimi54_stats.json'
+    VAE_PATH: './outputs/ARTalkCodecMimi54_MimiFlame54/CHANGE_ME/checkpoints/iter_50000.pt'
+
+TRAINER:
+  BATCH_SIZE: 128
+  TRAIN_ITER: 200000
+  CHECK_INTERVAL: 20000
+  NAME: 'Adam'
+  WARMUP_ITER: 1000
+  LR_DECAY_RATE: 0.1
+  LR_DECAY_ITER: 200000
+  LEARNING_RATE: 1.0e-4
+  USING_EMA: True
+  EMA_DECAY: 0.9999
+  EMA_UPDATE_FREQ: 1
+
+LOSS_KWARGS:
+  CE_WEIGHT: 1.0

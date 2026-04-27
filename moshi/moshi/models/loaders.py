@@ -119,6 +119,7 @@ _lm_kwargs = {
     "depformer_pos_emb": "none",
     "depformer_weights_per_step": True,
     "delays": [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
+    "backchannel_enabled": False,
 }
 
 
@@ -241,14 +242,15 @@ def get_moshi_lm(
                     if needle in name:
                         src = name.replace(needle, f"{rep}.{old}.")
                         if src in state_dict:
-                            print("Replacing %s <- %s", name, src)
+                            print(f"Replacing {name} <- {src}")
                             state_dict[name] = state_dict[src]
                             replaced = True
                         break
                 if replaced:
                     break
             if not replaced:
-                print("Missing %s", name)
+                if not name.startswith("backchannel"):
+                    print(f"Missing {name}")
 
     # Assign weights to target device
     dev = torch.device(device) if isinstance(device, str) else device

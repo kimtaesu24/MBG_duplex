@@ -1,0 +1,121 @@
+PIPELINE: 'vae_trainer.VAETrainer'
+WANDB_ENTITY: 'seonghee'
+WANDB_PROJECT: 'NIPS_duplex_ARTalk_mimi54'
+DUMP_DIR: './outputs'
+
+DATASET:
+  NAME: 'MimiFlame54'
+  JAW_DIM: 1
+  LOADER: 'mimi_flame_data.MimiFlameData'
+  CLIP_LENGTH: 100
+  PREV_LENGTH: 100
+  STYLE_LENGTH: 100
+  STRIDE: 50
+  MOTION_FPS: 25
+  AUDIO_SAMPLE_RATE: 16000
+  MIMI_FEATURE_FPS: 12.5
+  LENGTH_MISMATCH_CSV: '/home6/duplex/dataset/artalk_mimi54_length_mismatches.csv'
+  SOURCES:
+    - NAME: 'dualtalk'
+      DATA_ROOT: '/home6/duplex/dataset/dualtalk'
+      MIMI_ROOT: '/home6/duplex/dataset/mimi_emb'
+      SPLITS:
+        train: 'train'
+        val: 'ood'
+        test: 'test'
+      MIMI_SPLITS:
+        train: 'train'
+        val: 'ood'
+        test: 'test'
+      MIMI_STEM_PREFIX: ''
+      LENGTH_TOLERANCE: 2
+    - NAME: 'ami_bc'
+      DATA_ROOT: '/home6/duplex/dataset/ami_flame/bc'
+      MIMI_ROOT: '/home6/duplex/dataset/mimi_emb'
+      SPLITS:
+        train: 'train'
+        val: 'valid'
+        test: 'test'
+      MIMI_SPLITS:
+        train: 'ami_train_bc'
+        val: 'ami_val_bc'
+        test: 'ami_test_bc'
+      MIMI_STEM_PREFIX: ''
+      MIMI_STEM_SUFFIX_STRIP: '_bc'
+      LENGTH_TOLERANCE: 2
+    - NAME: 'ami_ut'
+      DATA_ROOT: '/home6/duplex/dataset/ami_flame/ut'
+      MIMI_ROOT: '/home6/duplex/dataset/mimi_emb'
+      SPLITS:
+        train: 'train'
+        val: 'valid'
+        test: 'test'
+      MIMI_SPLITS:
+        train: 'ami_train_ut'
+        val: 'ami_val_ut'
+        test: 'ami_test_ut'
+      MIMI_STEM_PREFIX: ''
+      LENGTH_TOLERANCE: 2
+    # - NAME: 'candor_bc'
+    #   DATA_ROOT: '/home6/duplex/dataset/candor_flame/bc'
+    #   MIMI_ROOT: '/home6/duplex/dataset/mimi_emb/candor_bc'
+    #   SPLITS:
+    #     train: '.'
+    #     val: '.'
+    #     test: '.'
+    #   MIMI_SPLITS:
+    #     train: '.'
+    #     val: '.'
+    #     test: '.'
+    #   MIMI_STEM_PREFIX: 'candor_bc_'
+    #   VAL_RATIO: 0.05
+    #   LENGTH_TOLERANCE: 2
+    # - NAME: 'candor_ut'
+    #   DATA_ROOT: '/home6/duplex/dataset/candor_flame/ut'
+    #   MIMI_ROOT: '/home6/duplex/dataset/mimi_emb/candor_ut'
+    #   SPLITS:
+    #     train: '.'
+    #     val: '.'
+    #     test: '.'
+    #   MIMI_SPLITS:
+    #     train: '.'
+    #     val: '.'
+    #     test: '.'
+    #   MIMI_STEM_PREFIX: 'candor_ut_'
+    #   VAL_RATIO: 0.05
+    #   LENGTH_TOLERANCE: 2
+
+MODEL:
+  NAME: 'ARTalkCodecMimi54'
+  LOADER: 'artalk_codec.ARTalkCodec'
+  MOTION_DIM: 54
+  V_CODE_DIM: 32
+  V_PATCH_NUMS: [1, 10, 20, 50, 100]
+  T_DEPTH: 8
+  T_NUM_HEADS: 8
+  T_HIDDEN_DIM: 512
+  STATS_PATH: '/home6/duplex/dataset/artalk_mimi54_stats.json'
+
+TRAINER:
+  BATCH_SIZE: 128
+  TRAIN_ITER: 200000
+  CHECK_INTERVAL: 50000
+  NAME: 'Adam'
+  WARMUP_ITER: 1000
+  LR_DECAY_RATE: 0.1
+  LR_DECAY_ITER: 200000
+  LEARNING_RATE: 1.0e-4
+  USING_EMA: True
+  EMA_DECAY: 0.9999
+  EMA_UPDATE_FREQ: 1
+
+LOSS_KWARGS:
+  VQ_WEIGHT: 1.0
+  EXP_WEIGHT: 1.0
+  POSE_WEIGHT: 8.0
+  HEAD_VEL_WEIGHT: 5.0
+  HEAD_SMOOTH_WEIGHT: 0.5
+  MESH_WEIGHT: 0.0
+  LIPS_WEIGHT: 0.0
+  MESH_VEL_WEIGHT: 0.0
+  MESH_SMOOTH_WEIGHT: 0.0

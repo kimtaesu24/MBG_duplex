@@ -39,6 +39,7 @@ import sys
 from typing import Optional, Union, List, Tuple, Callable, Iterator
 import sphn
 import torch
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from ..utils.sampling import sample_token
@@ -48,6 +49,8 @@ from ..modules.transformer import (
     StreamingTransformer,
     create_norm_fn,
 )
+from .backchannel_vap import BackchannelModule
+from .vap_gpt_module import VapGPTBackchannelModule
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,10 @@ class LMOutput:
     mask: torch.Tensor  # [B, K, T]
     text_logits: torch.Tensor  # [B, 1, T, text_card]
     text_mask: torch.Tensor  # [B, 1, T]
+    vap_logits: Optional[torch.Tensor] = None          # [B, T, 256] backchannel VAP logits
+    commitment_loss: Optional[torch.Tensor] = None    # scalar — Alt 3 commitment loss
+    face_pred: Optional[torch.Tensor] = None           # [B, T_face, 54] teacher-forced face motion
+    face_outputs: Optional[dict] = None                # full CausalSoftVQContinuousTransformer output dict
 
 
 def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -260,6 +267,32 @@ class LMModel(StreamingContainer):
         depformer_pos_emb: str = "sin",
         existing_text_padding_id: Optional[int] = None,
         context: Optional[int] = None,
+        # ── Backchannel VAP ──────────────────────────────────────────
+        backchannel_enabled: bool = False,
+        backchannel_module_type: str = "mlp",  # "mlp" | "vap_gpt"
+        backchannel_vap_dim: int = 256,
+        backchannel_bc_hidden: int = 512,
+        backchannel_pad_token_id: Optional[int] = None,
+        backchannel_epad_token_id: Optional[int] = None,
+        backchannel_gumbel_temp_init: float = 1.0,
+        backchannel_gumbel_temp_min: float = 0.5,
+        backchannel_gumbel_anneal_rate: float = 0.0001,
+        # VapGPT-specific params (used when backchannel_module_type == "vap_gpt")
+        backchannel_vap_repo_path: str = "",
+        backchannel_vap_checkpoint: Optional[str] = None,
+        backchannel_vap_channel_layers: int = 1,
+        backchannel_vap_cross_layers: int = 3,
+        backchannel_vap_num_heads: int = 4,
+        backchannel_vap_dropout: float = 0.1,
+        # ── Face Generation Module ────────────────────────────────────────────
+        face_module_enabled: bool = False,
+        face_module_dir: str = "",
+        face_module_checkpoint: Optional[str] = None,
+        face_module_hidden_dim: int = 512,
+        face_module_layers: int = 6,
+        face_module_heads: int = 8,
+        face_module_code_dim: int = 32,
+        face_module_prior_warmup_frames: int = 10,
         device=None,
         dtype=None,
         **kwargs,
@@ -351,6 +384,80 @@ class LMModel(StreamingContainer):
         self.linears = torch.nn.ModuleList(
             [torch.nn.Linear(dim, self.card, bias=bias_proj) for _ in range(dep_q)]
         )
+
+        # ── Backchannel VAP Module ────────────────────────────────────────
+        self.backchannel_enabled = backchannel_enabled
+        if backchannel_enabled:
+            # Default to the model's actual text PAD/EPAD token IDs when not explicitly set.
+            # text_padding_token_id = existing_text_padding_id (= 3 for Personaplex).
+            # end_of_text_padding_id = 0 (hardcoded property).
+            _pad_id = backchannel_pad_token_id if backchannel_pad_token_id is not None \
+                else self.text_padding_token_id
+            _epad_id = backchannel_epad_token_id if backchannel_epad_token_id is not None \
+                else self.end_of_text_padding_id
+            if backchannel_module_type == "vap_gpt":
+                self.backchannel = VapGPTBackchannelModule(
+                    lm_dim=self.dim,
+                    depformer_dim=depformer_dim,
+                    card=self.card,
+                    vap_repo_path=backchannel_vap_repo_path,
+                    checkpoint_path=backchannel_vap_checkpoint,
+                    vap_dim=backchannel_vap_dim,
+                    channel_layers=backchannel_vap_channel_layers,
+                    cross_layers=backchannel_vap_cross_layers,
+                    num_heads=backchannel_vap_num_heads,
+                    dropout=backchannel_vap_dropout,
+                    bc_hidden=backchannel_bc_hidden,
+                    pad_token_id=_pad_id,
+                    epad_token_id=_epad_id,
+                    gumbel_temp_init=backchannel_gumbel_temp_init,
+                    gumbel_temp_min=backchannel_gumbel_temp_min,
+                    gumbel_anneal_rate=backchannel_gumbel_anneal_rate,
+                )
+            else:  # "mlp"
+                self.backchannel = BackchannelModule(
+                    lm_dim=self.dim,
+                    depformer_dim=depformer_dim,
+                    card=self.card,
+                    vap_dim=backchannel_vap_dim,
+                    bc_hidden=backchannel_bc_hidden,
+                    pad_token_id=_pad_id,
+                    epad_token_id=_epad_id,
+                    gumbel_temp_init=backchannel_gumbel_temp_init,
+                    gumbel_temp_min=backchannel_gumbel_temp_min,
+                    gumbel_anneal_rate=backchannel_gumbel_anneal_rate,
+                )
+        else:
+            self.backchannel = None
+
+        # ── Face Generation Module ────────────────────────────────────────────
+        self.face_module = None
+        if face_module_enabled and face_module_dir:
+            if face_module_dir not in sys.path:
+                sys.path.insert(0, face_module_dir)
+            try:
+                from softvq_continuous_online_train import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                # Read architecture hyperparams from checkpoint when available,
+                # falling back to explicit constructor arguments.
+                ckpt_args: dict = {}
+                if face_module_checkpoint is not None:
+                    _raw = torch.load(face_module_checkpoint, map_location="cpu", weights_only=True)
+                    ckpt_args = _raw.get("args", {})
+                face_net = _FaceModel(
+                    hidden_dim=int(ckpt_args.get("hidden_dim", face_module_hidden_dim)),
+                    layers=int(ckpt_args.get("layers", face_module_layers)),
+                    heads=int(ckpt_args.get("heads", face_module_heads)),
+                    code_dim=int(ckpt_args.get("code_dim", face_module_code_dim)),
+                    prior_warmup_frames=int(ckpt_args.get("prior_warmup_frames", face_module_prior_warmup_frames)),
+                )
+                if face_module_checkpoint is not None:
+                    face_net.load_state_dict(_raw["model"])
+                    logger.info(f"[LMModel] Face module loaded from: {face_module_checkpoint}")
+                self.face_module = face_net
+                logger.info("[LMModel] Face generation module initialized as submodule.")
+            except Exception as _e:
+                logger.warning(f"[LMModel] Face module initialization failed: {_e}. Proceeding without face module.")
+                self.face_module = None
 
     @property
     def initial_token_id(self) -> int:
@@ -496,7 +603,18 @@ class LMModel(StreamingContainer):
         self,
         sequence: torch.Tensor,
         transformer_out: torch.Tensor,
+        text_token_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Run the DepthTransformer for all codebooks in parallel (training mode).
+
+        Args:
+            sequence: [B, K, T] delayed target codes.
+            transformer_out: [B, T, dim] main transformer output.
+            text_token_emb: [B, T, depformer_dim] optional pre-computed embedding for
+                cb_index=0 (the text slot). When provided it replaces the normal
+                depformer_text_emb lookup, allowing a differentiable soft embedding
+                (e.g. Gumbel-ST interpolation) to be passed directly.
+        """
         B, K, T = sequence.shape
         Ka = self.dep_q
         assert (
@@ -512,7 +630,9 @@ class LMModel(StreamingContainer):
             else:
                 transformer_in = self.depformer_in[0](transformer_out)
             if cb_index == 0:
-                token_in = self.depformer_text_emb(sequence[:, 0])
+                # Use provided differentiable embedding if available, otherwise look up.
+                token_in = text_token_emb if text_token_emb is not None \
+                    else self.depformer_text_emb(sequence[:, 0])
             else:
                 token_in = self.depformer_emb[cb_index - 1](sequence[:, cb_index + self.audio_offset - 1])
             depformer_inputs.append(token_in + transformer_in)
@@ -528,7 +648,50 @@ class LMModel(StreamingContainer):
         assert logits.dim() == 4, logits.shape  # [B, Ka, T, card]
         return logits
 
-    def forward_train(self, codes: torch.Tensor):
+    def _depformer_first_step_logits(
+        self,
+        transformer_out: torch.Tensor,
+        sequence: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run DepthTransformer for only the first codebook (cb_index=0)
+        and return logits. Used by the backchannel self-reflective gating.
+
+        Args:
+            transformer_out: [B, T, dim] from the main transformer.
+            sequence: [B, K, T] delayed codes (target side, i.e. delayed_codes[:, :, 1:]).
+
+        Returns:
+            logits: [B, T, card] for the first audio codebook.
+        """
+        B, T, _ = transformer_out.shape
+        cb_index = 0
+        if self.depformer_multi_linear:
+            linear_index = cb_index
+            if self.depformer_weights_per_step_schedule is not None:
+                linear_index = self.depformer_weights_per_step_schedule[cb_index]
+            transformer_in = self.depformer_in[linear_index](transformer_out)
+        else:
+            transformer_in = self.depformer_in[0](transformer_out)
+
+        # First codebook input: text token embedding
+        token_in = self.depformer_text_emb(sequence[:, 0])  # [B, T, depformer_dim]
+        depformer_input = (token_in + transformer_in)  # [B, T, depformer_dim]
+
+        # Reshape for depformer: [B*T, 1, depformer_dim]
+        depformer_input = depformer_input.view(B * T, 1, -1)
+        depformer_output = self.depformer(depformer_input)  # [B*T, 1, depformer_dim]
+
+        logits = self.linears[0](depformer_output[:, 0])  # [B*T, card]
+        logits = logits.view(B, T, -1)  # [B, T, card]
+        return logits
+
+    def forward(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
+                audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None):
+        return self.forward_train(codes, step=step, voice_prompt_embs=voice_prompt_embs,
+                                  audio_feat=audio_feat, gt_face_motion=gt_face_motion)
+
+    def forward_train(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
+                      audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None):
         B, K, T = codes.shape
         # Delaying codes and removing the last time step that will never be an input.
         initial = self._get_initial_token().expand(B, -1, -1)
@@ -536,9 +699,63 @@ class LMModel(StreamingContainer):
         # Inserting the empty tokens for the first time step.
         delayed_codes = torch.cat([initial, delayed_codes], dim=2)
 
-        # LLM Backbone
-        transformer_out, text_logits = self.forward_codes(delayed_codes[:, :, :-1])
-        logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
+        # Step 1: LLM Backbone → z_s (transformer_out)
+        # If voice_prompt_embs provided, prepend them so the transformer attends to voice context.
+        if voice_prompt_embs is not None:
+            main_embs = self.embed_codes(delayed_codes[:, :, :-1])  # [B, T, dim]
+            combined_embs = torch.cat([voice_prompt_embs, main_embs], dim=1)  # [B, V+T, dim]
+            transformer_out, text_logits = self.forward_embeddings(combined_embs)
+            V = voice_prompt_embs.shape[1]
+            transformer_out = transformer_out[:, V:]   # [B, T, dim]
+            text_logits = text_logits[:, :, V:]        # [B, 1, T, text_card]
+        else:
+            transformer_out, text_logits = self.forward_codes(delayed_codes[:, :, :-1])
+
+        # ── Backchannel Module ────────────────────────────────────────────
+        vap_logits = None
+        commitment_loss = None
+        if self.backchannel is not None:
+            target_codes = delayed_codes[:, :, 1:]
+
+            bc_result = self.backchannel(
+                transformer_out,
+                emb_cb0=self.depformer_text_emb,
+                step=step,
+            )
+            vap_logits = bc_result.vap_logits  # [B, T, vap_dim]
+
+            # Build a differentiable conditioned embedding for the depformer's text slot:
+            #   - PAD positions : bc_result.bc_embeddings
+            #                     = y_bc * epad_emb(0) + (1-y_bc) * pad_emb(3)
+            #                     differentiable via Gumbel-Softmax ST → gradient flows
+            #                     back to bc_mlp through y_bc.
+            #   - non-PAD positions : GT token embedding (word tokens / EPAD already in data)
+            # The text_loss target (codes[:, :1]) is left unchanged.
+            gt_text_emb = self.depformer_text_emb(target_codes[:, 0])   # [B, T, depformer_dim]
+            is_pad = (target_codes[:, 0] == self.text_padding_token_id).unsqueeze(-1)  # [B, T, 1]
+            conditioned_emb = torch.where(is_pad, bc_result.bc_embeddings, gt_text_emb)
+            logits = self.forward_depformer_training(target_codes, transformer_out,
+                                                     text_token_emb=conditioned_emb)
+
+            # Commitment loss — align bc_mlp & silence_gate with text_linear's
+            # PAD/EPAD distribution (stop-gradient so the LM backbone is not affected).
+            tl = text_logits[:, 0]  # [B, T, text_card]
+            pad_epad_tl = torch.stack([
+                tl[:, :, self.backchannel.pad_token_id],   # PAD prob  (index 0)
+                tl[:, :, self.backchannel.epad_token_id],  # EPAD prob (index 1)
+            ], dim=-1).detach()
+            epad_prob = F.softmax(pad_epad_tl, dim=-1)[..., 1]  # [B, T]
+            # bc_mlp[...,1] should fire when EPAD is likely
+            bc_commit = F.binary_cross_entropy_with_logits(
+                bc_result.bc_logits[..., 1], epad_prob,
+            )
+            # silence_gate[...,1] should fire when PAD (silence) is likely
+            silence_commit = F.binary_cross_entropy_with_logits(
+                bc_result.silence_gate_logits[..., 1], 1.0 - epad_prob,
+            )
+            commitment_loss = bc_commit + silence_commit
+        else:
+            logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
 
         # map back the logits on pattern sequence to logits on original codes: [B, K, S, card] -> [B, K, T, card]
         # and provide the corresponding mask over invalid positions of tokens. We will with NaN values invalid positions
@@ -549,8 +766,24 @@ class LMModel(StreamingContainer):
         logits_mask &= (codes[:, self.audio_offset: self.audio_offset + self.dep_q] != self.zero_token_id)
         text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float('NaN'))
         text_logits_mask &= (codes[:, :1] != self.zero_token_id)
-        return LMOutput(logits, logits_mask, text_logits, text_logits_mask)
 
+        # ── Face Generation (teacher-forced) ─────────────────────────────────
+        # audio_feat:    [B, T_mimi, 512] Mimi latents at 12.5 fps (decoded externally, frozen mimi)
+        # gt_face_motion:[B, T_face, 54]  ground-truth 3DMM at 25 fps
+        # transformer_out:[B, T_lm, 4096] LM backbone embedding z — provides gradient path
+        # The face module internally upsamples audio/llm from 12.5 fps to 25 fps via repeat_interleave(2).
+        face_pred = None
+        face_outputs = None
+        if self.face_module is not None and audio_feat is not None and gt_face_motion is not None:
+            start = self.face_module.start_motion.expand(B, 1, -1).to(
+                dtype=audio_feat.dtype, device=audio_feat.device)
+            # Teacher forcing: shift gt by one frame so frame t predicts frame t+1.
+            prev_motion = torch.cat([start, gt_face_motion[:, :-1]], dim=1)  # [B, T_face, 54]
+            face_outputs = self.face_module(audio_feat, prev_motion, llm_feat=transformer_out)
+            face_pred = face_outputs["pred_motion"]  # [B, T_face, 54]
+
+        return LMOutput(logits, logits_mask, text_logits, text_logits_mask, vap_logits, commitment_loss,
+                        face_pred, face_outputs)
 
 @dataclass
 class _LMGenState:
@@ -813,7 +1046,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
-             return_embeddings: bool=False) \
+             return_embeddings: bool=False, return_z: bool=False) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         state = self._streaming_state
         lm_model = self.lm_model
@@ -823,7 +1056,9 @@ class LMGen(StreamingModule[_LMGenState]):
         # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
         # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG
         if prepared_inputs is None:
-            return (None, None) if self.report_loss or self.return_logits else None
+            if self.report_loss or self.return_logits or return_embeddings or return_z:
+                return None, None
+            return None
         input_, provided_, target_, model_input_position, target_position = prepared_inputs
         if self.check:
             # Check that we are not feeding in any value that is not generated yet.
@@ -847,6 +1082,10 @@ class LMGen(StreamingModule[_LMGenState]):
         )
         if return_embeddings:
             return output, embeddings
+        if return_z:
+            # Clone: transformer_out may alias a CUDA-graph static buffer that is
+            # overwritten on every step, so the caller must not hold a raw reference.
+            return output, transformer_out.clone()
         return output
     
     @torch.no_grad()
@@ -888,6 +1127,21 @@ class LMGen(StreamingModule[_LMGenState]):
         assert sampled_text_token.shape[2] == 1
         assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
+
+        # Backchannel inference replacement: if bc_gate fires and the sampled token is
+        # PAD, replace it with EPAD so the model signals "about to talk".
+        # transformer_out is [B, 1, dim] in streaming mode; bc_gate is [B, 1].
+        if lm_model.backchannel is not None:
+            bc_result = lm_model.backchannel(
+                transformer_out, emb_cb0=lm_model.depformer_text_emb, step=0
+            )
+            is_pad = (sampled_text_token == lm_model.text_padding_token_id)
+            gate_fires = bc_result.bc_gate[:, 0].bool()  # [B]
+            sampled_text_token = torch.where(
+                is_pad & gate_fires,
+                sampled_text_token.new_full(sampled_text_token.shape, lm_model.end_of_text_padding_id),
+                sampled_text_token,
+            )
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
