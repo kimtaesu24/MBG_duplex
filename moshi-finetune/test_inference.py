@@ -466,7 +466,7 @@ def run_test_inference(args):
                 # 채널 swap은 InterleavedTokenizer 내부에서 처리하므로 stereo 그대로 전달
                 sample_data = interleaved_tokenizer(wav_np, 0.0, input_wav)
                 codes = sample_data.codes.to(device)  # already [1, K, T] from InterleavedTokenizer
-                
+
                 output = lm.forward_train(codes)
                 if output.vap_logits is not None:
                     vap_probs = F.softmax(output.vap_logits[0], dim=-1)  # [T, 256]
