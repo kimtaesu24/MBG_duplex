@@ -55,18 +55,8 @@ class Batch:
 
         voice_prompt_embs = None
         if all(b.voice_prompt_emb is not None for b in batch):
-            max_v = max(b.voice_prompt_emb.shape[0] for b in batch)
-            padded = []
-            for b in batch:
-                emb = b.voice_prompt_emb  # [V, dim]
-                if emb.shape[0] < max_v:
-                    pad = torch.zeros(
-                        max_v - emb.shape[0], emb.shape[1],
-                        dtype=emb.dtype, device=emb.device,
-                    )
-                    emb = torch.cat([emb, pad], dim=0)
-                padded.append(emb)
-            voice_prompt_embs = torch.stack(padded, dim=0)  # [B, V, dim]
+            # cache shape is fixed [1, K, T] int64 — cat along batch dim, no padding needed
+            voice_prompt_embs = torch.cat([b.voice_prompt_emb for b in batch], dim=0)  # [B, K, T]
 
         face_motion_gt = None
         if all(b.face_motion_gt is not None for b in batch):

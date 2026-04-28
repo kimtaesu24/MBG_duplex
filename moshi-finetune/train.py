@@ -388,7 +388,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 # FSDP의 forward pre-hook이 정상 발동하도록 __call__ -> forward 호출
                 voice_prompt_embs = batch.voice_prompt_embs
                 if voice_prompt_embs is not None:
-                    voice_prompt_embs = voice_prompt_embs.to(codes.device, dtype=param_dtype, non_blocking=True)
+                    voice_prompt_embs = voice_prompt_embs.to(codes.device, non_blocking=True)  # int64 mimi codes
 
                 # ── Face generation inputs ────────────────────────────────
                 # Decode agent audio codes to Mimi latent features.

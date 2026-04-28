@@ -42,15 +42,14 @@ def _build_voice_sample_lookup(jsonl_file: Path) -> dict[str, str]:
 
 
 def _load_voice_prompt_emb(pt_path: str) -> Optional[torch.Tensor]:
-    """Load and cache voice prompt embeddings. Returns [V, dim] CPU tensor."""
+    """Load pre-encoded mimi codes for voice prompt. Returns [1, K, T] int64 CPU tensor."""
     if pt_path in _VOICE_PROMPT_EMB_CACHE:
         return _VOICE_PROMPT_EMB_CACHE[pt_path]
     if not os.path.exists(pt_path):
         logger.warning(f"Voice prompt cache not found: {pt_path}")
         return None
     state = torch.load(pt_path, weights_only=False, map_location="cpu")
-    emb = state["embeddings"]  # [V, 1, 1, dim]
-    emb = emb.squeeze(1).squeeze(1)  # [V, dim]
+    emb = state["cache"]  # [1, K, T] int64 — frozen mimi codes, valid across training steps
     _VOICE_PROMPT_EMB_CACHE[pt_path] = emb
     return emb
 
