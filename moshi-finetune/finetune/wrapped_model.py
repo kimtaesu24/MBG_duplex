@@ -126,19 +126,17 @@ def get_fsdp_model(
         from peft import get_peft_model, LoraConfig, TaskType
         
         main_logger_info(f"LoRA 모드 활성화 (Rank={args.lora.rank}, Scaling={args.lora.scaling})")
-        # Moshi/Personaplex 내부 Linear 계층 타겟팅
-        # - in_proj, out_proj, linear1, linear2 (Transformer 내부)
-        # - text_linear, input_proj (의존성/텍스트 입출력)
-        # NOTE: linear_in/linear_out (ActivationGating) excluded — see comment below
-        target_modules = [
-            "in_proj", "out_proj",
-            "linear1", "linear2",
-            "text_linear", "input_proj",
-            # "linear_in" and "linear_out" are intentionally excluded:
-            # ActivationGating.forward() calls gating_forward_kernel(self.linear_in.weight, ...)
-            # which bypasses the module's __call__ entirely, so PEFT LoRA wrapping of these
-            # layers never intercepts the computation and corrupts the weight tensor access.
-        ]
+        # LLM transformer 레이어만 LoRA 타겟팅.
+        # face_module / backchannel 은 full fine-tuning 이므로 제외.
+        # PEFT는 target_modules가 문자열이면 re.fullmatch(pattern, full_module_key)로 매칭하므로
+        # 네거티브 룩어헤드로 face_module/backchannel 경로를 명시적으로 배제한다.
+        # NOTE: linear_in/linear_out (ActivationGating) excluded — ActivationGating.forward()
+        # calls gating_forward_kernel(self.linear_in.weight, ...) which bypasses the module's
+        # __call__ entirely, so PEFT LoRA wrapping corrupts the weight tensor access.
+        target_modules = (
+            r"(?!.*(face_module|backchannel))"
+            r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj)"
+        )
         
         peft_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,

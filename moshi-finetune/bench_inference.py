@@ -59,12 +59,20 @@ def log(level: str, msg: str):
 
 
 def _strip_peft_prefixes(state_dict: dict) -> dict:
+    """Strip training wrapper prefixes so keys match the bare LMModel namespace.
+
+    Training wraps: PeftModel(PeftCompatibleWrapper(LMModel))
+    Saved keys:     base_model.model.model.<lm_key>
+    After strip:    <lm_key>
+
+    .original_module.* entries are frozen originals kept by PEFT — skip them.
+    """
     cleaned = {}
     for k, v in state_dict.items():
-        if k.startswith("base_model.model.model."):
-            k = k[len("base_model.model.model."):]
         if ".original_module." in k:
             continue
+        if k.startswith("base_model.model.model."):
+            k = k[len("base_model.model.model."):]
         cleaned[k] = v
     return cleaned
 
@@ -86,12 +94,14 @@ def load_checkpoint(lm, ckpt_dir):
             log("warning", f"Face module keys still missing: {face_missing[:3]}")
         if not bc_missing and not face_missing:
             log("info", "Checkpoint loaded successfully.")
+
     elif os.path.exists(lora_path):
         log("info", f"Loading LoRA checkpoint from {lora_path}")
         state_dict = safetensors.torch.load_file(lora_path)
         state_dict = _strip_peft_prefixes(state_dict)
 
-        # 1. Load backchannel + face_module weights directly into LMModel
+        # 1. Load backchannel + face_module weights directly into LMModel.
+        #    These modules are full-finetuned (no LoRA) and stored flat in lora.safetensors.
         direct_weights = {k: v for k, v in state_dict.items()
                           if k.startswith("backchannel.") or k.startswith("face_module.")}
         if direct_weights:
@@ -105,7 +115,18 @@ def load_checkpoint(lm, ckpt_dir):
             if not bc_missing and not face_missing:
                 log("info", f"Direct weights loaded ({len(direct_weights)} tensors).")
 
-        # 2. Inject LoRA layers and load LoRA weights
+        # 2. Load LoRA adapter weights via PEFT then merge into base weights.
+        #    Training used PeftCompatibleWrapper so saved keys are at depth 3:
+        #      base_model.model.model.<lm_key>  →  stripped: <lm_key>
+        #    Inference PEFT model (bare LMModel) has depth 2:
+        #      base_model.model.<lm_key>
+        #    → re-add one "base_model.model." prefix before loading.
+        #
+        #    target_modules must match training (wrapped_model.py).
+        #    In Personaplex, only out_proj and text_linear are plain nn.Linear
+        #    that PEFT can wrap — the other names in the regex don't match any
+        #    module in the actual graph.  face_module / backchannel are excluded
+        #    by the negative lookahead so their linear layers are left as-is.
         lora_weights = {k: v for k, v in state_dict.items()
                         if not k.startswith("backchannel.") and not k.startswith("face_module.")}
         if lora_weights:
@@ -115,22 +136,22 @@ def load_checkpoint(lm, ckpt_dir):
                     task_type=TaskType.FEATURE_EXTRACTION,
                     r=64,
                     lora_alpha=128,
-                    # linear_in/linear_out excluded: ActivationGating bypasses module.__call__
-                    # so PEFT never intercepted them during training (see wrapped_model.py)
-                    target_modules=["in_proj", "out_proj", "linear1", "linear2",
-                                    "text_linear", "input_proj"],
+                    target_modules=(
+                        r"(?!.*(face_module|backchannel))"
+                        r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj)"
+                    ),
+                    bias="none",
                 )
-                # get_peft_model(lm) wraps lm in-place; its LoRA keys are at base_model.model.*
-                # _strip_peft_prefixes removed "base_model.model.model." so we re-add "base_model.model."
                 peft_lm = get_peft_model(lm, lora_config)
                 prefixed = {f"base_model.model.{k}": v for k, v in lora_weights.items()}
                 missing_lora, _ = peft_lm.load_state_dict(prefixed, strict=False)
-                missing_lora = [k for k in missing_lora if "lora" in k]
+                missing_lora = [k for k in missing_lora if "lora_" in k]
                 if missing_lora:
                     log("warning", f"Some LoRA keys missing: {missing_lora[:3]}")
                 else:
                     log("info", f"LoRA weights loaded ({len(lora_weights)} tensors).")
-                lm = peft_lm.base_model.model
+                # Merge LoRA deltas into base weights and restore a plain LMModel.
+                lm = peft_lm.merge_and_unload()
             except ImportError:
                 log("error", "LoRA weights found but PEFT is not installed.")
     else:
