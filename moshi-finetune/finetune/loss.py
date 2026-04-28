@@ -4,6 +4,20 @@ import torch
 from torch.nn import functional as F
 
 
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Compute mean of x over positions where mask is True.
+
+    Args:
+        x:    [B, T, ...] arbitrary trailing dims
+        mask: [B, T] bool — True = valid frame, False = silence-padded
+    """
+    m = mask
+    while m.dim() < x.dim():
+        m = m.unsqueeze(-1)
+    m = m.expand_as(x)
+    return (x * m).sum() / m.sum().clamp(min=1)
+
+
 @torch.no_grad()
 def _codec_quant_to_sum_feat_chunked(codec, motion: torch.Tensor) -> torch.Tensor:
     """Run ARTalkCodec.quant_to_sum_feat in 100-frame chunks (codec length constraint)."""
@@ -25,6 +39,7 @@ def compute_face_loss(
     gt_face_motion: torch.Tensor,
     codec,
     face_args,
+    valid_face_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute the full reference face-motion training loss.
 
@@ -56,22 +71,48 @@ def compute_face_loss(
 
     code_dim = z_pred.shape[-1]
 
-    loss_motion = F.l1_loss(pred, gt)
-    loss_prior  = F.l1_loss(prior, gt)
-    loss_z      = F.mse_loss(z_pred, z_target)
+    # valid_face_mask: [B, T] bool — None means all frames valid (full 10s clips)
+    use_mask = valid_face_mask is not None
+    if use_mask:
+        mask = valid_face_mask  # [B, T]
+
+    if use_mask:
+        loss_motion = _masked_mean((pred - gt).abs(), mask)
+        loss_prior  = _masked_mean((prior - gt).abs(), mask)
+        loss_z      = _masked_mean((z_pred - z_target).pow(2), mask)
+    else:
+        loss_motion = F.l1_loss(pred, gt)
+        loss_prior  = F.l1_loss(prior, gt)
+        loss_z      = F.mse_loss(z_pred, z_target)
 
     z_target_bits = (z_target > 0).to(z_pred.dtype)
-    loss_z_bce    = F.binary_cross_entropy_with_logits(
-        z_pred * math.sqrt(code_dim), z_target_bits
-    )
+    if use_mask:
+        bce_per_elem = F.binary_cross_entropy_with_logits(
+            z_pred * math.sqrt(code_dim), z_target_bits, reduction="none"
+        )
+        loss_z_bce = _masked_mean(bce_per_elem, mask)
+    else:
+        loss_z_bce = F.binary_cross_entropy_with_logits(
+            z_pred * math.sqrt(code_dim), z_target_bits
+        )
 
-    loss_jaw = F.l1_loss(pred[..., 50:51], gt[..., 50:51])
+    if use_mask:
+        loss_jaw = _masked_mean((pred[..., 50:51] - gt[..., 50:51]).abs(), mask)
+    else:
+        loss_jaw = F.l1_loss(pred[..., 50:51], gt[..., 50:51])
 
     pred_vel = pred[:, 1:] - pred[:, :-1]
     gt_vel   = gt[:, 1:]   - gt[:, :-1]
-    loss_vel = F.mse_loss(pred_vel, gt_vel)
+    if use_mask:
+        vel_mask = mask[:, 1:]  # velocity is T-1 frames
+        loss_vel = _masked_mean((pred_vel - gt_vel).pow(2), vel_mask)
+    else:
+        loss_vel = F.mse_loss(pred_vel, gt_vel)
 
-    loss_reg = delta.pow(2).mean() + residual.pow(2).mean()
+    if use_mask:
+        loss_reg = _masked_mean(delta.pow(2), mask) + _masked_mean(residual.pow(2), mask)
+    else:
+        loss_reg = delta.pow(2).mean() + residual.pow(2).mean()
 
     gate_target = group_gate.new_tensor(
         [face_args.gate_target_expr, face_args.gate_target_jaw, face_args.gate_target_neck]
@@ -79,7 +120,10 @@ def compute_face_loss(
     gate_group_weight = group_gate.new_tensor(
         [face_args.gate_loss_expr_weight, face_args.gate_loss_jaw_weight, face_args.gate_loss_neck_weight]
     ).view(1, 1, 3)
-    loss_gate = ((group_gate - gate_target) ** 2 * gate_group_weight).mean()
+    if use_mask:
+        loss_gate = _masked_mean((group_gate - gate_target) ** 2 * gate_group_weight, mask)
+    else:
+        loss_gate = ((group_gate - gate_target) ** 2 * gate_group_weight).mean()
 
     total = (
         face_args.motion_weight * loss_motion

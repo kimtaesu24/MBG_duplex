@@ -36,6 +36,8 @@ class Sample:
     vap_targets: torch.Tensor | None = None  # [1, T]
     voice_prompt_emb: torch.Tensor | None = None  # [V, dim]
     face_motion_gt: torch.Tensor | None = None    # [T_face, 54] at 25 fps
+    valid_mask: torch.Tensor | None = None        # [T_mimi] bool: True = real audio, False = silence-padded
+    valid_face_frames: int | None = None          # number of valid face frames (25 fps)
 
 
 @dataclass
@@ -45,6 +47,8 @@ class Batch:
     vap_targets: torch.Tensor | None = None       # [B, T]
     voice_prompt_embs: torch.Tensor | None = None  # [B, V, dim]
     face_motion_gt: torch.Tensor | None = None    # [B, T_face, 54] at 25 fps
+    valid_mask: torch.Tensor | None = None        # [B, T_mimi] bool
+    valid_face_frames: torch.Tensor | None = None # [B] int: valid face frame count per sample
 
     @classmethod
     def collate(cls, batch: list[Sample]) -> "Batch":
@@ -71,11 +75,23 @@ class Batch:
                 padded_face.append(fm)
             face_motion_gt = torch.stack(padded_face, dim=0)  # [B, T_face, 54]
 
+        valid_mask = None
+        if all(b.valid_mask is not None for b in batch):
+            valid_mask = torch.stack([b.valid_mask for b in batch], dim=0)  # [B, T_mimi]
+
+        valid_face_frames = None
+        if all(b.valid_face_frames is not None for b in batch):
+            valid_face_frames = torch.tensor(
+                [b.valid_face_frames for b in batch], dtype=torch.long
+            )  # [B]
+
         if batch[0].condition_attributes is None:
             return Batch(codes, vap_targets=vap_targets, voice_prompt_embs=voice_prompt_embs,
-                         face_motion_gt=face_motion_gt)
+                         face_motion_gt=face_motion_gt, valid_mask=valid_mask,
+                         valid_face_frames=valid_face_frames)
         return Batch(codes, [b.condition_attributes for b in batch], vap_targets=vap_targets,
-                     voice_prompt_embs=voice_prompt_embs, face_motion_gt=face_motion_gt)
+                     voice_prompt_embs=voice_prompt_embs, face_motion_gt=face_motion_gt,
+                     valid_mask=valid_mask, valid_face_frames=valid_face_frames)
 
 
 def tokenize(
@@ -345,6 +361,7 @@ class InterleavedTokenizer:
         start_sec: float,
         path: str,
         voice_prompt_emb: torch.Tensor | None = None,
+        actual_wav_samples: int | None = None,
     ) -> Sample:
         """Finish tokenization given pre-encoded mimi tokens.
 
@@ -412,15 +429,36 @@ class InterleavedTokenizer:
 
             if matched_fid is None:
                 print(f"[WARNING] No VAP target found for '{raw_file_id}' "
-                      f"(tried: {file_id_candidates}). All targets set to -100.")
+                      f"All targets set to -100.")
 
         # ── FLAME / 3DMM face motion ─────────────────────────────────────────
         face_motion_gt = None
         if self.flame_root:
             face_motion_gt = self._load_face_motion(path, start_sec)
 
+        # ── Silence-padding validity mask ─────────────────────────────────────
+        # When a short clip is zero-padded to batch max_T before mimi encoding,
+        # the padded region produces silence mimi tokens that should be excluded
+        # from all losses (audio, text, VAP, face).
+        valid_mask = None
+        valid_face_frames = None
+        if actual_wav_samples is not None:
+            actual_mimi_frames = min(
+                math.ceil(actual_wav_samples * self.mimi.frame_rate / self.mimi_sample_rate),
+                self.num_audio_frames,
+            )
+            valid_mask = torch.zeros(self.num_audio_frames, dtype=torch.bool)
+            valid_mask[:actual_mimi_frames] = True
+
+            n_face_frames = int(self.duration_sec * self._motion_fps)
+            valid_face_frames = min(
+                int(actual_wav_samples / self.mimi_sample_rate * self._motion_fps),
+                n_face_frames,
+            )
+
         return Sample(codes, data.get("text_conditions", None), vap_targets=vap_targets,
-                      voice_prompt_emb=voice_prompt_emb, face_motion_gt=face_motion_gt)
+                      voice_prompt_emb=voice_prompt_emb, face_motion_gt=face_motion_gt,
+                      valid_mask=valid_mask, valid_face_frames=valid_face_frames)
 
     def _find_flame_path(self, stem: str) -> Optional[Path]:
         """Return the FLAME .npy path for *stem*, or None if not found.

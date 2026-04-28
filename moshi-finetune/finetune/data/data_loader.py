@@ -111,6 +111,10 @@ def build_data_loader(
             C = wav_tensors[0].shape[0]    # channels per sample (typically 2)
             B = len(raw_buf)
 
+            # Record actual audio lengths before zero-padding so we can build
+            # validity masks that exclude silence-padded frames from all losses.
+            actual_wav_lens = [w.shape[-1] for w in wav_tensors]
+
             # Last segments of audio files are shorter than full duration (sphn slices
             # to unpadded_len).  Pad all wavs to the same T so torch.cat can proceed.
             max_T = max(w.shape[-1] for w in wav_tensors)
@@ -131,7 +135,8 @@ def build_data_loader(
 
             samples = [
                 instruct_tokenizer.tokenize_with_encoded_audio(
-                    all_tokens[i], start_sec, path, vp_emb
+                    all_tokens[i], start_sec, path, vp_emb,
+                    actual_wav_samples=actual_wav_lens[i],
                 )
                 for i, (_, start_sec, path, vp_emb) in enumerate(raw_buf)
             ]

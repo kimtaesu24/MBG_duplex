@@ -701,11 +701,13 @@ class LMModel(StreamingContainer):
 
         # Step 1: LLM Backbone → z_s (transformer_out)
         # If voice_prompt_embs provided, prepend them so the transformer attends to voice context.
+        # voice_prompt_embs: [B, K, T_vp] int64 mimi codes — embed with current LM weights each step.
         if voice_prompt_embs is not None:
+            vp_embs = self.embed_codes(voice_prompt_embs)  # [B, T_vp, dim]
             main_embs = self.embed_codes(delayed_codes[:, :, :-1])  # [B, T, dim]
-            combined_embs = torch.cat([voice_prompt_embs, main_embs], dim=1)  # [B, V+T, dim]
+            combined_embs = torch.cat([vp_embs, main_embs], dim=1)  # [B, T_vp+T, dim]
             transformer_out, text_logits = self.forward_embeddings(combined_embs)
-            V = voice_prompt_embs.shape[1]
+            V = vp_embs.shape[1]
             transformer_out = transformer_out[:, V:]   # [B, T, dim]
             text_logits = text_logits[:, :, V:]        # [B, 1, T, text_card]
         else:

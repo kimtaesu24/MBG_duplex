@@ -409,10 +409,21 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 output = model(codes, step=state.step, voice_prompt_embs=voice_prompt_embs,
                                audio_feat=audio_feat, gt_face_motion=gt_face_motion)
 
+                # ── Silence-padding mask ──────────────────────────────────────
+                # Short clips (<10s) are zero-padded before mimi encoding, producing
+                # silence tokens that must be excluded from all loss terms.
+                # valid_mask: [B, T_mimi] bool  (None when all clips are full 10s)
+                text_mask = output.text_mask
+                audio_mask = output.mask
+                if batch.valid_mask is not None:
+                    valid = batch.valid_mask.to(codes.device).unsqueeze(1)  # [B, 1, T]
+                    text_mask = text_mask & valid
+                    audio_mask = audio_mask & valid
+
                 text_loss = compute_loss_with_mask(
                     output.text_logits,
                     codes[:, : model.audio_offset],
-                    output.text_mask,
+                    text_mask,
                     mode="text",
                     text_padding_weight=args.text_padding_weight,
                     text_padding_ids={
@@ -423,7 +434,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 audio_loss = compute_loss_with_mask(
                     output.logits,
                     codes[:, model.audio_offset : model.audio_offset + model.dep_q],
-                    output.mask,
+                    audio_mask,
                     mode="audio",
                     first_codebook_weight_multiplier=args.first_codebook_weight_multiplier,
                 )
@@ -437,6 +448,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
                     if vap_logits is not None:
                         vap_targets_tensor = batch.vap_targets  # [B, T]
+                        # Mask silence-padded frames: set to ignore_index so cross_entropy skips them
+                        if vap_targets_tensor is not None and batch.valid_mask is not None:
+                            vap_targets_tensor = vap_targets_tensor.masked_fill(
+                                ~batch.valid_mask.to(vap_targets_tensor.device), -100
+                            )
                         if vap_targets_tensor is not None:
                             flat_targets = vap_targets_tensor.view(-1).long()
                             n_valid = (flat_targets != -100).sum().item()
@@ -468,8 +484,15 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 face_loss = None
                 if (args.face_gen.enable and output.face_outputs is not None
                         and gt_face_motion is not None and face_codec is not None):
+                    # Build [B, T_face] bool mask from per-sample valid frame counts
+                    valid_face_mask = None
+                    if batch.valid_face_frames is not None:
+                        T_face = gt_face_motion.shape[1]
+                        t_idx = torch.arange(T_face, device=codes.device).unsqueeze(0)  # [1, T_face]
+                        valid_face_mask = t_idx < batch.valid_face_frames.to(codes.device).unsqueeze(1)  # [B, T_face]
                     face_loss = compute_face_loss(
-                        output.face_outputs, gt_face_motion, face_codec, args.face_gen
+                        output.face_outputs, gt_face_motion, face_codec, args.face_gen,
+                        valid_face_mask=valid_face_mask,
                     )
                     if torch.isfinite(face_loss):
                         mb_loss = mb_loss + args.face_gen.face_loss_weight * face_loss
@@ -477,9 +500,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     else:
                         logger.warning(f"[step {state.step}] Non-finite face_loss={face_loss.item():.4f}, skipping.")
 
-                n_batch_tokens += output.text_mask.numel() + output.mask.numel()
+                n_batch_tokens += text_mask.numel() + audio_mask.numel()
                 n_real_tokens += (
-                    torch.sum(output.text_mask).item() + torch.sum(output.mask).item()
+                    torch.sum(text_mask).item() + torch.sum(audio_mask).item()
                 )
 
                 mb_loss.backward()
