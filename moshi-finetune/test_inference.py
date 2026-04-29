@@ -491,7 +491,7 @@ def run_test_inference(args):
             # 5) Optional face motion generation
             if face_gen is not None:
                 try:
-                    motion = face_gen.generate_numpy(vap_mimi)  # [T_face, 54]
+                    motion = face_gen.generate_numpy(vap_mimi)  # [T_face, 56]
                     out_face = os.path.join(args.output_dir, f"{base_name}_face_motion.npy")
                     np.save(out_face, motion)
                     log("info", f"Saved face motion to {out_face} (shape: {list(motion.shape)})")

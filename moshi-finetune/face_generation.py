@@ -89,7 +89,7 @@ class FaceGenerator:
         """Decode accumulated audio tokens and generate face motion.
 
         mimi: MimiModel instance (vap_mimi is ideal — no streaming state).
-        Returns [B, T_face, 54] float32 on the model's device.
+        Returns [B, T_face, 54] float32 on the model's device (raw model output).
         """
         if not self._agent_tokens:
             raise RuntimeError("No steps accumulated. Call add_step() before generate().")
@@ -111,5 +111,16 @@ class FaceGenerator:
         return motion  # [B, T_face, 54]
 
     def generate_numpy(self, mimi) -> np.ndarray:
-        """Convenience wrapper: returns motion as a numpy array [T_face, 54]."""
-        return self.generate(mimi)[0].cpu().float().numpy()
+        """Convenience wrapper: returns motion as a numpy array [T_face, 56].
+
+        Layout: [0:50]=expressions, [50]=jaw_open, [51:52]=zero (new jaw dims),
+                [53:56]=neck/rotation (shifted from original [51:54]).
+        """
+        motion = self.generate(mimi)[0].cpu().float().numpy()  # [T_face, 54]
+        T = motion.shape[0]
+        motion_56 = np.zeros((T, 56), dtype=np.float32)
+        motion_56[:, :50] = motion[:, :50]    # expressions
+        motion_56[:, 50] = motion[:, 50]      # jaw open/close
+        # indices 51, 52 are new jaw dimensions — zero-padded
+        motion_56[:, 53:56] = motion[:, 51:54]  # neck/rotation
+        return motion_56

@@ -259,7 +259,7 @@ def infer_one(
     # Face motion generation (post-loop, uses accumulated tokens/z)
     if face_gen is not None and getattr(face_gen, "_agent_tokens", None):
         try:
-            motion = face_gen.generate_numpy(vap_mimi)  # [T_face, 54]
+            motion = face_gen.generate_numpy(vap_mimi)  # [T_face, 56]
             face_out = inp.parent / "face_motion.npy"
             np.save(str(face_out), motion)
         except Exception as _e:
