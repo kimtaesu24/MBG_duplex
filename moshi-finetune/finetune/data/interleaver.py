@@ -451,8 +451,11 @@ class InterleavedTokenizer:
             valid_mask[:actual_mimi_frames] = True
 
             n_face_frames = int(self.duration_sec * self._motion_fps)
+            # Use ceil to be consistent with actual_mimi_frames above.
+            # floor would exclude the last 1–2 face frames that correspond to
+            # the last valid mimi frame (since face_fps = 2 × mimi_fps).
             valid_face_frames = min(
-                int(actual_wav_samples / self.mimi_sample_rate * self._motion_fps),
+                math.ceil(actual_wav_samples / self.mimi_sample_rate * self._motion_fps),
                 n_face_frames,
             )
 

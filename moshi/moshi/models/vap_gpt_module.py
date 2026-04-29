@@ -690,28 +690,28 @@ class VapGPTBackchannelModule(nn.Module):
         # ── Step 5: BC gate (agent-side context → PAD / EPAD decision) ───
         z_bc = self.bc_mlp(out["x2"])  # [B, T, 2]
         y_bc_onehot = gumbel_softmax_st(z_bc, temperature=temp, hard=True)
-        y_bc = y_bc_onehot[..., 1]    # [B, T],  1 = insert backchannel
+        y_bc = y_bc_onehot[..., 1]    # [B, T], hard {0,1} for g_final
+
+        # ── Alt 1: Silence gate ───────────────────────────────────────────
+        s_pad_logits = self.silence_gate_mlp(out["x"].detach())  # [B, T, 2]
+        s_pad_onehot = gumbel_softmax_st(s_pad_logits, temperature=temp, hard=True)
+        s_pad = s_pad_onehot[..., 1]  # [B, T], hard {0,1} for g_final
+
+        # Hard gate used at inference for discrete token replacement.
+        g_final = s_pad * y_bc  # [B, T]
+
+        # Soft gate for training embedding — product of raw softmax probs (no Gumbel, no ST).
+        # Both gates contribute gradient at every timestep; no blocking from the other being 0.
+        y_bc_soft = F.softmax(z_bc, dim=-1)[..., 1]          # [B, T]
+        s_pad_soft = F.softmax(s_pad_logits, dim=-1)[..., 1]  # [B, T]
+        g_soft = y_bc_soft * s_pad_soft                        # [B, T], always in (0,1)
 
         pad_ids = torch.full((1,), self.pad_token_id, device=device, dtype=torch.long)
         epad_ids = torch.full((1,), self.epad_token_id, device=device, dtype=torch.long)
         pad_emb = emb_cb0(pad_ids)    # [1, depformer_dim]
         epad_emb = emb_cb0(epad_ids)  # [1, depformer_dim]
-
-        y_bc_exp = y_bc.unsqueeze(-1)
-        bc_token_emb = y_bc_exp * epad_emb + (1.0 - y_bc_exp) * pad_emb  # [B, T, depformer_dim]
-
-        # ── Alt 1: Silence gate ───────────────────────────────────────────
-        # out["x"].detach(): combined VapGPT output에 화자 교대 정보가 풍부하게 담겨
-        # 있으므로 raw z_s보다 침묵 예측에 적합. detach로 VapGPT/Helium 보호.
-        s_pad_logits = self.silence_gate_mlp(out["x"].detach())  # [B, T, 2]
-        s_pad_onehot = gumbel_softmax_st(s_pad_logits, temperature=temp, hard=True)
-        s_pad = s_pad_onehot[..., 1]  # [B, T], 1 = silence predicted
-
-        # Final gate: backchannel only when BOTH conditions met
-        g_final = s_pad * y_bc  # [B, T]
-
-        # bc_embeddings = bc_token_emb (PAD/EPAD 보간값).
-        # cb_index=0 게이팅 ((1-g)*gt_emb + g*bc_embeddings)은 lm.py에서 처리 (Alt 2).
+        g_soft_exp = g_soft.unsqueeze(-1)
+        bc_token_emb = g_soft_exp * epad_emb + (1.0 - g_soft_exp) * pad_emb  # [B, T, depformer_dim]
         return BackchannelOutput(
             bc_embeddings=bc_token_emb,
             vap_logits=vap_logits,

@@ -390,6 +390,7 @@ def run_test_inference(args):
             
         generated_frames = []
         generated_text_tokens = []
+        bc_gate_log = []
         special_token_map = {0: 'EPAD', 1: 'BOS', 2: 'EOS', 3: 'PAD'}
 
         if face_gen is not None:
@@ -409,9 +410,10 @@ def run_test_inference(args):
                     tokens, z = result
                     face_gen.add_step(tokens, z)
                 else:
-                    tokens = lm_gen.step(user_encoded[:, :, c:c+1])
-                    if tokens is None:
+                    result = lm_gen.step(user_encoded[:, :, c:c+1], return_z=True)
+                    if result is None or result[0] is None:
                         continue
+                    tokens, z = result
 
                 generated_frames.append(decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens))
 
@@ -421,6 +423,29 @@ def run_test_inference(args):
                 else:
                     _t = text_tokenizer.id_to_piece(text_id).replace("▁", " ")
                     generated_text_tokens.append(_t)
+
+                # Level 2: BC gate analysis — log per-step gate internals
+                _PAD  = lm_gen.lm_model.text_padding_token_id
+                _EPAD = lm_gen.lm_model.end_of_text_padding_id
+                _label = "PAD" if text_id == _PAD else ("EPAD" if text_id == _EPAD else f"WORD({text_id})")
+                _bc_module = getattr(lm_gen.lm_model, "backchannel", None)
+                if _bc_module is not None and z is not None:
+                    with torch.no_grad():
+                        _bc = _bc_module(z, emb_cb0=lm_gen.lm_model.depformer_text_emb, step=999_999)
+                    _y_bc   = _bc.bc_logits[0, 0].softmax(-1)[1].item()
+                    _s_pad  = _bc.silence_gate_logits[0, 0].softmax(-1)[1].item()
+                    _g_soft = _y_bc * _s_pad
+                    _g_final = int(_bc.bc_gate[0, 0].item())
+                    print(f"[BC] step={c:4d} | token={_label:14s} | y_bc={_y_bc:.3f}  s_pad={_s_pad:.3f}  g_soft={_g_soft:.3f}  g_final={_g_final}")
+                    bc_gate_log.append({
+                        "step": c,
+                        "token_id": text_id,
+                        "token_label": _label,
+                        "y_bc": round(_y_bc, 4),
+                        "s_pad": round(_s_pad, 4),
+                        "g_soft": round(_g_soft, 4),
+                        "g_final": _g_final,
+                    })
                     
         # Save outputs
         if generated_frames:
@@ -453,9 +478,14 @@ def run_test_inference(args):
             merged_pcm = np.stack([input_pcm, output_pcm], axis=0)  # [2, T]
             sphn.write_wav(out_merged_wav, merged_pcm, mimi.sample_rate)
             
-            # 4) Save text tokens
+            # 4) Save text tokens + BC gate analysis log into same file
             with open(out_text, 'w') as f:
-                json.dump(generated_text_tokens, f, ensure_ascii=False)
+                json.dump({
+                    "text_tokens": generated_text_tokens,
+                    "bc_gate_log": bc_gate_log,
+                }, f, indent=2, ensure_ascii=False)
+            log("info", f"Saved text tokens + BC gate log → {out_text}")
+
             log("info", f"Saved {out_input_wav}, {out_output_wav}, {out_merged_wav}")
 
             # 5) Optional face motion generation

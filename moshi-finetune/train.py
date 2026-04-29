@@ -371,6 +371,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         loss = torch.tensor([0.0], device="cuda")
         vap_loss_val = torch.tensor([0.0], device="cuda")
         face_loss_val = torch.tensor([0.0], device="cuda")
+        bc_stats_accum: dict | None = None
         n_batch_tokens: int = 0
         n_real_tokens: int = 0
 
@@ -409,16 +410,13 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 output = model(codes, step=state.step, voice_prompt_embs=voice_prompt_embs,
                                audio_feat=audio_feat, gt_face_motion=gt_face_motion)
 
-                # ── Silence-padding mask ──────────────────────────────────────
-                # Short clips (<10s) are zero-padded before mimi encoding, producing
-                # silence tokens that must be excluded from all loss terms.
-                # valid_mask: [B, T_mimi] bool  (None when all clips are full 10s)
+                # Silence-padded frames (mimi tokens from zero-padded waveform) are kept
+                # in audio/text loss intentionally: they provide backbone regularization,
+                # teaching the model to suppress output after real content ends.
+                # Text at padded positions is already zero_token_id (-1) → text_mask=False
+                # regardless; the audio silence tokens are the meaningful signal here.
                 text_mask = output.text_mask
                 audio_mask = output.mask
-                if batch.valid_mask is not None:
-                    valid = batch.valid_mask.to(codes.device).unsqueeze(1)  # [B, 1, T]
-                    text_mask = text_mask & valid
-                    audio_mask = audio_mask & valid
 
                 text_loss = compute_loss_with_mask(
                     output.text_logits,
@@ -508,6 +506,12 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 mb_loss.backward()
 
             loss += mb_loss.detach()
+            if args.backchannel.enable and output.bc_stats is not None:
+                if bc_stats_accum is None:
+                    bc_stats_accum = {k: v.clone() for k, v in output.bc_stats.items()}
+                else:
+                    for k in bc_stats_accum:
+                        bc_stats_accum[k] = bc_stats_accum[k] + output.bc_stats[k]
             del output, mb_loss, text_loss, audio_loss
             if args.backchannel.enable and vap_loss is not None:
                 del vap_loss
@@ -518,6 +522,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             loss /= args.num_microbatches
             if args.backchannel.enable:
                 vap_loss_val /= args.num_microbatches
+                if bc_stats_accum is not None:
+                    for k in bc_stats_accum:
+                        bc_stats_accum[k] = bc_stats_accum[k] / args.num_microbatches
             if args.face_gen.enable:
                 face_loss_val /= args.num_microbatches
             for p in model.parameters():
@@ -567,6 +574,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
         # 타이밍
         state.end_step(n_batch_tokens)
+
+        if args.backchannel.enable and bc_stats_accum is not None and state.step % args.log_freq == 0:
+            state.this_bc_stats = {k: avg_aggregate(v.item()) for k, v in bc_stats_accum.items()}
 
         if state.step % args.log_freq == 0:
             train_logs = get_train_logs(

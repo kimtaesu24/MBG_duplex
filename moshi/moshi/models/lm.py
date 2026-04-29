@@ -72,6 +72,7 @@ class LMOutput:
     commitment_loss: Optional[torch.Tensor] = None    # scalar — Alt 3 commitment loss
     face_pred: Optional[torch.Tensor] = None           # [B, T_face, 54] teacher-forced face motion
     face_outputs: Optional[dict] = None                # full CausalSoftVQContinuousTransformer output dict
+    bc_stats: Optional[dict] = None                    # scalar tensors: y_bc_mean, s_pad_mean, g_soft_mean, g_final_rate
 
 
 def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -716,6 +717,7 @@ class LMModel(StreamingContainer):
         # ── Backchannel Module ────────────────────────────────────────────
         vap_logits = None
         commitment_loss = None
+        bc_stats = None
         if self.backchannel is not None:
             target_codes = delayed_codes[:, :, 1:]
 
@@ -728,9 +730,10 @@ class LMModel(StreamingContainer):
 
             # Build a differentiable conditioned embedding for the depformer's text slot:
             #   - PAD positions : bc_result.bc_embeddings
-            #                     = y_bc * epad_emb(0) + (1-y_bc) * pad_emb(3)
-            #                     differentiable via Gumbel-Softmax ST → gradient flows
-            #                     back to bc_mlp through y_bc.
+            #                     = g_soft * epad_emb + (1-g_soft) * pad_emb
+            #                     g_soft = y_bc_soft * s_pad_soft (raw softmax, no ST)
+            #                     → gradient flows to both bc_mlp and silence_gate_mlp
+            #                       at every PAD timestep without blocking.
             #   - non-PAD positions : GT token embedding (word tokens / EPAD already in data)
             # The text_loss target (codes[:, :1]) is left unchanged.
             gt_text_emb = self.depformer_text_emb(target_codes[:, 0])   # [B, T, depformer_dim]
@@ -756,6 +759,15 @@ class LMModel(StreamingContainer):
                 bc_result.silence_gate_logits[..., 1], 1.0 - epad_prob,
             )
             commitment_loss = bc_commit + silence_commit
+
+            y_bc_soft = F.softmax(bc_result.bc_logits, dim=-1)[..., 1]
+            s_pad_soft = F.softmax(bc_result.silence_gate_logits, dim=-1)[..., 1]
+            bc_stats = {
+                "bc/y_bc_mean":    y_bc_soft.detach().mean(),
+                "bc/s_pad_mean":   s_pad_soft.detach().mean(),
+                "bc/g_soft_mean":  (y_bc_soft * s_pad_soft).detach().mean(),
+                "bc/g_final_rate": bc_result.bc_gate.detach().mean(),
+            }
         else:
             logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
 
@@ -785,7 +797,7 @@ class LMModel(StreamingContainer):
             face_pred = face_outputs["pred_motion"]  # [B, T_face, 54]
 
         return LMOutput(logits, logits_mask, text_logits, text_logits_mask, vap_logits, commitment_loss,
-                        face_pred, face_outputs)
+                        face_pred, face_outputs, bc_stats)
 
 @dataclass
 class _LMGenState:
@@ -1135,7 +1147,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # transformer_out is [B, 1, dim] in streaming mode; bc_gate is [B, 1].
         if lm_model.backchannel is not None:
             bc_result = lm_model.backchannel(
-                transformer_out, emb_cb0=lm_model.depformer_text_emb, step=0
+                transformer_out, emb_cb0=lm_model.depformer_text_emb, step=999_999
             )
             is_pad = (sampled_text_token == lm_model.text_padding_token_id)
             gate_fires = bc_result.bc_gate[:, 0].bool()  # [B]

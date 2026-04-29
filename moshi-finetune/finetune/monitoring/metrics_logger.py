@@ -48,6 +48,9 @@ def get_train_logs(
     if state.this_face_loss is not None:
         metrics["face_loss"] = state.this_face_loss
 
+    if state.this_bc_stats is not None:
+        metrics.update(state.this_bc_stats)
+
     return metrics
 
 

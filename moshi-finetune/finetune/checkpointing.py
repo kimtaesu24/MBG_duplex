@@ -115,56 +115,28 @@ class Checkpointer:
 
         offload_to_cpu = get_world_size() > 1
         if save_only_lora:
-
-            def is_trainable_fsdp(module: torch.nn.Module | FullyShardedDataParallel):
-                is_fsdp = (
-                    isinstance(module, FullyShardedDataParallel)
-                    or get_world_size() == 1
-                )
-                all_params_have_grads = is_fsdp and all(
-                    p.requires_grad for p in module.parameters()
-                )
-
-                # need to make sure only lowest fsdp wrap is used
-                is_leaf_node = is_fsdp and (
-                    get_world_size() == 1 or len(list(module.module.children())) == 0
-                )  # type: ignore
-
-                return is_fsdp and all_params_have_grads and is_leaf_node
-
-            # extract all modules with only trainable weights
-            modules = {
-                k: m for k, m in self.model.named_modules() if is_trainable_fsdp(m)
+            assert (
+                isinstance(self.model, FullyShardedDataParallel)
+                or get_world_size() == 1
+            )
+            trainable_names = {
+                n for n, p in self.model.named_parameters() if p.requires_grad
             }
-
-            states = {}
-            for key, module in modules.items():
-                assert (
-                    isinstance(module, FullyShardedDataParallel)
-                    or get_world_size() == 1
-                ), (
-                    "`module` should be an instance of `FullyShardedDataParallel` if `world_size > 1`"
-                )
-                parent_prefix = key.replace("_fsdp_wrapped_module.", "").replace(
-                    "_checkpoint_wrapped_module.", ""
-                )
-                if get_world_size() > 1:
-                    with module.summon_full_params(
-                        module, writeback=True, offload_to_cpu=offload_to_cpu
-                    ):
-                        states.update(
-                            {
-                                f"{parent_prefix}.{k}": v.to(dtype=save_dtype)
-                                for k, v in module.state_dict().items()
-                            }
-                        )
-                else:
-                    states.update(
-                        {
-                            f"{parent_prefix}.{k}": v.to(device="cpu", dtype=save_dtype)
-                            for k, v in module.state_dict().items()
-                        }
-                    )
+            if get_world_size() > 1:
+                with self.model.summon_full_params(
+                    self.model, writeback=True, offload_to_cpu=offload_to_cpu
+                ):
+                    states = {
+                        k: v.to(dtype=save_dtype)
+                        for k, v in self.model.state_dict().items()
+                        if k in trainable_names
+                    }
+            else:
+                states = {
+                    k: v.to(device="cpu", dtype=save_dtype)
+                    for k, v in self.model.state_dict().items()
+                    if k in trainable_names
+                }
         else:
             # merge weights if we don't just save LoRA
             if _has_lora and LoRALinear is not None:
