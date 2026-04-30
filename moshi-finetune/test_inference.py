@@ -291,8 +291,12 @@ def run_test_inference(args):
             "All samples will use the default voice prompt. "
             "To use per-sample voice prompts, pass data_with_voice_sample.jsonl as --test-jsonl.")
 
-    text_prompt = "<system> You are a highly realistic conversational AI. You should listen attentively. <system>"
-    lm_gen.text_prompt_tokens = text_tokenizer.encode(text_prompt)
+    text_prompt = config.get("text_prompt", "")
+    lm_gen.text_prompt_tokens = text_tokenizer.encode(text_prompt) if text_prompt else []
+    if text_prompt:
+        log("info", f"텍스트 프롬프트 적용 ({len(lm_gen.text_prompt_tokens)}토큰): {text_prompt!r}")
+    else:
+        log("info", "텍스트 프롬프트 없음 (config에 text_prompt 미설정)")
 
     # 5-a) Use the end-to-end trained face_module from the finetuned checkpoint.
     # lm.face_module was instantiated with pretrained weights by get_moshi_lm()

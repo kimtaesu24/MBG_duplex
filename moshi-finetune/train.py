@@ -290,6 +290,16 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     spm = sentencepiece.SentencePieceProcessor()
     spm.Load(tokenizer_path)
 
+    # ── 텍스트 프롬프트 사전 토크나이즈 ──────────────────────────────────
+    # inference의 lm_gen.text_prompt_tokens = spm.encode(text_prompt) 와 동일.
+    prompt_ids: list[int] = spm.encode(args.text_prompt) if args.text_prompt else []
+    T_p: int = len(prompt_ids)
+    if T_p:
+        main_logger_info(
+            f"텍스트 프롬프트 활성화: {T_p}토큰 prefix로 삽입 "
+            f"(inference step_system_prompts 정렬)\n  프롬프트: {args.text_prompt!r}"
+        )
+
     interleaver = Interleaver(
         spm,
         mimi.frame_rate,
@@ -379,6 +389,22 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             batch = next(data_loader)
             codes = batch.codes  # [B, K, T]
 
+            # ── 텍스트 프롬프트 prefix 삽입 ───────────────────────────────
+            # inference: step_system_prompts() → _step_text_prompt_core()에서
+            # 토큰마다 text_token=prompt_id, audio=silence 로 step()을 호출하는 것과 동일.
+            # 학습: codes의 앞에 [prompt_ids ; zero_token_id×(K-1)] 블록을 붙임.
+            # 손실은 prefix 구간을 제외하고 원본 codes에 대해서만 계산.
+            if T_p:
+                prefix = torch.full(
+                    [codes.shape[0], codes.shape[1], T_p],
+                    model.zero_token_id,
+                    device=codes.device, dtype=codes.dtype,
+                )
+                prefix[:, 0, :] = torch.tensor(prompt_ids, device=codes.device)
+                codes_in = torch.cat([prefix, codes], dim=2)  # [B, K, T_p+T]
+            else:
+                codes_in = codes
+
             # 마지막 microbatch 전까지는 FSDP all-reduce 억제 (단일 GPU는 no_sync 없으므로 스킵)
             sync_ctx = (
                 contextlib.nullcontext()
@@ -404,10 +430,25 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                         audio_codes = codes[:, 1:9].clamp(min=0)
                         audio_feat = mimi.decode_latent(audio_codes).transpose(1, 2)  # [B, T, 512]
                         audio_feat = audio_feat.to(dtype=param_dtype)
+                        if T_p:
+                            # Prepend T_p silence frames so audio_feat aligns with codes_in.
+                            zero_feat = torch.zeros(
+                                codes.shape[0], T_p, audio_feat.shape[2],
+                                device=audio_feat.device, dtype=audio_feat.dtype,
+                            )
+                            audio_feat = torch.cat([zero_feat, audio_feat], dim=1)  # [B, T_p+T, 512]
                     if batch.face_motion_gt is not None:
                         gt_face_motion = batch.face_motion_gt.to(codes.device, dtype=param_dtype)
+                        if T_p:
+                            # Face runs at 25fps = 2× mimi 12.5fps → T_p mimi frames = 2*T_p face frames.
+                            T_face_p = T_p * 2
+                            zero_motion = torch.zeros(
+                                codes.shape[0], T_face_p, gt_face_motion.shape[2],
+                                device=gt_face_motion.device, dtype=gt_face_motion.dtype,
+                            )
+                            gt_face_motion = torch.cat([zero_motion, gt_face_motion], dim=1)
 
-                output = model(codes, step=state.step, voice_prompt_embs=voice_prompt_embs,
+                output = model(codes_in, step=state.step, voice_prompt_embs=voice_prompt_embs,
                                audio_feat=audio_feat, gt_face_motion=gt_face_motion)
 
                 # Silence-padded frames (mimi tokens from zero-padded waveform) are kept
@@ -415,11 +456,12 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 # teaching the model to suppress output after real content ends.
                 # Text at padded positions is already zero_token_id (-1) → text_mask=False
                 # regardless; the audio silence tokens are the meaningful signal here.
-                text_mask = output.text_mask
-                audio_mask = output.mask
+                # Slice off the T_p prompt-prefix frames — loss is on the conversation only.
+                text_mask = output.text_mask[:, :, T_p:]
+                audio_mask = output.mask[:, :, T_p:]
 
                 text_loss = compute_loss_with_mask(
-                    output.text_logits,
+                    output.text_logits[:, :, T_p:],
                     codes[:, : model.audio_offset],
                     text_mask,
                     mode="text",
@@ -429,7 +471,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     epad_weight=args.epad_weight,
                 )
                 audio_loss = compute_loss_with_mask(
-                    output.logits,
+                    output.logits[:, :, T_p:],
                     codes[:, model.audio_offset : model.audio_offset + model.dep_q],
                     audio_mask,
                     mode="audio",
@@ -441,7 +483,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 # ── VAP 보조 손실 ─────────────────────────────────────────
                 vap_loss = None
                 if args.backchannel.enable:
-                    vap_logits = output.vap_logits  # [B, T, 256] from BackchannelModule inside LM
+                    # Slice off prompt prefix so VAP logits align with batch.vap_targets [B, T].
+                    vap_logits = output.vap_logits[:, T_p:] if output.vap_logits is not None else None
 
                     if vap_logits is not None:
                         vap_targets_tensor = batch.vap_targets  # [B, T]
@@ -457,7 +500,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                                 num_vap_classes = vap_logits.shape[-1]
                                 flat_targets = flat_targets.clamp(-100, num_vap_classes - 1)
                                 vap_loss = F.cross_entropy(
-                                    vap_logits.view(-1, num_vap_classes),
+                                    vap_logits.reshape(-1, num_vap_classes),
                                     flat_targets,
                                     ignore_index=-100,
                                 )
@@ -481,12 +524,20 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 face_loss = None
                 if (args.face_gen.enable and output.face_outputs is not None
                         and gt_face_motion is not None and face_codec is not None):
-                    # Build [B, T_face] bool mask from per-sample valid frame counts
+                    # Build [B, T_face] bool mask.
+                    # When T_p > 0, gt_face_motion was prepended with 2*T_p zero frames
+                    # (face runs at 25fps = 2× mimi 12.5fps) — exclude those from loss.
+                    T_face_p = T_p * 2
                     valid_face_mask = None
-                    if batch.valid_face_frames is not None:
+                    if T_p or batch.valid_face_frames is not None:
                         T_face = gt_face_motion.shape[1]
                         t_idx = torch.arange(T_face, device=codes.device).unsqueeze(0)  # [1, T_face]
-                        valid_face_mask = t_idx < batch.valid_face_frames.to(codes.device).unsqueeze(1)  # [B, T_face]
+                        if batch.valid_face_frames is not None:
+                            valid_face_mask = (t_idx >= T_face_p) & (
+                                t_idx < T_face_p + batch.valid_face_frames.to(codes.device).unsqueeze(1)
+                            )
+                        else:
+                            valid_face_mask = t_idx >= T_face_p  # [1, T_face], broadcasts to [B, T_face]
                     face_loss = compute_face_loss(
                         output.face_outputs, gt_face_motion, face_codec, args.face_gen,
                         valid_face_mask=valid_face_mask,

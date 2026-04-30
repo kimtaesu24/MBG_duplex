@@ -188,6 +188,12 @@ class TrainArgs(Serializable):
     text_padding_weight: float = 0.5
     epad_weight: float = 1.0  # EPAD(end-of-text-padding) 토큰 손실 가중치 (PAD와 별도)
 
+    # 텍스트 프롬프트 (에이전트 지시문)
+    # 비어 있으면 프롬프트 없이 학습 (기존 동작 유지).
+    # 설정 시 매 학습 스텝에서 codes의 앞에 접두사로 삽입되어
+    # inference의 step_system_prompts() 와 동일한 방식으로 LM에 제공됩니다.
+    text_prompt: str = ""
+
     optim: OptimArgs = field(default_factory=OptimArgs)
     seed: int = 0
     num_microbatches: int = 1   # 그래디언트 누적 횟수
