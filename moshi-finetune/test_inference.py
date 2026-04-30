@@ -396,6 +396,7 @@ def run_test_inference(args):
         generated_text_tokens = []
         bc_gate_log = []
         special_token_map = {0: 'EPAD', 1: 'BOS', 2: 'EOS', 3: 'PAD'}
+        _prev_bc_result = None  # BC result from the previous step, aligned with the current returned token
 
         if face_gen is not None:
             face_gen.reset()
@@ -428,28 +429,28 @@ def run_test_inference(args):
                     _t = text_tokenizer.id_to_piece(text_id).replace("▁", " ")
                     generated_text_tokens.append(_t)
 
-                # Level 2: BC gate analysis — log per-step gate internals
+                # Level 2: BC gate analysis — use result from the same forward pass (no separate call).
+                # _prev_bc_result is the BC output from the previous step, which corresponds to the
+                # token being returned now (1-frame offset from the delay buffer).
                 _PAD  = lm_gen.lm_model.text_padding_token_id
                 _EPAD = lm_gen.lm_model.end_of_text_padding_id
                 _label = "PAD" if text_id == _PAD else ("EPAD" if text_id == _EPAD else f"WORD({text_id})")
-                _bc_module = getattr(lm_gen.lm_model, "backchannel", None)
-                if _bc_module is not None and z is not None:
-                    with torch.no_grad():
-                        _bc = _bc_module(z, emb_cb0=lm_gen.lm_model.depformer_text_emb, step=999_999)
-                    _y_bc   = _bc.bc_logits[0, 0].softmax(-1)[1].item()
-                    _s_pad  = _bc.silence_gate_logits[0, 0].softmax(-1)[1].item()
-                    _g_soft = _y_bc * _s_pad
-                    _g_final = int(_bc.bc_gate[0, 0].item())
-                    print(f"[BC] step={c:4d} | token={_label:14s} | y_bc={_y_bc:.3f}  s_pad={_s_pad:.3f}  g_soft={_g_soft:.3f}  g_final={_g_final}")
-                    bc_gate_log.append({
-                        "step": c,
-                        "token_id": text_id,
-                        "token_label": _label,
-                        "y_bc": round(_y_bc, 4),
-                        "s_pad": round(_s_pad, 4),
-                        "g_soft": round(_g_soft, 4),
-                        "g_final": _g_final,
-                    })
+                if getattr(lm_gen.lm_model, "backchannel", None) is not None:
+                    if _prev_bc_result is not None:
+                        _y_bc   = _prev_bc_result.bc_logits[0, 0].softmax(-1)[1].item()
+                        _s_pad  = _prev_bc_result.silence_gate_logits[0, 0].softmax(-1)[1].item()
+                        _g_soft = _y_bc * _s_pad
+                        _g_final = int(_prev_bc_result.bc_gate[0, 0].item())
+                        print(f"token={_label:14s} | y_bc={_y_bc:.3f}  s_pad={_s_pad:.3f}  g_soft={_g_soft:.3f}  g_final={_g_final}")
+                        bc_gate_log.append({
+                            "token_id": text_id,
+                            "token_label": _label,
+                            "y_bc": round(_y_bc, 4),
+                            "s_pad": round(_s_pad, 4),
+                            "g_soft": round(_g_soft, 4),
+                            "g_final": _g_final,
+                        })
+                    _prev_bc_result = getattr(lm_gen.lm_model, "_last_bc_result", None)
                     
         # Save outputs
         if generated_frames:
