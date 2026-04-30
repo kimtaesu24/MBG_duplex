@@ -130,12 +130,9 @@ def get_fsdp_model(
         # face_module / backchannel 은 full fine-tuning 이므로 제외.
         # PEFT는 target_modules가 문자열이면 re.fullmatch(pattern, full_module_key)로 매칭하므로
         # 네거티브 룩어헤드로 face_module/backchannel 경로를 명시적으로 배제한다.
-        # NOTE: linear_in/linear_out (ActivationGating) excluded — ActivationGating.forward()
-        # calls gating_forward_kernel(self.linear_in.weight, ...) which bypasses the module's
-        # __call__ entirely, so PEFT LoRA wrapping corrupts the weight tensor access.
         target_modules = (
             r"(?!.*(face_module|backchannel))"
-            r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj)"
+            r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj|linear_in|linear_out)"
         )
         
         peft_config = LoraConfig(

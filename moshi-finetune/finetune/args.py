@@ -186,6 +186,7 @@ class TrainArgs(Serializable):
     # 손실 가중치
     first_codebook_weight_multiplier: float = 1.0
     text_padding_weight: float = 0.5
+    epad_weight: float = 1.0  # EPAD(end-of-text-padding) 토큰 손실 가중치 (PAD와 별도)
 
     optim: OptimArgs = field(default_factory=OptimArgs)
     seed: int = 0

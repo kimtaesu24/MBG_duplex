@@ -99,6 +99,44 @@ class Checkpointer:
             if not any(l_key in k for l_key in ["lora", "frozen"])
         }
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Helper: keys to save in hybrid LoRA + full-finetune mode.
+    #
+    # When the backbone is LoRA-finetuned but face_module / backchannel are
+    # full-finetuned, we want to persist:
+    #   1. All LoRA adapter tensors  (lora_A, lora_B, …)
+    #   2. All face_module parameters
+    #   3. All backchannel parameters
+    #
+    # We derive the set from the state_dict keys directly (avoiding the
+    # FSDP flat-param name mismatch that occurs with named_parameters()).
+    # ──────────────────────────────────────────────────────────────────────
+    _FULL_FINETUNE_PREFIXES: tuple[str, ...] = ("face_module", "backchannel")
+    _LORA_KEYWORDS: tuple[str, ...] = ("lora_A", "lora_B", "lora_embedding",
+                                        "lora_magnitude", "lora_dropout")
+
+    @classmethod
+    def _is_hybrid_save_key(cls, key: str) -> bool:
+        """Return True if *key* should be included in a hybrid LoRA checkpoint.
+
+        Included:
+          - LoRA adapter weights (lora_A / lora_B / …)
+          - face_module.* and backchannel.* parameters (full fine-tune)
+        Excluded:
+          - frozen base-model weights (neither LoRA nor full-FT modules)
+        """
+        # LoRA adapter tensors
+        if any(kw in key for kw in cls._LORA_KEYWORDS):
+            return True
+        # Full-finetune sub-modules
+        # Normalise PEFT / FSDP path prefixes (e.g. "base_model.model.model.")
+        # by checking *any* segment of the dot-split key.
+        segments = key.split(".")
+        for prefix in cls._FULL_FINETUNE_PREFIXES:
+            if any(seg == prefix or seg.startswith(prefix) for seg in segments):
+                return True
+        return False
+
     @torch.no_grad()
     def retrieve_save_states(
         self, save_only_lora: bool, save_dtype: torch.dtype
@@ -115,28 +153,35 @@ class Checkpointer:
 
         offload_to_cpu = get_world_size() > 1
         if save_only_lora:
+            # ── Hybrid mode: LoRA backbone + full-finetune face/VAP ──────────
+            # Collect trainable state-dict keys by inspecting the state_dict
+            # directly (avoids FSDP flat-param name mismatch).
             assert (
                 isinstance(self.model, FullyShardedDataParallel)
                 or get_world_size() == 1
             )
-            trainable_names = {
-                n for n, p in self.model.named_parameters() if p.requires_grad
-            }
             if get_world_size() > 1:
                 with self.model.summon_full_params(
                     self.model, writeback=True, offload_to_cpu=offload_to_cpu
                 ):
+                    full_sd = self.model.state_dict()
                     states = {
                         k: v.to(dtype=save_dtype)
-                        for k, v in self.model.state_dict().items()
-                        if k in trainable_names
+                        for k, v in full_sd.items()
+                        if self._is_hybrid_save_key(k)
                     }
             else:
+                full_sd = self.model.state_dict()
                 states = {
                     k: v.to(device="cpu", dtype=save_dtype)
-                    for k, v in self.model.state_dict().items()
-                    if k in trainable_names
+                    for k, v in full_sd.items()
+                    if self._is_hybrid_save_key(k)
                 }
+
+            main_logger_info(
+                f"[Checkpointer] Hybrid save: {len(states)} tensors "
+                f"(LoRA adapters + face_module + backchannel)"
+            )
         else:
             # merge weights if we don't just save LoRA
             if _has_lora and LoRALinear is not None:

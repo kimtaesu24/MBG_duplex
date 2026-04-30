@@ -424,10 +424,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     text_mask,
                     mode="text",
                     text_padding_weight=args.text_padding_weight,
-                    text_padding_ids={
-                        model.text_padding_token_id,
-                        model.end_of_text_padding_id,
-                    },
+                    text_padding_ids={model.text_padding_token_id},
+                    epad_ids={model.end_of_text_padding_id},
+                    epad_weight=args.epad_weight,
                 )
                 audio_loss = compute_loss_with_mask(
                     output.logits,

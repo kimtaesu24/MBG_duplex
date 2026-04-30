@@ -68,6 +68,8 @@ def _strip_peft_prefixes(state_dict: dict) -> dict:
             continue
         if k.startswith("base_model.model.model."):
             k = k[len("base_model.model.model."):]
+        elif k.startswith("base_model.model."):
+            k = k[len("base_model.model."):]
         cleaned[k] = v
     return cleaned
 
@@ -98,8 +100,11 @@ def load_checkpoint(lm, ckpt_dir):
 
         # 1. Load backchannel + face_module weights directly into LMModel.
         #    These modules are full-finetuned (no LoRA) and stored flat in lora.safetensors.
-        direct_weights = {k: v for k, v in state_dict.items()
-                          if k.startswith("backchannel.") or k.startswith("face_module.")}
+        def _is_direct_module_key(k: str) -> bool:
+            segments = k.split(".")
+            return any(seg in ("backchannel", "face_module") or seg.startswith("backchannel") or seg.startswith("face_module") for seg in segments)
+
+        direct_weights = {k: v for k, v in state_dict.items() if _is_direct_module_key(k)}
         if direct_weights:
             missing, _ = lm.load_state_dict(direct_weights, strict=False)
             bc_missing = [k for k in missing if "backchannel" in k]
@@ -119,12 +124,7 @@ def load_checkpoint(lm, ckpt_dir):
         #    → re-add one "base_model.model." prefix before loading.
         #
         #    target_modules must match training (wrapped_model.py).
-        #    In Personaplex, only out_proj and text_linear are plain nn.Linear
-        #    that PEFT can wrap — the other names in the regex don't match any
-        #    module in the actual graph.  face_module / backchannel are excluded
-        #    by the negative lookahead so their linear layers are left as-is.
-        lora_weights = {k: v for k, v in state_dict.items()
-                        if not k.startswith("backchannel.") and not k.startswith("face_module.")}
+        lora_weights = {k: v for k, v in state_dict.items() if not _is_direct_module_key(k)}
         if lora_weights:
             try:
                 from peft import get_peft_model, LoraConfig, TaskType
@@ -134,7 +134,7 @@ def load_checkpoint(lm, ckpt_dir):
                     lora_alpha=128,
                     target_modules=(
                         r"(?!.*(face_module|backchannel))"
-                        r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj)"
+                        r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj|linear_in|linear_out)"
                     ),
                     bias="none",
                 )

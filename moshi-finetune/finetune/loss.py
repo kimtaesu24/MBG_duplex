@@ -146,6 +146,8 @@ def compute_loss_with_mask(
     first_codebook_weight_multiplier: float = 1.0,
     text_padding_weight: float = 1.0,
     text_padding_ids: set[int] | None = None,
+    epad_weight: float = 1.0,
+    epad_ids: set[int] | None = None,
 ):
     target = torch.where(target_mask, target, torch.zeros_like(target))
 
@@ -156,6 +158,9 @@ def compute_loss_with_mask(
         assert text_padding_ids is not None
         for id in text_padding_ids:
             weights[target == id] *= text_padding_weight
+        if epad_ids is not None:
+            for id in epad_ids:
+                weights[target == id] *= epad_weight
 
     logits = logits.reshape(-1, logits.size(-1)).float()
     target = target.reshape(-1)
