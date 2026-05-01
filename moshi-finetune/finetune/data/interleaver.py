@@ -427,9 +427,9 @@ class InterleavedTokenizer:
                     matched_fid = fid
                     break
 
-            if matched_fid is None:
-                print(f"[WARNING] No VAP target found for '{raw_file_id}' "
-                      f"All targets set to -100.")
+            # if matched_fid is None:
+            #     print(f"[WARNING] No VAP target found for '{raw_file_id}' "
+            #           f"All targets set to -100.")
 
         # ── FLAME / 3DMM face motion ─────────────────────────────────────────
         face_motion_gt = None

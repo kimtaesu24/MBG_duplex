@@ -23,6 +23,7 @@ class TrainState:
     this_audio_loss: float | None = None
     this_text_loss: float | None = None
     this_vap_loss: float | None = None
+    this_commitment_loss: float | None = None
     this_face_loss: float | None = None
     this_bc_stats: dict | None = None
 

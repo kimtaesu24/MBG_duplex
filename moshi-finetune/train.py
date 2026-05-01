@@ -380,6 +380,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
         loss = torch.tensor([0.0], device="cuda")
         vap_loss_val = torch.tensor([0.0], device="cuda")
+        commitment_loss_val = torch.tensor([0.0], device="cuda")
         face_loss_val = torch.tensor([0.0], device="cuda")
         bc_stats_accum: dict | None = None
         n_batch_tokens: int = 0
@@ -519,6 +520,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     # Alt 3: Commitment loss — bc_mlp + silence_gate alignment with depformer
                     if output.commitment_loss is not None and not torch.isnan(output.commitment_loss):
                         mb_loss = mb_loss + args.backchannel.commitment_loss_weight * output.commitment_loss
+                        commitment_loss_val += output.commitment_loss.detach()
 
                 # ── Face motion reconstruction loss (full reference loss) ──
                 face_loss = None
@@ -572,6 +574,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             loss /= args.num_microbatches
             if args.backchannel.enable:
                 vap_loss_val /= args.num_microbatches
+                commitment_loss_val /= args.num_microbatches
                 if bc_stats_accum is not None:
                     for k in bc_stats_accum:
                         bc_stats_accum[k] = bc_stats_accum[k] / args.num_microbatches
@@ -594,6 +597,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         avg_loss = avg_aggregate(loss_item)
         if args.backchannel.enable:
             state.this_vap_loss = avg_aggregate(vap_loss_val.item())
+            state.this_commitment_loss = avg_aggregate(commitment_loss_val.item())
         if args.face_gen.enable:
             state.this_face_loss = avg_aggregate(face_loss_val.item())
 

@@ -45,6 +45,9 @@ def get_train_logs(
     if state.this_vap_loss is not None:
         metrics["vap_loss"] = state.this_vap_loss
 
+    if state.this_commitment_loss is not None:
+        metrics["commitment_loss"] = state.this_commitment_loss
+
     if state.this_face_loss is not None:
         metrics["face_loss"] = state.this_face_loss
 
@@ -87,13 +90,14 @@ def train_log_msg(state: TrainState, logs: dict[str, float | int], loss: float) 
     metrics["step"] = state.step
     metrics["loss"] = loss
 
-    optional_keys = {"vap_loss", "face_loss"}
+    optional_keys = {"vap_loss", "commitment_loss", "face_loss"}
     parts = []
     for key, fmt, new_name in [
         ("step", "06", None),
         ("percent_done", "03.1f", "done (%)"),
         ("loss", ".3f", None),
         ("vap_loss", ".3f", None),
+        ("commitment_loss", ".4f", None),
         ("face_loss", ".3f", None),
         ("lr", ".1e", None),
         ("peak_allocated_mem", ".1f", "peak_alloc_mem (GB)"),

@@ -1149,6 +1149,7 @@ class LMGen(StreamingModule[_LMGenState]):
             bc_result = lm_model.backchannel(
                 transformer_out, emb_cb0=lm_model.depformer_text_emb, step=999_999
             )
+            lm_model._last_bc_result = bc_result  # expose for external logging
             is_pad = (sampled_text_token == lm_model.text_padding_token_id)
             gate_fires = bc_result.bc_gate[:, 0].bool()  # [B]
             sampled_text_token = torch.where(

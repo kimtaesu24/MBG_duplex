@@ -353,8 +353,8 @@ def run_test_inference(args):
         if not os.path.isabs(input_wav):
             input_wav = os.path.join(jsonl_dir, input_wav)
         base_name = os.path.basename(input_wav).replace(".wav", "")
-        out_text = os.path.join(args.output_dir, f"out_{base_name}.json")
-        out_vap = os.path.join(args.output_dir, f"out_{base_name}_vap.json")
+        out_text = os.path.join(args.output_dir, f"{base_name}.json")
+        out_vap = os.path.join(args.output_dir, f"{base_name}_vap.json")
         
         log("info", f"[{i+1}/{len(samples)}] Processing {input_wav}...")
         
