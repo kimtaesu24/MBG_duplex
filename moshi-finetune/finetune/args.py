@@ -156,6 +156,11 @@ class FaceGenArgs(Serializable):
     flame_root: str = ""
     flame_speaker: str = "bc"  # primary speaker suffix for the agent channel
 
+    # When True, the audio feature fed to the face module is decoded from the
+    # model's own predicted audio codes (argmax of depformer logits) rather than
+    # from the ground-truth codes (teacher forcing).
+    use_generated_audio_feat: bool = False
+
     # ── Per-component loss weights (from reference pretraining) ───────────
     # Overall weight applied to the sum of all face sub-losses.
     face_loss_weight: float = 1.0

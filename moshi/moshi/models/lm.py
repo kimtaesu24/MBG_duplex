@@ -442,7 +442,7 @@ class LMModel(StreamingContainer):
                 # falling back to explicit constructor arguments.
                 ckpt_args: dict = {}
                 if face_module_checkpoint is not None:
-                    _raw = torch.load(face_module_checkpoint, map_location="cpu", weights_only=True)
+                    _raw = torch.load(face_module_checkpoint, map_location="cpu", weights_only=False)
                     ckpt_args = _raw.get("args", {})
                 face_net = _FaceModel(
                     hidden_dim=int(ckpt_args.get("hidden_dim", face_module_hidden_dim)),
@@ -687,12 +687,14 @@ class LMModel(StreamingContainer):
         return logits
 
     def forward(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
-                audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None):
+                audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None,
+                mimi=None):
         return self.forward_train(codes, step=step, voice_prompt_embs=voice_prompt_embs,
-                                  audio_feat=audio_feat, gt_face_motion=gt_face_motion)
+                                  audio_feat=audio_feat, gt_face_motion=gt_face_motion, mimi=mimi)
 
     def forward_train(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
-                      audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None):
+                      audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None,
+                      mimi=None):
         B, K, T = codes.shape
         # Delaying codes and removing the last time step that will never be an input.
         initial = self._get_initial_token().expand(B, -1, -1)
@@ -781,20 +783,32 @@ class LMModel(StreamingContainer):
         text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float('NaN'))
         text_logits_mask &= (codes[:, :1] != self.zero_token_id)
 
-        # ── Face Generation (teacher-forced) ─────────────────────────────────
-        # audio_feat:    [B, T_mimi, 512] Mimi latents at 12.5 fps (decoded externally, frozen mimi)
+        # ── Face Generation ───────────────────────────────────────────────────
+        # audio_feat:    [B, T_mimi, 512] Mimi latents at 12.5 fps
         # gt_face_motion:[B, T_face, 54]  ground-truth 3DMM at 25 fps
         # transformer_out:[B, T_lm, 4096] LM backbone embedding z — provides gradient path
         # The face module internally upsamples audio/llm from 12.5 fps to 25 fps via repeat_interleave(2).
+        #
+        # When mimi is provided, audio_feat is derived from the model's own predicted
+        # audio codes (argmax of depformer logits) instead of the ground-truth codes.
+        # logits at this point: [B, dep_q, T, card], already un-delayed.
         face_pred = None
         face_outputs = None
-        if self.face_module is not None and audio_feat is not None and gt_face_motion is not None:
-            start = self.face_module.start_motion.expand(B, 1, -1).to(
-                dtype=audio_feat.dtype, device=audio_feat.device)
-            # Teacher forcing: shift gt by one frame so frame t predicts frame t+1.
-            prev_motion = torch.cat([start, gt_face_motion[:, :-1]], dim=1)  # [B, T_face, 54]
-            face_outputs = self.face_module(audio_feat, prev_motion, llm_feat=transformer_out)
-            face_pred = face_outputs["pred_motion"]  # [B, T_face, 54]
+        if self.face_module is not None and gt_face_motion is not None:
+            if mimi is not None:
+                with torch.no_grad():
+                    # NaN marks delay-padding positions; treat as code 0 (silence).
+                    pred_codes = logits.detach().nan_to_num(0.0).argmax(-1).clamp(min=0)  # [B, dep_q, T]
+                    # mimi has 8 codebooks; logits covers dep_q (16) = agent(8) + user(8). Use agent only.
+                    audio_feat = mimi.decode_latent(pred_codes[:, :8]).transpose(1, 2)    # [B, T, 512]
+                    audio_feat = audio_feat.to(dtype=logits.dtype)
+            if audio_feat is not None:
+                start = self.face_module.start_motion.expand(B, 1, -1).to(
+                    dtype=audio_feat.dtype, device=audio_feat.device)
+                # Teacher forcing on motion: shift gt by one frame so frame t predicts frame t+1.
+                prev_motion = torch.cat([start, gt_face_motion[:, :-1]], dim=1)  # [B, T_face, 54]
+                face_outputs = self.face_module(audio_feat, prev_motion, llm_feat=transformer_out)
+                face_pred = face_outputs["pred_motion"]  # [B, T_face, 54]
 
         return LMOutput(logits, logits_mask, text_logits, text_logits_mask, vap_logits, commitment_loss,
                         face_pred, face_outputs, bc_stats)

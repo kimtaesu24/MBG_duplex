@@ -14,6 +14,7 @@ Usage:
                 synthetic_user_interruption \\
         [--ckpt-dir path/to/checkpoint] \\
         [--overwrite] \\
+        [--suppress-epad] \\
         [--device cuda]
 """
 
@@ -36,13 +37,11 @@ import yaml
 from huggingface_hub import hf_hub_download
 
 import moshi.models.loaders as loaders
-import safetensors.torch
-from moshi.client_utils import make_log
 from moshi.models import LMGen
-from moshi.models.lm import load_audio as lm_load_audio
-from moshi.models.lm import _iterate_audio as lm_iterate_audio
-from moshi.models.lm import encode_from_sphn as lm_encode_from_sphn
-from moshi.offline import warmup, decode_tokens_to_pcm
+from moshi.offline import warmup
+
+# Shared helpers and the canonical per-sample inference function live in test_inference.
+from test_inference import log, _strip_peft_prefixes, load_checkpoint, infer_one
 
 
 V1_TASKS = [
@@ -52,111 +51,6 @@ V1_TASKS = [
     "icc_backchannel",
     "synthetic_user_interruption",
 ]
-
-
-def log(level: str, msg: str):
-    print(make_log(level, msg))
-
-
-def _strip_peft_prefixes(state_dict: dict) -> dict:
-    """Strip training wrapper prefixes so keys match the bare LMModel namespace.
-
-    Training wraps: PeftModel(PeftCompatibleWrapper(LMModel))
-    Saved keys:     base_model.model.model.<lm_key>
-    After strip:    <lm_key>
-
-    .original_module.* entries are frozen originals kept by PEFT — skip them.
-    """
-    cleaned = {}
-    for k, v in state_dict.items():
-        if ".original_module." in k:
-            continue
-        if k.startswith("base_model.model.model."):
-            k = k[len("base_model.model.model."):]
-        cleaned[k] = v
-    return cleaned
-
-
-def load_checkpoint(lm, ckpt_dir):
-    consolidated = os.path.join(ckpt_dir, "consolidated", "consolidated.safetensors")
-    lora_path = os.path.join(ckpt_dir, "consolidated", "lora.safetensors")
-
-    if os.path.exists(consolidated):
-        log("info", f"Loading full checkpoint from {consolidated}")
-        state_dict = safetensors.torch.load_file(consolidated)
-        state_dict = _strip_peft_prefixes(state_dict)
-        missing, _ = lm.load_state_dict(state_dict, strict=False)
-        bc_missing = [k for k in missing if "backchannel" in k]
-        face_missing = [k for k in missing if "face_module" in k]
-        if bc_missing:
-            log("warning", f"Backchannel keys still missing: {bc_missing}")
-        if face_missing:
-            log("warning", f"Face module keys still missing: {face_missing[:3]}")
-        if not bc_missing and not face_missing:
-            log("info", "Checkpoint loaded successfully.")
-
-    elif os.path.exists(lora_path):
-        log("info", f"Loading LoRA checkpoint from {lora_path}")
-        state_dict = safetensors.torch.load_file(lora_path)
-        state_dict = _strip_peft_prefixes(state_dict)
-
-        # 1. Load backchannel + face_module weights directly into LMModel.
-        #    These modules are full-finetuned (no LoRA) and stored flat in lora.safetensors.
-        direct_weights = {k: v for k, v in state_dict.items()
-                          if k.startswith("backchannel.") or k.startswith("face_module.")}
-        if direct_weights:
-            missing, _ = lm.load_state_dict(direct_weights, strict=False)
-            bc_missing = [k for k in missing if "backchannel" in k]
-            face_missing = [k for k in missing if "face_module" in k]
-            if bc_missing:
-                log("warning", f"Backchannel keys missing: {bc_missing}")
-            if face_missing:
-                log("warning", f"Face module keys missing: {face_missing[:3]}")
-            if not bc_missing and not face_missing:
-                log("info", f"Direct weights loaded ({len(direct_weights)} tensors).")
-
-        # 2. Load LoRA adapter weights via PEFT then merge into base weights.
-        #    Training used PeftCompatibleWrapper so saved keys are at depth 3:
-        #      base_model.model.model.<lm_key>  →  stripped: <lm_key>
-        #    Inference PEFT model (bare LMModel) has depth 2:
-        #      base_model.model.<lm_key>
-        #    → re-add one "base_model.model." prefix before loading.
-        #
-        #    target_modules must match training (wrapped_model.py).
-        #    In Personaplex, only out_proj and text_linear are plain nn.Linear
-        #    that PEFT can wrap — the other names in the regex don't match any
-        #    module in the actual graph.  face_module / backchannel are excluded
-        #    by the negative lookahead so their linear layers are left as-is.
-        lora_weights = {k: v for k, v in state_dict.items()
-                        if not k.startswith("backchannel.") and not k.startswith("face_module.")}
-        if lora_weights:
-            try:
-                from peft import get_peft_model, LoraConfig, TaskType
-                lora_config = LoraConfig(
-                    task_type=TaskType.FEATURE_EXTRACTION,
-                    r=64,
-                    lora_alpha=128,
-                    target_modules=(
-                        r"(?!.*(face_module|backchannel))"
-                        r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj)"
-                    ),
-                    bias="none",
-                )
-                peft_lm = get_peft_model(lm, lora_config)
-                prefixed = {f"base_model.model.{k}": v for k, v in lora_weights.items()}
-                missing_lora, _ = peft_lm.load_state_dict(prefixed, strict=False)
-                missing_lora = [k for k in missing_lora if "lora_" in k]
-                if missing_lora:
-                    log("warning", f"Some LoRA keys missing: {missing_lora[:3]}")
-                else:
-                    log("info", f"LoRA weights loaded ({len(lora_weights)} tensors).")
-                # Merge LoRA deltas into base weights and restore a plain LMModel.
-                lm = peft_lm.merge_and_unload()
-            except ImportError:
-                log("error", "LoRA weights found but PEFT is not installed.")
-    else:
-        log("warning", f"No checkpoint found in {ckpt_dir}, running base model.")
-    return lm
 
 
 def collect_input_files(data_dir: Path, tasks: list[str], overwrite: bool) -> list[Path]:
@@ -177,97 +71,6 @@ def collect_input_files(data_dir: Path, tasks: list[str], overwrite: bool) -> li
                 continue
             files.append(inp)
     return files
-
-
-def infer_one(
-    inp: Path,
-    mimi,
-    other_mimi,
-    lm_gen,
-    text_tokenizer,
-    frame_size: int,
-    device: str,
-    voice_prompt_path: str = "",
-    vap_mimi=None,
-    face_gen: "FaceGenerator | None" = None,
-):
-    """Run a single input.wav through the model and return (output_pcm, sample_rate).
-
-    If face_gen is provided, also generates face motion and saves it as
-    ``inp.parent / "face_motion.npy"``.
-    """
-    mimi.reset_streaming()
-    other_mimi.reset_streaming()
-    lm_gen.reset_streaming()
-
-    # Must happen after reset_streaming() and before step_system_prompts() so the
-    # embeddings replay and KV-cache restore land on a clean streaming state.
-    if voice_prompt_path:
-        lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
-
-    if face_gen is not None:
-        face_gen.reset()
-
-    lm_gen.step_system_prompts(mimi)
-    mimi.reset_streaming()
-
-    user_audio = lm_load_audio(str(inp), mimi.sample_rate)
-
-    if user_audio.ndim == 2 and user_audio.shape[0] == 2:
-        # AMI stereo is often [Agent, User] — swap so Ch0 = User (Moshi convention)
-        user_audio = user_audio[[1, 0], :]
-    elif user_audio.ndim == 2:
-        user_audio = user_audio[0:1]   # keep shape (1, T)
-    else:
-        user_audio = user_audio[np.newaxis]  # (1, T)
-
-    target_samples = user_audio.shape[-1]
-    generated_frames = []
-
-    for user_encoded in lm_encode_from_sphn(
-        mimi,
-        lm_iterate_audio(user_audio, sample_interval_size=frame_size, pad=True),
-        max_batch=1,
-    ):
-        steps = user_encoded.shape[-1]
-        for c in range(steps):
-            if face_gen is not None:
-                result = lm_gen.step(user_encoded[:, :, c : c + 1], return_z=True)
-                if result is None or result[0] is None:
-                    continue
-                tokens, z = result
-                face_gen.add_step(tokens, z)
-            else:
-                tokens = lm_gen.step(user_encoded[:, :, c : c + 1])
-                if tokens is None:
-                    continue
-            generated_frames.append(decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens))
-
-    if not generated_frames:
-        return np.zeros(target_samples, dtype=np.float32), mimi.sample_rate
-
-    output_pcm = np.concatenate(generated_frames, axis=-1)
-
-    # Trim or zero-pad to match input length so output is time-synchronous
-    if output_pcm.shape[-1] > target_samples:
-        output_pcm = output_pcm[:target_samples]
-    elif output_pcm.shape[-1] < target_samples:
-        output_pcm = np.concatenate(
-            [output_pcm, np.zeros(target_samples - output_pcm.shape[-1], dtype=output_pcm.dtype)]
-        )
-
-    # Face motion generation (post-loop, uses accumulated tokens/z)
-    if face_gen is not None and getattr(face_gen, "_agent_tokens", None):
-        try:
-            motion = face_gen.generate_numpy(vap_mimi)  # [T_face, 56]
-            face_out = inp.parent / "face_motion.npy"
-            np.save(str(face_out), motion)
-        except Exception as _e:
-            import traceback as _tb
-            log("warning", f"Face generation failed for {inp.name}: {_e}")
-            _tb.print_exc()
-
-    return output_pcm, mimi.sample_rate
 
 
 def run(args):
@@ -384,7 +187,7 @@ def run(args):
             tar.extractall(path=os.path.dirname(voices_tgz))
         voice_prompt_path = os.path.join(os.path.dirname(voices_tgz), "voices/NATM1.pt")
 
-    text_prompt = "<system> You are a highly realistic conversational AI. You should listen attentively. <system>"
+    text_prompt = config.get("text_prompt", "")
     lm_gen.text_prompt_tokens = text_tokenizer.encode(text_prompt)
 
     log("info", "Model ready.")
@@ -401,13 +204,27 @@ def run(args):
             out = inp.parent / "output.wav"
             pbar.set_postfix_str(inp.parent.name)
             try:
-                pcm, sr = infer_one(
-                    inp, mimi, other_mimi, lm_gen, text_tokenizer, frame_size, device,
+                pcm, sr, _, _, _ = infer_one(
+                    str(inp),
+                    mimi, other_mimi, lm_gen,
+                    frame_size,
                     voice_prompt_path=voice_prompt_path,
-                    vap_mimi=vap_mimi,
                     face_gen=face_gen,
+                    suppress_epad=args.suppress_epad,
+                    collect_bc_log=False,
                 )
                 sphn.write_wav(str(out), pcm, sr)
+
+                if face_gen is not None and getattr(face_gen, "_agent_tokens", None):
+                    try:
+                        motion = face_gen.generate_numpy(vap_mimi)
+                        face_out = inp.parent / "face_motion.npy"
+                        np.save(str(face_out), motion)
+                    except Exception as _e:
+                        import traceback as _tb
+                        log("warning", f"Face generation failed for {inp.name}: {_e}")
+                        _tb.print_exc()
+
             except Exception as e:
                 import traceback
                 log("warning", f"FAILED {inp}: {e}")
@@ -429,6 +246,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--ckpt-dir", default=None, help="Finetuned checkpoint directory")
     parser.add_argument("--overwrite", action="store_true", help="Re-generate even if output.wav exists")
+    parser.add_argument("--suppress-epad", action="store_true",
+                        help="Force [EPAD] → [PAD] whenever g_final=0 (VAP says don't speak). "
+                             "Word tokens in progress are never replaced.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--cpu-offload", action="store_true")
 

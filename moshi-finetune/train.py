@@ -419,25 +419,32 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     voice_prompt_embs = voice_prompt_embs.to(codes.device, non_blocking=True)  # int64 mimi codes
 
                 # ── Face generation inputs ────────────────────────────────
-                # Decode agent audio codes to Mimi latent features.
-                # Uses frozen mimi (no grad) — safe to call outside the model.
                 audio_feat = None
                 gt_face_motion = None
+                mimi_for_model = None
                 if args.face_gen.enable:
-                    with torch.no_grad():
-                        # codes[:, 1:9] = first 8 agent audio codebooks (Mimi's n_q).
-                        # Clamp to min=0 so zero_token_id (-1) padding positions don't
-                        # produce out-of-bounds indices inside F.embedding in the VQ decoder.
-                        audio_codes = codes[:, 1:9].clamp(min=0)
-                        audio_feat = mimi.decode_latent(audio_codes).transpose(1, 2)  # [B, T, 512]
-                        audio_feat = audio_feat.to(dtype=param_dtype)
-                        if T_p:
-                            # Prepend T_p silence frames so audio_feat aligns with codes_in.
-                            zero_feat = torch.zeros(
-                                codes.shape[0], T_p, audio_feat.shape[2],
-                                device=audio_feat.device, dtype=audio_feat.dtype,
-                            )
-                            audio_feat = torch.cat([zero_feat, audio_feat], dim=1)  # [B, T_p+T, 512]
+                    if args.face_gen.use_generated_audio_feat:
+                        # audio_feat will be derived inside the model from its own predicted
+                        # audio codes (argmax of depformer logits). Pass mimi so the model
+                        # can call mimi.decode_latent internally.
+                        mimi_for_model = mimi
+                    else:
+                        # Teacher-forced: decode GT audio codes to Mimi latent features.
+                        # Uses frozen mimi (no grad) — safe to call outside the model.
+                        with torch.no_grad():
+                            # codes[:, 1:9] = first 8 agent audio codebooks (Mimi's n_q).
+                            # Clamp to min=0 so zero_token_id (-1) padding positions don't
+                            # produce out-of-bounds indices inside F.embedding in the VQ decoder.
+                            audio_codes = codes[:, 1:9].clamp(min=0)
+                            audio_feat = mimi.decode_latent(audio_codes).transpose(1, 2)  # [B, T, 512]
+                            audio_feat = audio_feat.to(dtype=param_dtype)
+                            if T_p:
+                                # Prepend T_p silence frames so audio_feat aligns with codes_in.
+                                zero_feat = torch.zeros(
+                                    codes.shape[0], T_p, audio_feat.shape[2],
+                                    device=audio_feat.device, dtype=audio_feat.dtype,
+                                )
+                                audio_feat = torch.cat([zero_feat, audio_feat], dim=1)  # [B, T_p+T, 512]
                     if batch.face_motion_gt is not None:
                         gt_face_motion = batch.face_motion_gt.to(codes.device, dtype=param_dtype)
                         if T_p:
@@ -450,7 +457,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                             gt_face_motion = torch.cat([zero_motion, gt_face_motion], dim=1)
 
                 output = model(codes_in, step=state.step, voice_prompt_embs=voice_prompt_embs,
-                               audio_feat=audio_feat, gt_face_motion=gt_face_motion)
+                               audio_feat=audio_feat, gt_face_motion=gt_face_motion,
+                               mimi=mimi_for_model)
 
                 # Silence-padded frames (mimi tokens from zero-padded waveform) are kept
                 # in audio/text loss intentionally: they provide backbone regularization,
