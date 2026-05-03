@@ -382,9 +382,12 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         vap_loss_val = torch.tensor([0.0], device="cuda")
         commitment_loss_val = torch.tensor([0.0], device="cuda")
         face_loss_val = torch.tensor([0.0], device="cuda")
+        bc_event_loss_val = torch.tensor([0.0], device="cuda")
         bc_stats_accum: dict | None = None
         n_batch_tokens: int = 0
         n_real_tokens: int = 0
+        face_loss_skipped_no_data: int = 0   # batches where face_motion_gt was None (missing FLAME files)
+        face_loss_skipped_nonfinite: int = 0 # batches where face_loss was NaN/Inf
 
         for i in range(args.num_microbatches):
             batch = next(data_loader)
@@ -455,10 +458,31 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                                 device=gt_face_motion.device, dtype=gt_face_motion.dtype,
                             )
                             gt_face_motion = torch.cat([zero_motion, gt_face_motion], dim=1)
+                    else:
+                        # batch.face_motion_gt is None when ≥1 sample in the batch has no
+                        # matching FLAME .npy file — the collate_fn uses all(...) so one
+                        # missing file silently drops face loss for the entire batch.
+                        face_loss_skipped_no_data += 1
+
+                # ── Per-speaker Mimi features for VapGPT backchannel ─────────────────
+                bc_audio_feats = None
+                if (args.backchannel.enable
+                        and args.backchannel.module_type == "vap_gpt"):
+                    with torch.no_grad():
+                        _agent = mimi.decode_latent(codes[:, 1:9].clamp(min=0)).transpose(1, 2)
+                        _user  = mimi.decode_latent(codes[:, 9:17].clamp(min=0)).transpose(1, 2)
+                        _agent = _agent.to(dtype=param_dtype)
+                        _user  = _user.to(dtype=param_dtype)
+                        if T_p:
+                            _zero = torch.zeros(codes.shape[0], T_p, _agent.shape[2],
+                                                device=_agent.device, dtype=_agent.dtype)
+                            _agent = torch.cat([_zero, _agent], dim=1)
+                            _user  = torch.cat([_zero, _user],  dim=1)
+                    bc_audio_feats = (_agent, _user)
 
                 output = model(codes_in, step=state.step, voice_prompt_embs=voice_prompt_embs,
                                audio_feat=audio_feat, gt_face_motion=gt_face_motion,
-                               mimi=mimi_for_model)
+                               mimi=mimi_for_model, bc_audio_feats=bc_audio_feats)
 
                 # Silence-padded frames (mimi tokens from zero-padded waveform) are kept
                 # in audio/text loss intentionally: they provide backbone regularization,
@@ -530,33 +554,80 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                         mb_loss = mb_loss + args.backchannel.commitment_loss_weight * output.commitment_loss
                         commitment_loss_val += output.commitment_loss.detach()
 
+                # ── Direct BC event supervision (focal BCE) ───────────────────────────
+                if (args.backchannel.enable
+                        and args.backchannel.bc_event_loss_weight > 0
+                        and output.bc_logits is not None
+                        and batch.bc_timing_targets is not None):
+                    bc_targets = batch.bc_timing_targets.to(codes.device)  # [B, T_content] — no T_p prefix
+                    bc_logit_pos = output.bc_logits[:, T_p:, 1]  # [B, T_content] — strip prompt prefix
+                    valid_bc = bc_targets != -100
+                    if valid_bc.any():
+                        bce = F.binary_cross_entropy_with_logits(
+                            bc_logit_pos[valid_bc],
+                            bc_targets[valid_bc],
+                            pos_weight=torch.tensor(
+                                args.backchannel.bc_focal_pos_weight,
+                                device=codes.device, dtype=bc_logit_pos.dtype,
+                            ),
+                            reduction='none',
+                        )
+                        p_t = torch.exp(-bce.detach())
+                        bc_event_loss = ((1.0 - p_t) ** args.backchannel.bc_focal_gamma * bce).mean()
+                        mb_loss = mb_loss + args.backchannel.bc_event_loss_weight * bc_event_loss
+                        bc_event_loss_val += bc_event_loss.detach()
+
                 # ── Face motion reconstruction loss (full reference loss) ──
                 face_loss = None
-                if (args.face_gen.enable and output.face_outputs is not None
-                        and gt_face_motion is not None and face_codec is not None):
-                    # Build [B, T_face] bool mask.
-                    # When T_p > 0, gt_face_motion was prepended with 2*T_p zero frames
-                    # (face runs at 25fps = 2× mimi 12.5fps) — exclude those from loss.
-                    T_face_p = T_p * 2
-                    valid_face_mask = None
-                    if T_p or batch.valid_face_frames is not None:
-                        T_face = gt_face_motion.shape[1]
-                        t_idx = torch.arange(T_face, device=codes.device).unsqueeze(0)  # [1, T_face]
-                        if batch.valid_face_frames is not None:
-                            valid_face_mask = (t_idx >= T_face_p) & (
-                                t_idx < T_face_p + batch.valid_face_frames.to(codes.device).unsqueeze(1)
+                if args.face_gen.enable:
+                    if output.face_outputs is None:
+                        # Covered above by face_loss_skipped_no_data when batch.face_motion_gt
+                        # was None.  This branch fires when gt_face_motion is None for a
+                        # different reason (face_codec missing, audio_feat None in model, etc.).
+                        if gt_face_motion is not None and get_rank() == 0:
+                            logger.warning(
+                                f"[step {state.step}] face_outputs is None but gt_face_motion "
+                                f"is not None — face_codec={'ok' if face_codec is not None else 'MISSING'}. "
+                                f"Check audio_feat passed to the model."
                             )
+                    elif gt_face_motion is not None and face_codec is not None:
+                        # Build [B, T_face] bool mask.
+                        # When T_p > 0, gt_face_motion was prepended with 2*T_p zero frames
+                        # (face runs at 25fps = 2× mimi 12.5fps) — exclude those from loss.
+                        T_face_p = T_p * 2
+                        valid_face_mask = None
+                        if T_p or batch.valid_face_frames is not None:
+                            T_face = gt_face_motion.shape[1]
+                            t_idx = torch.arange(T_face, device=codes.device).unsqueeze(0)  # [1, T_face]
+                            if batch.valid_face_frames is not None:
+                                valid_face_mask = (t_idx >= T_face_p) & (
+                                    t_idx < T_face_p + batch.valid_face_frames.to(codes.device).unsqueeze(1)
+                                )
+                            else:
+                                valid_face_mask = t_idx >= T_face_p  # [1, T_face], broadcasts to [B, T_face]
+                        if valid_face_mask is not None and not valid_face_mask.any() and get_rank() == 0:
+                            logger.warning(
+                                f"[step {state.step}] valid_face_mask is all-False — "
+                                f"valid_face_frames={batch.valid_face_frames}, "
+                                f"T_face_p={T_face_p}, T_face={gt_face_motion.shape[1]}. "
+                                f"Face loss will be 0."
+                            )
+                        face_loss = compute_face_loss(
+                            output.face_outputs, gt_face_motion, face_codec, args.face_gen,
+                            valid_face_mask=valid_face_mask,
+                        )
+                        if torch.isfinite(face_loss):
+                            if face_loss.item() == 0.0 and get_rank() == 0:
+                                logger.warning(
+                                    f"[step {state.step}] face_loss computed as exactly 0.0 "
+                                    f"(mask valid={valid_face_mask.sum().item() if valid_face_mask is not None else 'N/A'} frames). "
+                                    f"Check FLAME data quality."
+                                )
+                            mb_loss = mb_loss + args.face_gen.face_loss_weight * face_loss
+                            face_loss_val += face_loss.detach()
                         else:
-                            valid_face_mask = t_idx >= T_face_p  # [1, T_face], broadcasts to [B, T_face]
-                    face_loss = compute_face_loss(
-                        output.face_outputs, gt_face_motion, face_codec, args.face_gen,
-                        valid_face_mask=valid_face_mask,
-                    )
-                    if torch.isfinite(face_loss):
-                        mb_loss = mb_loss + args.face_gen.face_loss_weight * face_loss
-                        face_loss_val += face_loss.detach()
-                    else:
-                        logger.warning(f"[step {state.step}] Non-finite face_loss={face_loss.item():.4f}, skipping.")
+                            face_loss_skipped_nonfinite += 1
+                            logger.warning(f"[step {state.step}] Non-finite face_loss={face_loss.item():.4f}, skipping.")
 
                 n_batch_tokens += text_mask.numel() + audio_mask.numel()
                 n_real_tokens += (
@@ -575,6 +646,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             del output, mb_loss, text_loss, audio_loss
             if args.backchannel.enable and vap_loss is not None:
                 del vap_loss
+            if bc_audio_feats is not None:
+                del bc_audio_feats
             if args.face_gen.enable:
                 del audio_feat, gt_face_motion, face_loss
 
@@ -583,6 +656,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             if args.backchannel.enable:
                 vap_loss_val /= args.num_microbatches
                 commitment_loss_val /= args.num_microbatches
+                bc_event_loss_val /= args.num_microbatches
                 if bc_stats_accum is not None:
                     for k in bc_stats_accum:
                         bc_stats_accum[k] = bc_stats_accum[k] / args.num_microbatches
@@ -594,6 +668,21 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
         # 그래디언트 클리핑
         torch.nn.utils.clip_grad_norm_(list(model.parameters()), args.max_norm)
+
+        # VapGPT warm-up: protect pretrained GPT/vap_head weights during early steps
+        if (args.backchannel.enable
+                and args.backchannel.module_type == "vap_gpt"
+                and args.backchannel.bc_warmup_steps > 0
+                and state.step <= args.backchannel.bc_warmup_steps):
+            for name, p in model.named_parameters():
+                if p.grad is not None and (
+                    "backchannel.ar_channel" in name
+                    or "backchannel.ar." in name
+                    or "backchannel.vap_head" in name
+                ):
+                    p.grad.zero_()
+            if state.step == args.backchannel.bc_warmup_steps and get_rank() == 0:
+                logger.info(f"[step {state.step}] VapGPT warm-up done — GPT/vap_head gradients re-enabled.")
 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)  # 메모리 즉시 해제
@@ -622,7 +711,10 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 world_size=get_world_size(),
                 is_eval=True,
             )
-            evaluate(model, eval_data_loader, state, args)
+            evaluate(model, eval_data_loader, state, args,
+                     mimi=mimi, face_codec=face_codec,
+                     T_p=T_p, prompt_ids=prompt_ids if T_p else None,
+                     param_dtype=param_dtype)
             del eval_data_loader
 
             eval_logs = get_eval_logs(
@@ -641,6 +733,21 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             state.this_bc_stats = {k: avg_aggregate(v.item()) for k, v in bc_stats_accum.items()}
 
         if state.step % args.log_freq == 0:
+            if args.face_gen.enable and get_rank() == 0:
+                total_mb = args.num_microbatches
+                if face_loss_skipped_no_data > 0:
+                    logger.warning(
+                        f"[step {state.step}] face_loss skipped in "
+                        f"{face_loss_skipped_no_data}/{total_mb} microbatch(es): "
+                        f"batch.face_motion_gt was None — at least one sample had no "
+                        f"matching FLAME .npy file (check flame_root path and file naming)."
+                    )
+                if face_loss_skipped_nonfinite > 0:
+                    logger.warning(
+                        f"[step {state.step}] face_loss skipped in "
+                        f"{face_loss_skipped_nonfinite}/{total_mb} microbatch(es): "
+                        f"face_loss was NaN or Inf."
+                    )
             train_logs = get_train_logs(
                 state,
                 avg_loss,
@@ -652,6 +759,10 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             )
             main_logger_info(train_log_msg(state, logs=train_logs, loss=avg_loss))
             metrics_logger.log(train_logs, step=state.step)
+            if args.backchannel.enable and args.backchannel.bc_event_loss_weight > 0:
+                bc_evt = avg_aggregate(bc_event_loss_val.item())
+                if get_rank() == 0:
+                    logger.info(f"[step {state.step}] bc_event_loss={bc_evt:.4f}")
 
         # 주기적 CUDA 캐시 비우기 (메모리 단편화 방지)
         if state.step % 200 == 0:

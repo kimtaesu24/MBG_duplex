@@ -73,6 +73,7 @@ class LMOutput:
     face_pred: Optional[torch.Tensor] = None           # [B, T_face, 54] teacher-forced face motion
     face_outputs: Optional[dict] = None                # full CausalSoftVQContinuousTransformer output dict
     bc_stats: Optional[dict] = None                    # scalar tensors: y_bc_mean, s_pad_mean, g_soft_mean, g_final_rate
+    bc_logits: Optional[torch.Tensor] = None  # [B, T, 2] — raw bc_mlp logits for focal loss
 
 
 def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -688,13 +689,14 @@ class LMModel(StreamingContainer):
 
     def forward(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
                 audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None,
-                mimi=None):
+                mimi=None, bc_audio_feats: Optional[tuple] = None):
         return self.forward_train(codes, step=step, voice_prompt_embs=voice_prompt_embs,
-                                  audio_feat=audio_feat, gt_face_motion=gt_face_motion, mimi=mimi)
+                                  audio_feat=audio_feat, gt_face_motion=gt_face_motion, mimi=mimi,
+                                  bc_audio_feats=bc_audio_feats)
 
     def forward_train(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
                       audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None,
-                      mimi=None):
+                      mimi=None, bc_audio_feats: Optional[tuple] = None):  # (agent_audio_feat, user_audio_feat), each [B,T,512]
         B, K, T = codes.shape
         # Delaying codes and removing the last time step that will never be an input.
         initial = self._get_initial_token().expand(B, -1, -1)
@@ -720,13 +722,28 @@ class LMModel(StreamingContainer):
         vap_logits = None
         commitment_loss = None
         bc_stats = None
+        bc_result = None
         if self.backchannel is not None:
             target_codes = delayed_codes[:, :, 1:]
-
+            # Auto-extract per-speaker Mimi latents when not provided externally.
+            # This keeps eval/inference self-contained: callers only need to pass mimi.
+            if (bc_audio_feats is None and mimi is not None
+                    and isinstance(self.backchannel, VapGPTBackchannelModule)):
+                with torch.no_grad():
+                    _a = mimi.decode_latent(codes[:, 1:9].clamp(min=0)).transpose(1, 2)
+                    _u = mimi.decode_latent(codes[:, 9:17].clamp(min=0)).transpose(1, 2)
+                bc_audio_feats = (
+                    _a.to(dtype=transformer_out.dtype),
+                    _u.to(dtype=transformer_out.dtype),
+                )
+            _agent_af = bc_audio_feats[0] if bc_audio_feats is not None else None
+            _user_af  = bc_audio_feats[1] if bc_audio_feats is not None else None
             bc_result = self.backchannel(
                 transformer_out,
                 emb_cb0=self.depformer_text_emb,
                 step=step,
+                agent_audio_feat=_agent_af,
+                user_audio_feat=_user_af,
             )
             vap_logits = bc_result.vap_logits  # [B, T, vap_dim]
 
@@ -795,7 +812,7 @@ class LMModel(StreamingContainer):
         face_pred = None
         face_outputs = None
         if self.face_module is not None and gt_face_motion is not None:
-            if mimi is not None:
+            if mimi is not None and audio_feat is None:
                 with torch.no_grad():
                     # NaN marks delay-padding positions; treat as code 0 (silence).
                     pred_codes = logits.detach().nan_to_num(0.0).argmax(-1).clamp(min=0)  # [B, dep_q, T]
@@ -811,7 +828,8 @@ class LMModel(StreamingContainer):
                 face_pred = face_outputs["pred_motion"]  # [B, T_face, 54]
 
         return LMOutput(logits, logits_mask, text_logits, text_logits_mask, vap_logits, commitment_loss,
-                        face_pred, face_outputs, bc_stats)
+                        face_pred, face_outputs, bc_stats,
+                        bc_logits=bc_result.bc_logits if self.backchannel is not None else None)
 
 @dataclass
 class _LMGenState:

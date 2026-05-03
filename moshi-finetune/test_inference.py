@@ -154,6 +154,125 @@ def load_checkpoint(lm, ckpt_dir):
         log("warning", f"No checkpoint found in {ckpt_dir}, running base model.")
     return lm
 
+
+def infer_one(
+    inp_path: str,
+    mimi,
+    other_mimi,
+    lm_gen,
+    frame_size: int,
+    voice_prompt_path: str = "",
+    face_gen=None,
+    text_tokenizer=None,
+    suppress_epad: bool = False,
+    collect_bc_log: bool = False,
+):
+    """Run offline inference for a single input WAV.
+
+    Returns (output_pcm, sample_rate, generated_text_tokens, bc_gate_log, has_audio).
+    generated_text_tokens and bc_gate_log are empty lists when collect_bc_log=False.
+    If face_gen is provided, add_step() is called per frame; the caller is responsible
+    for invoking face_gen.generate_numpy() afterwards.
+    """
+    mimi.reset_streaming()
+    other_mimi.reset_streaming()
+    lm_gen.reset_streaming()
+
+    if voice_prompt_path:
+        lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+
+    if face_gen is not None:
+        face_gen.reset()
+
+    lm_gen.step_system_prompts(mimi)
+    mimi.reset_streaming()
+
+    user_audio = lm_load_audio(inp_path, mimi.sample_rate)
+    if user_audio.ndim == 2 and user_audio.shape[0] == 2:
+        log("info", f"Swapping channels for {inp_path}...")
+        user_audio = user_audio[[1, 0], :]
+    elif user_audio.ndim == 2:
+        user_audio = user_audio[0:1]
+    else:
+        user_audio = user_audio[np.newaxis]
+
+    target_samples = user_audio.shape[-1]
+    generated_frames = []
+    generated_text_tokens = []
+    bc_gate_log = []
+    special_token_map = {0: "EPAD", 1: "BOS", 2: "EOS", 3: "PAD"}
+    _prev_bc_result = None
+
+    for user_encoded in lm_encode_from_sphn(
+        mimi,
+        lm_iterate_audio(user_audio, sample_interval_size=frame_size, pad=True),
+        max_batch=1,
+    ):
+        steps = user_encoded.shape[-1]
+        for c in range(steps):
+            result = lm_gen.step(user_encoded[:, :, c : c + 1], return_z=True)
+            if result is None or result[0] is None:
+                continue
+            tokens, z = result
+
+            if face_gen is not None:
+                face_gen.add_step(tokens, z)
+
+            _PAD  = lm_gen.lm_model.text_padding_token_id
+            _EPAD = lm_gen.lm_model.end_of_text_padding_id
+
+            # Suppress [EPAD] → [PAD] when g_final == 0 and no word is currently being spoken.
+            # Word tokens are left untouched; only EPAD (premature speech onset) is suppressed.
+            if suppress_epad and getattr(lm_gen.lm_model, "backchannel", None) is not None and _prev_bc_result is not None:
+                _g_final_now = int(_prev_bc_result.bc_gate[0, 0].item())
+                if _g_final_now == 0 and tokens[0, 0, 0].item() == _EPAD:
+                    tokens = tokens.clone()
+                    tokens[0, 0, 0] = _PAD
+
+            generated_frames.append(decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens))
+
+            if collect_bc_log:
+                text_id = tokens[0, 0, 0].item()
+                if text_id in special_token_map:
+                    generated_text_tokens.append(special_token_map[text_id])
+                else:
+                    generated_text_tokens.append(
+                        text_tokenizer.id_to_piece(text_id).replace("▁", " ")
+                    )
+                _label = "PAD" if text_id == _PAD else ("EPAD" if text_id == _EPAD else f"WORD({text_id})")
+                if getattr(lm_gen.lm_model, "backchannel", None) is not None and _prev_bc_result is not None:
+                    _y_bc   = _prev_bc_result.bc_logits[0, 0].softmax(-1)[1].item()
+                    _s_pad  = _prev_bc_result.silence_gate_logits[0, 0].softmax(-1)[1].item()
+                    _g_soft = _y_bc * _s_pad
+                    _g_final = int(_prev_bc_result.bc_gate[0, 0].item())
+                    print(f"token={_label:14s} | y_bc={_y_bc:.3f}  s_pad={_s_pad:.3f}  g_soft={_g_soft:.3f}  g_final={_g_final}")
+                    bc_gate_log.append({
+                        "token_id": text_id,
+                        "token_label": _label,
+                        "y_bc": round(_y_bc, 4),
+                        "s_pad": round(_s_pad, 4),
+                        "g_soft": round(_g_soft, 4),
+                        "g_final": _g_final,
+                    })
+
+            if getattr(lm_gen.lm_model, "backchannel", None) is not None:
+                _prev_bc_result = getattr(lm_gen.lm_model, "_last_bc_result", None)
+
+    if not generated_frames:
+        return np.zeros(target_samples, dtype=np.float32), mimi.sample_rate, [], [], False
+
+    output_pcm = np.concatenate(generated_frames, axis=-1)
+    if output_pcm.shape[-1] > target_samples:
+        output_pcm = output_pcm[:target_samples]
+    elif output_pcm.shape[-1] < target_samples:
+        output_pcm = np.concatenate([
+            output_pcm,
+            np.zeros(target_samples - output_pcm.shape[-1], dtype=output_pcm.dtype),
+        ])
+
+    return output_pcm, mimi.sample_rate, generated_text_tokens, bc_gate_log, True
+
+
 def run_test_inference(args):
     device = args.device
     os.makedirs(args.output_dir, exist_ok=True)
@@ -355,148 +474,70 @@ def run_test_inference(args):
         base_name = os.path.basename(input_wav).replace(".wav", "")
         out_text = os.path.join(args.output_dir, f"{base_name}.json")
         out_vap = os.path.join(args.output_dir, f"{base_name}_vap.json")
-        
-        log("info", f"[{i+1}/{len(samples)}] Processing {input_wav}...")
-        
-        # --- Autoregressive Generation ---
-        # Reset streaming
-        mimi.reset_streaming()
-        other_mimi.reset_streaming()
-        lm_gen.reset_streaming()
 
-        # Load per-sample voice prompt (mirrors training: JSONL voice_sample -> .pt cache).
-        # Must happen after reset_streaming() and before step_system_prompts() so the
-        # embeddings replay and KV-cache restore land on a clean streaming state.
+        log("info", f"[{i+1}/{len(samples)}] Processing {input_wav}...")
+
+        # Determine voice prompt path for this sample
         audio_basename = os.path.basename(input_wav)
         per_sample_pt = voice_sample_lookup.get(audio_basename)
         if per_sample_pt and os.path.exists(per_sample_pt):
-            lm_gen.load_voice_prompt_embeddings(per_sample_pt)
+            voice_prompt = per_sample_pt
             log("info", f"  Voice prompt: {per_sample_pt}")
         else:
-            lm_gen.load_voice_prompt_embeddings(default_voice_prompt_path)
+            voice_prompt = default_voice_prompt_path
             if per_sample_pt:
                 log("warning", f"  Voice prompt .pt not found ({per_sample_pt}), using default")
             else:
                 log("info", f"  No voice_sample entry for {audio_basename}, using default")
 
-        # Warmup and system prompts
-        lm_gen.step_system_prompts(mimi)
-        mimi.reset_streaming()
-        
-        # Stream User Audio
-        user_audio = lm_load_audio(input_wav, mimi.sample_rate)
-        if user_audio.ndim == 2 and user_audio.shape[0] == 2:
-            # Swap channels: original AMI stereo is often [Agent, User] or simply reversed
-            # By swapping [1, 0], we make Ch0 the User and Ch1 the Agent.
-            # Moshi normally expects User in Ch0 for its input iterator.
-            log("info", f"Swapping channels for {input_wav}...")
-            user_audio = user_audio[[1, 0], :]
-            
-        generated_frames = []
-        generated_text_tokens = []
-        bc_gate_log = []
-        special_token_map = {0: 'EPAD', 1: 'BOS', 2: 'EOS', 3: 'PAD'}
-        _prev_bc_result = None  # BC result from the previous step, aligned with the current returned token
+        output_pcm, _, generated_text_tokens, bc_gate_log, has_audio = infer_one(
+            input_wav,
+            mimi, other_mimi, lm_gen,
+            frame_size,
+            voice_prompt_path=voice_prompt,
+            face_gen=face_gen,
+            text_tokenizer=text_tokenizer,
+            suppress_epad=args.suppress_epad,
+            collect_bc_log=bc_enabled,
+        )
 
-        if face_gen is not None:
-            face_gen.reset()
+        if has_audio:
+            # Reload input audio for saving _input.wav / _merged.wav.
+            # user ch = original ch1 (before the [1,0] swap applied inside infer_one).
+            raw_audio = lm_load_audio(input_wav, mimi.sample_rate)
+            if raw_audio.ndim == 2 and raw_audio.shape[0] == 2:
+                input_pcm = raw_audio[1]
+            elif raw_audio.ndim == 2:
+                input_pcm = raw_audio[0]
+            else:
+                input_pcm = raw_audio
 
-        for user_encoded in lm_encode_from_sphn(
-            mimi,
-            lm_iterate_audio(user_audio, sample_interval_size=frame_size, pad=True),
-            max_batch=1,
-        ):
-            steps = user_encoded.shape[-1]
-            for c in range(steps):
-                if face_gen is not None:
-                    result = lm_gen.step(user_encoded[:, :, c:c+1], return_z=True)
-                    if result is None or result[0] is None:
-                        continue
-                    tokens, z = result
-                    face_gen.add_step(tokens, z)
-                else:
-                    result = lm_gen.step(user_encoded[:, :, c:c+1], return_z=True)
-                    if result is None or result[0] is None:
-                        continue
-                    tokens, z = result
-
-                generated_frames.append(decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens))
-
-                text_id = tokens[0, 0, 0].item()
-                if text_id in special_token_map:
-                    generated_text_tokens.append(special_token_map[text_id])
-                else:
-                    _t = text_tokenizer.id_to_piece(text_id).replace("▁", " ")
-                    generated_text_tokens.append(_t)
-
-                # Level 2: BC gate analysis — use result from the same forward pass (no separate call).
-                # _prev_bc_result is the BC output from the previous step, which corresponds to the
-                # token being returned now (1-frame offset from the delay buffer).
-                _PAD  = lm_gen.lm_model.text_padding_token_id
-                _EPAD = lm_gen.lm_model.end_of_text_padding_id
-                _label = "PAD" if text_id == _PAD else ("EPAD" if text_id == _EPAD else f"WORD({text_id})")
-                if getattr(lm_gen.lm_model, "backchannel", None) is not None:
-                    if _prev_bc_result is not None:
-                        _y_bc   = _prev_bc_result.bc_logits[0, 0].softmax(-1)[1].item()
-                        _s_pad  = _prev_bc_result.silence_gate_logits[0, 0].softmax(-1)[1].item()
-                        _g_soft = _y_bc * _s_pad
-                        _g_final = int(_prev_bc_result.bc_gate[0, 0].item())
-                        print(f"token={_label:14s} | y_bc={_y_bc:.3f}  s_pad={_s_pad:.3f}  g_soft={_g_soft:.3f}  g_final={_g_final}")
-                        bc_gate_log.append({
-                            "token_id": text_id,
-                            "token_label": _label,
-                            "y_bc": round(_y_bc, 4),
-                            "s_pad": round(_s_pad, 4),
-                            "g_soft": round(_g_soft, 4),
-                            "g_final": _g_final,
-                        })
-                    _prev_bc_result = getattr(lm_gen.lm_model, "_last_bc_result", None)
-                    
-        # Save outputs
-        if generated_frames:
-            output_pcm = np.concatenate(generated_frames, axis=-1)
-            # Load input audio as numpy for saving
-            input_pcm = user_audio
-            if input_pcm.ndim == 2:
-                input_pcm = input_pcm[0]  # mono
-            target_samples = input_pcm.shape[-1]
-            
-            # Trim/pad output to match input length
-            if output_pcm.shape[-1] > target_samples:
-                output_pcm = output_pcm[:target_samples]
-            elif output_pcm.shape[-1] < target_samples:
-                output_pcm = np.concatenate([
-                    output_pcm,
-                    np.zeros(target_samples - output_pcm.shape[-1], dtype=output_pcm.dtype)
-                ], axis=-1)
-            
             # 1) Save input WAV (mono)
             out_input_wav = os.path.join(args.output_dir, f"{base_name}_input.wav")
             sphn.write_wav(out_input_wav, input_pcm, mimi.sample_rate)
-            
+
             # 2) Save output WAV (mono)
             out_output_wav = os.path.join(args.output_dir, f"{base_name}_output.wav")
             sphn.write_wav(out_output_wav, output_pcm, mimi.sample_rate)
-            
+
             # 3) Save merged WAV (stereo: ch0=input, ch1=output)
             out_merged_wav = os.path.join(args.output_dir, f"{base_name}_merged.wav")
-            merged_pcm = np.stack([input_pcm, output_pcm], axis=0)  # [2, T]
+            merged_pcm = np.stack([input_pcm, output_pcm], axis=0)
             sphn.write_wav(out_merged_wav, merged_pcm, mimi.sample_rate)
-            
-            # 4) Save text tokens + BC gate analysis log into same file
+
+            # 4) Save text tokens + BC gate analysis log
             with open(out_text, 'w') as f:
                 json.dump({
                     "text_tokens": generated_text_tokens,
                     "bc_gate_log": bc_gate_log,
                 }, f, indent=2, ensure_ascii=False)
             log("info", f"Saved text tokens + BC gate log → {out_text}")
-
             log("info", f"Saved {out_input_wav}, {out_output_wav}, {out_merged_wav}")
 
             # 5) Optional face motion generation
             if face_gen is not None:
                 try:
-                    motion = face_gen.generate_numpy(vap_mimi)  # [T_face, 56]
+                    motion = face_gen.generate_numpy(vap_mimi)
                     out_face = os.path.join(args.output_dir, f"{base_name}_face_motion.npy")
                     np.save(out_face, motion)
                     log("info", f"Saved face motion to {out_face} (shape: {list(motion.shape)})")
@@ -579,6 +620,9 @@ if __name__ == "__main__":
     parser.add_argument("--input-wav", type=str, default=None, help="Process only a specific WAV path in the JSONL")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--cpu-offload", action="store_true")
+    parser.add_argument("--suppress-epad", action="store_true",
+                        help="Force [EPAD] → [PAD] whenever g_final=0 (VAP says don't speak). "
+                             "Word tokens in progress are never replaced.")
     
     args = parser.parse_args()
     torch.set_grad_enabled(False)

@@ -38,6 +38,7 @@ class Sample:
     face_motion_gt: torch.Tensor | None = None    # [T_face, 54] at 25 fps
     valid_mask: torch.Tensor | None = None        # [T_mimi] bool: True = real audio, False = silence-padded
     valid_face_frames: int | None = None          # number of valid face frames (25 fps)
+    bc_timing_targets: torch.Tensor | None = None  # [1, T] float32: 1=good BC, 0=not, -100=unknown
 
 
 @dataclass
@@ -49,6 +50,7 @@ class Batch:
     face_motion_gt: torch.Tensor | None = None    # [B, T_face, 54] at 25 fps
     valid_mask: torch.Tensor | None = None        # [B, T_mimi] bool
     valid_face_frames: torch.Tensor | None = None # [B] int: valid face frame count per sample
+    bc_timing_targets: torch.Tensor | None = None  # [B, T] float32
 
     @classmethod
     def collate(cls, batch: list[Sample]) -> "Batch":
@@ -85,13 +87,19 @@ class Batch:
                 [b.valid_face_frames for b in batch], dtype=torch.long
             )  # [B]
 
+        bc_timing_targets = None
+        if all(b.bc_timing_targets is not None for b in batch):
+            bc_timing_targets = torch.cat([b.bc_timing_targets for b in batch])  # [B, T]
+
         if batch[0].condition_attributes is None:
             return Batch(codes, vap_targets=vap_targets, voice_prompt_embs=voice_prompt_embs,
                          face_motion_gt=face_motion_gt, valid_mask=valid_mask,
-                         valid_face_frames=valid_face_frames)
+                         valid_face_frames=valid_face_frames,
+                         bc_timing_targets=bc_timing_targets)
         return Batch(codes, [b.condition_attributes for b in batch], vap_targets=vap_targets,
                      voice_prompt_embs=voice_prompt_embs, face_motion_gt=face_motion_gt,
-                     valid_mask=valid_mask, valid_face_frames=valid_face_frames)
+                     valid_mask=valid_mask, valid_face_frames=valid_face_frames,
+                     bc_timing_targets=bc_timing_targets)
 
 
 def tokenize(
@@ -431,6 +439,23 @@ class InterleavedTokenizer:
             #     print(f"[WARNING] No VAP target found for '{raw_file_id}' "
             #           f"All targets set to -100.")
 
+        # ── Binary BC timing target (vectorized) ─────────────────────────────
+        # Agent (spk1) speaks in next 200ms AND user (spk0) is silent.
+        # Derived from the same VAP manifest labels (no extra data needed):
+        #   spk0_bin0 = bit 7 of label_int,  spk1_bin0 = bit 3 of label_int
+        # Base rate: ~3% — use focal loss with pos_weight at training time.
+        bc_timing_targets = None
+        if self.vap_lookup and vap_targets is not None:
+            lbl = vap_targets[0]  # [T] long tensor with -100 for unknown
+            valid = lbl != -100
+            bc = torch.full((self.num_audio_frames,), -100.0, dtype=torch.float32, device=codes.device)
+            if valid.any():
+                lbl_valid = lbl[valid].long()
+                spk0_bin0 = (lbl_valid >> 7) & 1   # user speaking in next 200ms
+                spk1_bin0 = (lbl_valid >> 3) & 1   # agent speaking in next 200ms
+                bc[valid] = ((spk1_bin0 == 1) & (spk0_bin0 == 0)).float()
+            bc_timing_targets = bc.unsqueeze(0)  # [1, T]
+
         # ── FLAME / 3DMM face motion ─────────────────────────────────────────
         face_motion_gt = None
         if self.flame_root:
@@ -461,7 +486,8 @@ class InterleavedTokenizer:
 
         return Sample(codes, data.get("text_conditions", None), vap_targets=vap_targets,
                       voice_prompt_emb=voice_prompt_emb, face_motion_gt=face_motion_gt,
-                      valid_mask=valid_mask, valid_face_frames=valid_face_frames)
+                      valid_mask=valid_mask, valid_face_frames=valid_face_frames,
+                      bc_timing_targets=bc_timing_targets)
 
     def _find_flame_path(self, stem: str) -> Optional[Path]:
         """Return the FLAME .npy path for *stem*, or None if not found.
@@ -553,6 +579,17 @@ class InterleavedTokenizer:
             pad = np.zeros((n_face_frames - window.shape[0], 54), dtype=np.float32)
             window = np.concatenate([window, pad], axis=0)
         return torch.from_numpy(window).float()  # [T_face, 54]
+
+    def has_flame_file(self, path: str) -> bool:
+        """Return True if a FLAME .npy file exists for this audio path.
+
+        Uses the same cached lookup as _load_face_motion.  Always returns True
+        when flame_root is not configured (face gen disabled for this tokenizer).
+        """
+        if not self.flame_root:
+            return True
+        stem = os.path.splitext(os.path.basename(path))[0].replace("_stereo", "")
+        return self._find_flame_path(stem) is not None
 
     def __call__(self, wav: np.ndarray, start_sec: float, path: str, voice_prompt_emb: torch.Tensor | None = None) -> Sample:
         with torch.no_grad():

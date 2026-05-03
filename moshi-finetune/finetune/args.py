@@ -31,6 +31,13 @@ class BackchannelArgs(Serializable):
     vap_loss_weight: float = 0.1
     commitment_loss_weight: float = 0.05  # Alt 3: bc_mlp + silence_gate alignment with depformer
 
+    # Direct BC event supervision (focal BCE against EPAD ground truth)
+    bc_event_loss_weight: float = 0.3      # weight for focal BCE on bc_mlp vs EPAD events
+    bc_focal_gamma: float = 2.0            # focal loss exponent (down-weights easy negatives)
+    bc_focal_pos_weight: float = 15.0      # pos_weight in BCE (~97/3 ratio, tuned down)
+    # VapGPT warm-up: freeze GPT layers for this many steps so projections stabilise first
+    bc_warmup_steps: int = 200
+
     # ── VapGPT 모드 전용 ──────────────────────────────────────────────────
     # VoiceActivityProjection 리포지토리 루트 경로
     vap_gpt_repo_path: str = "/home2/s20235100/Conversational-AI/VoiceActivityProjection"
@@ -231,6 +238,7 @@ class TrainArgs(Serializable):
     lora: LoraArgs = field(default_factory=LoraArgs)
     # Personaplex는 LoRA 미지원이므로 full_finetuning=True가 기본값
     full_finetuning: bool = True
+    freeze_depformer: bool = False  # True이면 Depformer 전체를 동결 (LM transformer만 학습)
 
     # Backchannel VAP
     backchannel: BackchannelArgs = field(default_factory=BackchannelArgs)

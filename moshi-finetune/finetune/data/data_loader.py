@@ -1,3 +1,4 @@
+import logging
 import queue as _queue
 import threading
 from typing import Any, Iterator
@@ -7,6 +8,8 @@ import torch
 from .args import DataArgs
 from .dataset import build_raw_dataset
 from .interleaver import Batch, InterleavedTokenizer
+
+logger = logging.getLogger(__name__)
 
 _SENTINEL = object()
 
@@ -90,9 +93,28 @@ def build_data_loader(
 
     mimi = instruct_tokenizer.mimi
 
+    _flame_filter = instruct_tokenizer.flame_root  # non-empty → face gen active
+
     def _batch_generator():
         raw_buf = []
+        n_flame_skipped = 0
         for item in raw_dataset:
+            # ── Pre-filter: drop audio files with no matching FLAME .npy ─────
+            # Collate uses all() — one missing file zeros the face loss for the
+            # entire batch.  Check here (cached after first lookup) so we never
+            # waste a mimi.encode call on a sample that will ruin the batch.
+            if _flame_filter:
+                _, _, path, _ = item
+                if not instruct_tokenizer.has_flame_file(path):
+                    n_flame_skipped += 1
+                    if n_flame_skipped % 1000 == 1:
+                        logger.warning(
+                            f"[data_loader] Skipped {n_flame_skipped} sample(s) so far "
+                            f"with no FLAME file (last: {path}). "
+                            f"Check flame_root and file naming."
+                        )
+                    continue
+
             raw_buf.append(item)
             if len(raw_buf) < batch_size:
                 continue
@@ -140,6 +162,23 @@ def build_data_loader(
                 )
                 for i, (_, start_sec, path, vp_emb) in enumerate(raw_buf)
             ]
+
+            # ── Post-tokenization safety check ────────────────────────────
+            # Pre-filter handles missing files; this catches the rarer case where
+            # the file exists but the audio segment starts beyond the FLAME array.
+            if _flame_filter:
+                valid_samples = [s for s in samples if s.face_motion_gt is not None]
+                n_oob = len(samples) - len(valid_samples)
+                if n_oob > 0:
+                    logger.warning(
+                        f"[data_loader] {n_oob}/{len(samples)} sample(s) had face_motion_gt=None "
+                        f"after tokenization (segment out-of-range in FLAME file). "
+                        f"Dropping these samples from this batch."
+                    )
+                    samples = valid_samples
+                if not samples:
+                    raw_buf = []
+                    continue
 
             assert all(s.codes.dim() == 3 and len(s.codes) == 1 for s in samples)
             yield Batch.collate(samples)

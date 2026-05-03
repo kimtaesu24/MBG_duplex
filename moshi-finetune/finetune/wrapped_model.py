@@ -160,7 +160,9 @@ def get_fsdp_model(
                 return self.model(input_ids, step=kwargs.get("step", 0),
                                   voice_prompt_embs=kwargs.get("voice_prompt_embs", None),
                                   audio_feat=kwargs.get("audio_feat", None),
-                                  gt_face_motion=kwargs.get("gt_face_motion", None))
+                                  gt_face_motion=kwargs.get("gt_face_motion", None),
+                                  mimi=kwargs.get("mimi", None),
+                                  bc_audio_feats=kwargs.get("bc_audio_feats", None))
 
         model = PeftCompatibleWrapper(model)
         model = get_peft_model(model, peft_config)
@@ -201,6 +203,15 @@ def get_fsdp_model(
         for param in model.parameters():
             param.requires_grad = True
         main_logger_info("Full finetuning (fallback): 모든 파라미터 학습 가능")
+
+    if args.freeze_depformer:
+        frozen = sum(
+            p.numel() for name, p in model.named_parameters() if "depformer" in name
+        )
+        for name, param in model.named_parameters():
+            if "depformer" in name:
+                param.requires_grad = False
+        main_logger_info(f"Depformer 동결: {frozen:,}개 파라미터")
 
     if get_world_size() == 1:
         model = model.cuda()

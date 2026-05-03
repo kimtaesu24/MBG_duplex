@@ -15,7 +15,8 @@ data:
   eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
   vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
 
-run_dir: ./output/personaplex_ami_vap_gpt_voice_face
+# check
+run_dir: ./output/personaplex_ami_vap_gpt_voice_face_new
 overwrite_run_dir: true
 
 # ── Personaplex 모델 경로 ────────────────────────────────────────────────
@@ -23,14 +24,14 @@ moshi_paths:
   hf_repo_id: nvidia/personaplex-7b-v1
 
 # ── W&B 로깅 ─────────────────────────────────────────────────────────────
-wandb:
+wandb: # check
   project: "personaplex_finetune"
-  run_name: "ami_vap_gpt_voice_face"
+  run_name: "ami_vap_gpt_voice_face_new"
 
 # ── 학습 설정 ─────────────────────────────────────────────────────────────
-max_steps: 50000
-batch_size: 4
-num_microbatches: 4
+max_steps: 2000
+batch_size: 64
+num_microbatches: 2
 duration_sec: 10
 
 # Full finetuning (LM + VapGPT + FaceModule 전체 학습)
@@ -39,6 +40,7 @@ lora:
   rank: 64
   scaling: 2.0
 full_finetuning: false
+freeze_depformer: false
 
 param_dtype: bfloat16
 gradient_checkpointing: true
@@ -59,8 +61,14 @@ optim:
   pct_start: 0.05
 
 # ── 손실 가중치 ───────────────────────────────────────────────────────────
-text_padding_weight: 0.5
+text_padding_weight: 0.5   # PAD 토큰 손실 가중치 (낮을수록 PAD에 집중 감소)
+epad_weight: 2.0            # EPAD 토큰 손실 가중치 (PAD run 끝 전환 지점 강조)
 first_codebook_weight_multiplier: 1.0
+
+# ── 텍스트 프롬프트 (에이전트 지시문) ────────────────────────────────────
+# inference의 lm_gen.text_prompt_tokens 와 동일한 문자열을 설정합니다.
+# 빈 문자열("")이면 프롬프트 없이 학습합니다.
+text_prompt: "<system> [Attentive Mode] You are an attentive and supportive listener. You specialize in active listening, providing calm and consistent backchannels to support the speaker's flow without leading the conversation. <system>"
 
 # ── Backchannel VAP (VapGPT, LM 내부) ────────────────────────────────────
 backchannel:
@@ -72,9 +80,14 @@ backchannel:
   vap_dim: 256
   bc_hidden: 512
   gumbel_temp_init: 1.0
-  gumbel_temp_min: 0.5
-  gumbel_anneal_rate: 0.0001
-  vap_loss_weight: 0.1
+  gumbel_temp_min: 0.3
+  gumbel_anneal_rate: 0.001
+  vap_loss_weight: 0.5         # was 0.1
+  commitment_loss_weight: 0.0  # replaced by bc_event_loss
+  bc_event_loss_weight: 0.3
+  bc_focal_gamma: 2.0
+  bc_focal_pos_weight: 15.0
+  bc_warmup_steps: 200
 
   vap_gpt_repo_path: /home2/s20235100/Conversational-AI/VoiceActivityProjection
   vap_gpt_checkpoint: /home2/s20235100/Conversational-AI/VoiceActivityProjection/example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt
@@ -90,9 +103,10 @@ backchannel:
 # Inference: autoregressive streaming via model.generate().
 face_gen:
   enable: true
+  use_generated_audio_feat: true 
 
   # Pretrained face model checkpoint (CausalSoftVQContinuousTransformer)
-  ckpt_path: /home6/duplex/personaplex/moshi/moshi/ARTalk/train_code/outputs/stream_talkingface_model_trained/checkpoint_epoch_1200.ckpt
+  ckpt_path: /home6/duplex/personaplex/moshi/moshi/ARTalk/train_code/outputs/stream_talkingface_model_trained/checkpoint_epoch_2000.ckpt
 
   # Architecture — read from ckpt["args"] when available; values below are fallbacks.
   hidden_dim: 512
