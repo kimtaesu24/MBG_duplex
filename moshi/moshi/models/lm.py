@@ -730,8 +730,9 @@ class LMModel(StreamingContainer):
             if (bc_audio_feats is None and mimi is not None
                     and isinstance(self.backchannel, VapGPTBackchannelModule)):
                 with torch.no_grad():
-                    _a = mimi.decode_latent(codes[:, 1:9].clamp(min=0)).transpose(1, 2)
-                    _u = mimi.decode_latent(codes[:, 9:17].clamp(min=0)).transpose(1, 2)
+                    _max = self.card - 1
+                    _a = mimi.decode_latent(codes[:, 1:9].clamp(0, _max)).transpose(1, 2)
+                    _u = mimi.decode_latent(codes[:, 9:17].clamp(0, _max)).transpose(1, 2)
                 bc_audio_feats = (
                     _a.to(dtype=transformer_out.dtype),
                     _u.to(dtype=transformer_out.dtype),
@@ -940,6 +941,7 @@ class LMGen(StreamingModule[_LMGenState]):
         save_voice_prompt_embeddings: bool = False,
         sample_rate: int = 32000,
         frame_rate: int = FRAME_RATE_HZ,
+        mimi=None,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -977,6 +979,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
+        self.mimi = mimi  # optional; used to auto-extract bc_audio_feats for VapGPT backchannel
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -1125,6 +1128,7 @@ class LMGen(StreamingModule[_LMGenState]):
             target_,
             model_input_position,
             target_position,
+            input_codes=input_,
         )
         if return_embeddings:
             return output, embeddings
@@ -1146,7 +1150,7 @@ class LMGen(StreamingModule[_LMGenState]):
             )
             if prepared_inputs is not None:
                 break
-        _, provided_, target_, model_input_position, target_position = prepared_inputs
+        input_, provided_, target_, model_input_position, target_position = prepared_inputs
         transformer_out, text_logits = state.graphed_embeddings(embeddings)
         return self.process_transformer_output(
             transformer_out,
@@ -1155,10 +1159,12 @@ class LMGen(StreamingModule[_LMGenState]):
             target_,
             model_input_position,
             target_position,
+            input_codes=input_,
         )
 
     @torch.no_grad()
-    def process_transformer_output(self, transformer_out, text_logits, provided_, target_, model_input_position, target_position):
+    def process_transformer_output(self, transformer_out, text_logits, provided_, target_,
+                                   model_input_position, target_position, input_codes=None):
         state = self._streaming_state
         lm_model = self.lm_model
 
@@ -1178,8 +1184,24 @@ class LMGen(StreamingModule[_LMGenState]):
         # PAD, replace it with EPAD so the model signals "about to talk".
         # transformer_out is [B, 1, dim] in streaming mode; bc_gate is [B, 1].
         if lm_model.backchannel is not None:
+            agent_af = None
+            user_af = None
+            if (self.mimi is not None and input_codes is not None
+                    and isinstance(lm_model.backchannel, VapGPTBackchannelModule)):
+                # input_codes: [B, K, 1] — decode a single frame of per-speaker latents.
+                # Sentinel values: initial_token_id = card (out-of-range high),
+                # ungenerated = -2, zero = -1 (out-of-range low).
+                # Clamp to [0, card-1] so mimi.decode_latent embedding lookup is always valid.
+                max_code = lm_model.card - 1
+                agent_af = self.mimi.decode_latent(
+                    input_codes[:, 1:9, :].clamp(0, max_code)
+                ).transpose(1, 2).to(dtype=transformer_out.dtype)  # [B, 1, 512]
+                user_af = self.mimi.decode_latent(
+                    input_codes[:, 9:17, :].clamp(0, max_code)
+                ).transpose(1, 2).to(dtype=transformer_out.dtype)  # [B, 1, 512]
             bc_result = lm_model.backchannel(
-                transformer_out, emb_cb0=lm_model.depformer_text_emb, step=999_999
+                transformer_out, emb_cb0=lm_model.depformer_text_emb, step=999_999,
+                agent_audio_feat=agent_af, user_audio_feat=user_af,
             )
             lm_model._last_bc_result = bc_result  # expose for external logging
             is_pad = (sampled_text_token == lm_model.text_padding_token_id)

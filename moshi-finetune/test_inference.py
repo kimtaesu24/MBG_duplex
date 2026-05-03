@@ -371,6 +371,7 @@ def run_test_inference(args):
         temp_text=0.7,
         top_k=250,
         top_k_text=25,
+        mimi=mimi,
     )
     
     # Set streaming mode (critical for LMGen to work)
