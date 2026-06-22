@@ -553,6 +553,7 @@ class VapGPTBackchannelModule(nn.Module):
         gumbel_temp_init: float = 1.0,
         gumbel_temp_min: float = 0.5,
         gumbel_anneal_rate: float = 0.0001,
+        use_silence_ctx_proj: bool = True,
     ):
         super().__init__()
 
@@ -568,6 +569,7 @@ class VapGPTBackchannelModule(nn.Module):
         self.gumbel_temp_init = gumbel_temp_init
         self.gumbel_temp_min = gumbel_temp_min
         self.gumbel_anneal_rate = gumbel_anneal_rate
+        self.use_silence_ctx_proj = use_silence_ctx_proj
 
         # ── Pseudo-speaker projections (LM-dim fallbacks) ────────────────
         # z_s carries fused context for both speakers.  Two independent linear
@@ -624,7 +626,7 @@ class VapGPTBackchannelModule(nn.Module):
         )
 
         # ── Silence context projection for the BC gate ────────────────────
-        self.silence_ctx_proj = nn.Linear(vap_dim, vap_dim, bias=False)
+        self.silence_ctx_proj = nn.Linear(vap_dim, vap_dim, bias=False) if use_silence_ctx_proj else None
 
         # ── Load pretrained VapGPT weights (GPT layers + vap_head) ───────
         if checkpoint_path is not None:
@@ -709,7 +711,10 @@ class VapGPTBackchannelModule(nn.Module):
         # when user is silent, silence_ctx_proj(x_user) contributes to bc_mlp input,
         # steering bc_mlp toward firing precisely at IPU boundaries.
         s_pad_soft_exp = F.softmax(s_pad_logits, dim=-1)[..., 1:2]  # [B, T, 1] soft silence prob
-        z_bc_input = out["x2"] + self.silence_ctx_proj(x_user) * s_pad_soft_exp
+        if self.silence_ctx_proj is not None:
+            z_bc_input = out["x2"] + self.silence_ctx_proj(x_user) * s_pad_soft_exp
+        else:
+            z_bc_input = out["x2"]
         z_bc = self.bc_mlp(z_bc_input)   # [B, T, 2]
         y_bc_onehot = gumbel_softmax_st(z_bc, temperature=temp, hard=True)
         y_bc = y_bc_onehot[..., 1]       # [B, T]

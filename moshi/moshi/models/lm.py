@@ -286,6 +286,7 @@ class LMModel(StreamingContainer):
         backchannel_vap_cross_layers: int = 3,
         backchannel_vap_num_heads: int = 4,
         backchannel_vap_dropout: float = 0.1,
+        backchannel_vap_use_silence_ctx_proj: bool = True,
         # ── Face Generation Module ────────────────────────────────────────────
         face_module_enabled: bool = False,
         face_module_dir: str = "",
@@ -295,6 +296,10 @@ class LMModel(StreamingContainer):
         face_module_heads: int = 8,
         face_module_code_dim: int = 32,
         face_module_prior_warmup_frames: int = 10,
+        # ── Mimi Model for internal audio decoding (server) ──────────────────
+        # Used by the face module to decode agent audio from predicted logits.
+        mimi_enabled: bool = False,
+        mimi_checkpoint: Optional[str] = None,
         device=None,
         dtype=None,
         **kwargs,
@@ -410,6 +415,7 @@ class LMModel(StreamingContainer):
                     num_heads=backchannel_vap_num_heads,
                     dropout=backchannel_vap_dropout,
                     bc_hidden=backchannel_bc_hidden,
+                    use_silence_ctx_proj=backchannel_vap_use_silence_ctx_proj,
                     pad_token_id=_pad_id,
                     epad_token_id=_epad_id,
                     gumbel_temp_init=backchannel_gumbel_temp_init,
@@ -460,6 +466,25 @@ class LMModel(StreamingContainer):
             except Exception as _e:
                 logger.warning(f"[LMModel] Face module initialization failed: {_e}. Proceeding without face module.")
                 self.face_module = None
+
+        # ── Internal Mimi for face audio decoding (server) ──────────────────
+        # Each rank holds a frozen full copy (small model — no FSDP needed).
+        # Used to decode the agent's predicted audio codes into Mimi latents
+        # so the face module can run in "generated audio" mode.
+        self.mimi = None
+        if mimi_checkpoint is not None:
+            try:
+                from .loaders import get_mimi  # local import to avoid circular dependency
+                self.mimi = get_mimi(mimi_checkpoint, device=device)
+                self.mimi.eval()
+                for p in self.mimi.parameters():
+                    p.requires_grad = False
+                logger.info(f"[LMModel] Internal Mimi loaded from: {mimi_checkpoint}")
+            except Exception as _e:
+                logger.warning(
+                    f"[LMModel] Mimi initialization failed: {_e}. "
+                    "Internal face audio decoding will not be available."
+                )
 
     @property
     def initial_token_id(self) -> int:
@@ -801,36 +826,108 @@ class LMModel(StreamingContainer):
         text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float('NaN'))
         text_logits_mask &= (codes[:, :1] != self.zero_token_id)
 
-        # ── Face Generation ───────────────────────────────────────────────────
-        # audio_feat:    [B, T_mimi, 512] Mimi latents at 12.5 fps
-        # gt_face_motion:[B, T_face, 54]  ground-truth 3DMM at 25 fps
-        # transformer_out:[B, T_lm, 4096] LM backbone embedding z — provides gradient path
-        # The face module internally upsamples audio/llm from 12.5 fps to 25 fps via repeat_interleave(2).
+        # ── Face Generation Module (server logic) ────────────────────────────
         #
-        # When mimi is provided, audio_feat is derived from the model's own predicted
-        # audio codes (argmax of depformer logits) instead of the ground-truth codes.
-        # logits at this point: [B, dep_q, T, card], already un-delayed.
+        # Design:
+        #   • valid_face_batch  — False when gt_face_motion is missing or has zero size
+        #                         (can happen when a rank's FLAME file is absent).
+        #   • dummy pass         — When valid_face_batch is False we still forward the
+        #                         face module with zero tensors so FSDP all-reduce stays
+        #                         in sync across all ranks.
+        #   • mimi priority      — External mimi (caller) > self.mimi (loaded at init).
+        #                         Used to decode agent predicted codes → audio latents.
+        #
         face_pred = None
         face_outputs = None
-        if self.face_module is not None and gt_face_motion is not None:
-            if mimi is not None and audio_feat is None:
-                with torch.no_grad():
-                    # NaN marks delay-padding positions; treat as code 0 (silence).
-                    pred_codes = logits.detach().nan_to_num(0.0).argmax(-1).clamp(min=0)  # [B, dep_q, T]
-                    # mimi has 8 codebooks; logits covers dep_q (16) = agent(8) + user(8). Use agent only.
-                    audio_feat = mimi.decode_latent(pred_codes[:, :8]).transpose(1, 2)    # [B, T, 512]
-                    audio_feat = audio_feat.to(dtype=logits.dtype)
-            if audio_feat is not None:
-                start = self.face_module.start_motion.expand(B, 1, -1).to(
-                    dtype=audio_feat.dtype, device=audio_feat.device)
-                # Teacher forcing on motion: shift gt by one frame so frame t predicts frame t+1.
-                prev_motion = torch.cat([start, gt_face_motion[:, :-1]], dim=1)  # [B, T_face, 54]
-                face_outputs = self.face_module(audio_feat, prev_motion, llm_feat=transformer_out)
-                face_pred = face_outputs["pred_motion"]  # [B, T_face, 54]
 
-        return LMOutput(logits, logits_mask, text_logits, text_logits_mask, vap_logits, commitment_loss,
-                        face_pred, face_outputs, bc_stats,
-                        bc_logits=bc_result.bc_logits if self.backchannel is not None else None)
+        if self.face_module is not None:
+            # 1. Determine expected motion dim and whether this batch has valid data.
+            valid_face_batch = True
+            dummy_B = max(B, 1)
+
+            if gt_face_motion is None:
+                valid_face_batch = False
+                expected_dim = getattr(
+                    getattr(self.face_module, "module", self.face_module),
+                    "motion_dim", 54,
+                )
+            else:
+                expected_dim = gt_face_motion.shape[-1]
+                if B == 0 or gt_face_motion.shape[0] == 0 or gt_face_motion.shape[1] == 0:
+                    valid_face_batch = False
+                elif B != gt_face_motion.shape[0]:
+                    valid_face_batch = False
+
+            # 2. Resolve which mimi to use and decode agent audio features.
+            mimi_to_use = mimi if mimi is not None else self.mimi
+            transformer_out_run = transformer_out
+            audio_feat_run = None
+
+            if mimi_to_use is not None:
+                # Derive audio features from the model's own predicted audio codes
+                # (argmax of depformer logits). NaN padding → treat as code 0 (silence).
+                pred_codes = logits.detach().nan_to_num(0.0).argmax(-1).clamp(min=0)  # [B, dep_q, T]
+                # dep_q == 16: first 8 are agent codebooks, next 8 are user codebooks.
+                # Select agent-only codes matching Mimi's 8 codebooks.
+                if pred_codes.shape[1] == 16:
+                    agent_codes = pred_codes[:, :8]
+                elif pred_codes.shape[1] > 8:
+                    agent_codes = pred_codes[:, -8:]
+                else:
+                    agent_codes = pred_codes
+                audio_feat_run = (
+                    mimi_to_use.decode_latent(agent_codes)
+                    .transpose(1, 2)
+                    .to(dtype=transformer_out.dtype)
+                )  # [B, T, 512]
+            else:
+                # Fallback: use externally provided audio_feat (teacher-forced).
+                audio_feat_run = audio_feat
+
+            # 3. Build prev_motion for teacher forcing, or create dummy tensors.
+            if valid_face_batch:
+                start = torch.zeros(
+                    B, 1, expected_dim,
+                    dtype=transformer_out.dtype, device=transformer_out.device,
+                )
+                prev_motion = torch.cat([start, gt_face_motion[:, :-1]], dim=1)
+            else:
+                # Dummy tensors — same device/dtype as transformer_out, minimal B=1.
+                T_face = transformer_out_run.shape[1] * 2  # face runs at 2× mimi fps
+                prev_motion = torch.zeros(
+                    dummy_B, T_face, expected_dim,
+                    device=transformer_out_run.device, dtype=transformer_out_run.dtype,
+                )
+                if audio_feat_run is not None and audio_feat_run.shape[0] != dummy_B:
+                    audio_feat_run = audio_feat_run[:1].expand(dummy_B, -1, -1)
+                if transformer_out_run.shape[0] != dummy_B:
+                    transformer_out_run = transformer_out_run[:1].expand(dummy_B, -1, -1)
+
+            # 4. Forward the face module (always, for FSDP sync).
+            if audio_feat_run is not None:
+                face_outputs = self.face_module(
+                    audio_feat_run, prev_motion, llm_feat=transformer_out_run
+                )
+                if valid_face_batch:
+                    face_pred = face_outputs["pred_motion"]
+                else:
+                    # Zero placeholder — loss computation downstream will mask it out.
+                    T_face_gt = (gt_face_motion.shape[1]
+                                 if (gt_face_motion is not None and gt_face_motion.shape[1] > 0)
+                                 else transformer_out.shape[1] * 2)
+                    face_pred = torch.zeros(
+                        (B, T_face_gt, expected_dim),
+                        dtype=transformer_out.dtype, device=transformer_out.device,
+                    )
+                    if face_outputs is not None:
+                        face_outputs["is_dummy"] = True
+
+        return LMOutput(
+            logits, logits_mask, 
+            text_logits, text_logits_mask, 
+            vap_logits, commitment_loss,
+            face_pred, face_outputs, bc_stats,
+            bc_logits=bc_result.bc_logits if bc_result is not None else None)
 
 @dataclass
 class _LMGenState:
@@ -942,6 +1039,7 @@ class LMGen(StreamingModule[_LMGenState]):
         sample_rate: int = 32000,
         frame_rate: int = FRAME_RATE_HZ,
         mimi=None,
+        suppress_epad: bool = False,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -980,6 +1078,11 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
         self.mimi = mimi  # optional; used to auto-extract bc_audio_feats for VapGPT backchannel
+        # When True, force a sampled [EPAD] back to [PAD] whenever the backchannel gate
+        # says "don't speak" (g_final == 0). The substitution happens before the token is
+        # written to state.cache, so the model's autoregressive history sees [PAD] and is
+        # therefore prevented from starting a word in the next step.
+        self.suppress_epad = suppress_epad
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -1211,6 +1314,17 @@ class LMGen(StreamingModule[_LMGenState]):
                 sampled_text_token.new_full(sampled_text_token.shape, lm_model.end_of_text_padding_id),
                 sampled_text_token,
             )
+            # Suppression (inverse of the injection above): when the gate says "don't speak"
+            # (g_final == 0) but the model sampled [EPAD] (premature speech onset), force it
+            # back to [PAD]. This runs before the cache write below, so the model's history
+            # sees [PAD] and is prevented from emitting a word on the following step.
+            if self.suppress_epad:
+                is_epad = (sampled_text_token == lm_model.end_of_text_padding_id)
+                sampled_text_token = torch.where(
+                    is_epad & ~gate_fires,
+                    sampled_text_token.new_full(sampled_text_token.shape, lm_model.text_padding_token_id),
+                    sampled_text_token,
+                )
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 

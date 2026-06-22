@@ -61,7 +61,24 @@ def evaluate(
                     device=codes.device, dtype=codes.dtype,
                 )
                 if prompt_ids:
-                    prefix[:, 0, :] = torch.tensor(prompt_ids, device=codes.device)
+                    if isinstance(prompt_ids[0], list):
+                        dataset_idx = batch.get("dataset_idx")
+                        if dataset_idx is None:
+                            raise ValueError(
+                                "Missing dataset_idx in eval batch for multi-prompt evaluation."
+                            )
+                        ds_indices = dataset_idx.tolist()
+                        for b_idx, ds_idx in enumerate(ds_indices):
+                            p_tokens = prompt_ids[ds_idx % len(prompt_ids)]
+                            curr_len = len(p_tokens)
+                            prefix[b_idx, 0, T_p - curr_len:] = torch.tensor(
+                                p_tokens, device=codes.device
+                            )
+                    else:
+                        curr_len = len(prompt_ids)
+                        prefix[:, 0, T_p - curr_len:] = torch.tensor(
+                            prompt_ids, device=codes.device
+                        )
                 codes_in = torch.cat([prefix, codes], dim=2)
             else:
                 codes_in = codes
@@ -77,7 +94,7 @@ def evaluate(
             # For face gen, we mirror train.py: teacher-forced audio_feat is
             # precomputed here; generated-audio mode passes mimi to the model.
             audio_feat = None
-            gt_face_motion = None
+            gt_face_motion = batch.face_motion_gt
             mimi_for_model = mimi  # always pass mimi so VapGPT bc can auto-extract
 
             if args.face_gen.enable and mimi is not None:
@@ -96,8 +113,8 @@ def evaluate(
                         )
                         audio_feat = torch.cat([zero_feat, audio_feat], dim=1)
 
-                if batch.face_motion_gt is not None:
-                    gt_face_motion = batch.face_motion_gt.to(codes.device, dtype=param_dtype)
+                if gt_face_motion is not None:
+                    gt_face_motion = gt_face_motion.to(codes.device, dtype=param_dtype)
                     if T_p:
                         T_face_p = T_p * 2  # face runs at 25 fps = 2× mimi 12.5 fps
                         zero_motion = torch.zeros(

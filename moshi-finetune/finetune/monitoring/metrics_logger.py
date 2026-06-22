@@ -28,12 +28,20 @@ def get_train_logs(
     peak_allocated_mem: float,
     allocated_mem: float,
     train_args: TrainArgs,
+    commitment_loss: float | None = None,
+    vap_loss: float | None = None,
+    face_loss: float | None = None,
 ) -> dict[str, float | int]:
+    prob_real_tokens = (
+        num_real_tokens / state.this_step_tokens
+        if state.this_step_tokens > 0
+        else 0.0
+    )
     metrics = {
         "lr": lr,
         "step": state.step,
         "loss": loss,
-        "prob_real_tokens": num_real_tokens / state.this_step_tokens,
+        "prob_real_tokens": prob_real_tokens,
         "percent_done": 100 * state.step / train_args.max_steps,
         "peak_allocated_mem": peak_allocated_mem / GB,
         "allocated_mem": allocated_mem / GB,
@@ -42,14 +50,14 @@ def get_train_logs(
         "eta_in_seconds": state.eta,
     }
 
-    if state.this_vap_loss is not None:
-        metrics["vap_loss"] = state.this_vap_loss
-
-    if state.this_commitment_loss is not None:
-        metrics["commitment_loss"] = state.this_commitment_loss
-
-    if state.this_face_loss is not None:
-        metrics["face_loss"] = state.this_face_loss
+    if commitment_loss is not None:
+        metrics["commitment_loss"] = commitment_loss
+    
+    if vap_loss is not None:
+        metrics["vap_loss"] = vap_loss
+    
+    if face_loss is not None:
+        metrics["face_loss"] = face_loss
 
     if state.this_bc_stats is not None:
         metrics.update(state.this_bc_stats)
@@ -90,14 +98,13 @@ def train_log_msg(state: TrainState, logs: dict[str, float | int], loss: float) 
     metrics["step"] = state.step
     metrics["loss"] = loss
 
-    optional_keys = {"vap_loss", "commitment_loss", "face_loss"}
+    optional_keys = {"vap_loss", "face_loss"}
     parts = []
     for key, fmt, new_name in [
         ("step", "06", None),
         ("percent_done", "03.1f", "done (%)"),
         ("loss", ".3f", None),
         ("vap_loss", ".3f", None),
-        ("commitment_loss", ".4f", None),
         ("face_loss", ".3f", None),
         ("lr", ".1e", None),
         ("peak_allocated_mem", ".1f", "peak_alloc_mem (GB)"),
@@ -171,8 +178,13 @@ class MetricsLogger:
                 wandb.login(key=wandb_args.key)
             if wandb_args.offline:
                 os.environ["WANDB_MODE"] = "offline"
-            # wandb staging 파일을 로컬 디스크에 써서 NFS I/O 부하 방지
+                
             local_dir = Path(wandb_args.local_dir)
+            '''
+            # hyades_taesoo version (train with)
+            # wandb staging 파일을 로컬 디스크에 써서 NFS I/O 부하 방지
+            # local_dir = Path('./wandb_logs')
+            '''
             local_dir.mkdir(parents=True, exist_ok=True)
             os.environ["WANDB_DIR"] = str(local_dir)
             os.environ["WANDB_CACHE_DIR"] = str(local_dir / "cache")

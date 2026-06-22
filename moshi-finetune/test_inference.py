@@ -5,6 +5,7 @@ Loads the finetuned Moshi checkpoint and iteratively runs inference, saving the 
 
 import argparse
 import os
+import random
 import sys
 
 # Ensure local moshi source takes precedence over installed site-packages
@@ -33,6 +34,15 @@ from moshi.models.lm import load_audio as lm_load_audio
 from moshi.models.lm import _iterate_audio as lm_iterate_audio
 from moshi.models.lm import encode_from_sphn as lm_encode_from_sphn
 from moshi.offline import warmup, decode_tokens_to_pcm
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
 
 def log(level: str, msg: str):
@@ -128,12 +138,15 @@ def load_checkpoint(lm, ckpt_dir):
         if lora_weights:
             try:
                 from peft import get_peft_model, LoraConfig, TaskType
+                # Exclude depformer if the checkpoint has no depformer LoRA keys
+                # (happens when freeze_depformer=true was used during training).
+                extra_exclude = "|depformer" if not any("depformer" in k for k in lora_weights) else ""
                 lora_config = LoraConfig(
                     task_type=TaskType.FEATURE_EXTRACTION,
                     r=64,
                     lora_alpha=128,
                     target_modules=(
-                        r"(?!.*(face_module|backchannel))"
+                        rf"(?!.*(face_module|backchannel{extra_exclude}))"
                         r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj|linear_in|linear_out)"
                     ),
                     bias="none",
@@ -164,7 +177,6 @@ def infer_one(
     voice_prompt_path: str = "",
     face_gen=None,
     text_tokenizer=None,
-    suppress_epad: bool = False,
     collect_bc_log: bool = False,
 ):
     """Run offline inference for a single input WAV.
@@ -221,13 +233,11 @@ def infer_one(
             _PAD  = lm_gen.lm_model.text_padding_token_id
             _EPAD = lm_gen.lm_model.end_of_text_padding_id
 
-            # Suppress [EPAD] → [PAD] when g_final == 0 and no word is currently being spoken.
-            # Word tokens are left untouched; only EPAD (premature speech onset) is suppressed.
-            if suppress_epad and getattr(lm_gen.lm_model, "backchannel", None) is not None and _prev_bc_result is not None:
-                _g_final_now = int(_prev_bc_result.bc_gate[0, 0].item())
-                if _g_final_now == 0 and tokens[0, 0, 0].item() == _EPAD:
-                    tokens = tokens.clone()
-                    tokens[0, 0, 0] = _PAD
+            # Note: [EPAD] → [PAD] suppression (when the backchannel gate says "don't speak")
+            # is handled inside LMGen.process_transformer_output, controlled by the
+            # suppress_epad flag passed at LMGen construction. It must run there so the
+            # substitution is written to the model's autoregressive cache; doing it here on
+            # the returned tokens would only affect decoding/logging, not generation.
 
             generated_frames.append(decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens))
 
@@ -274,6 +284,7 @@ def infer_one(
 
 
 def run_test_inference(args):
+    set_seed(args.seed)
     device = args.device
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -372,6 +383,7 @@ def run_test_inference(args):
         top_k=250,
         top_k_text=25,
         mimi=mimi,
+        suppress_epad=args.suppress_epad,
     )
     
     # Set streaming mode (critical for LMGen to work)
@@ -444,7 +456,11 @@ def run_test_inference(args):
         samples = [s for s in samples if s["path"] == args.input_wav]
         log("info", f"Testing single sample with path {args.input_wav}")
     else:
-        log("info", f"Found {len(samples)} samples to test.")
+        if args.world_size > 1:
+            samples = samples[args.rank::args.world_size]
+            log("info", f"Rank {args.rank}/{args.world_size}: Found {len(samples)} samples to test out of total.")
+        else:
+            log("info", f"Found {len(samples)} samples to test.")
     
     # Resolve base directory for relative WAV paths in the jsonl
     jsonl_dir = os.path.dirname(os.path.abspath(args.test_jsonl))
@@ -498,7 +514,6 @@ def run_test_inference(args):
             voice_prompt_path=voice_prompt,
             face_gen=face_gen,
             text_tokenizer=text_tokenizer,
-            suppress_epad=args.suppress_epad,
             collect_bc_log=bc_enabled,
         )
 
@@ -557,7 +572,7 @@ def run_test_inference(args):
                 sample_data = interleaved_tokenizer(wav_np, 0.0, input_wav)
                 codes = sample_data.codes.to(device)  # already [1, K, T] from InterleavedTokenizer
 
-                output = lm.forward_train(codes)
+                output = lm.forward_train(codes, mimi=mimi)
                 if output.vap_logits is not None:
                     vap_probs = F.softmax(output.vap_logits[0], dim=-1)  # [T, 256]
                     vap_preds = vap_probs.argmax(dim=-1).cpu().tolist()
@@ -613,10 +628,10 @@ def run_test_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test Dataset Inference")
-    parser.add_argument("--config", type=str, required=True, help="Path to args.yaml or training config yaml")
-    parser.add_argument("--test-jsonl", type=str, required=True, help="Path to data.jsonl for the test dataset")
-    parser.add_argument("--output-dir", type=str, required=True, help="Directory to save generated outputs")
-    parser.add_argument("--ckpt-dir", type=str, default=None, help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument("--config", type=str, default='./output/example_5e-5/args.yaml', help="Path to args.yaml or training config yaml")
+    parser.add_argument("--test-jsonl", type=str, default='./data/stereo_ami_balanced_test/data_with_voice_sample.jsonl', help="Path to data.jsonl for the test dataset")
+    parser.add_argument("--output-dir", type=str, default='./result/example_5e-5', help="Directory to save generated outputs")
+    parser.add_argument("--ckpt-dir", type=str, default="./output/example_5e-5/checkpoints/checkpoint_002000", help="Directory containing consolidated/lora.safetensors")
     parser.add_argument("--sample-idx", type=int, default=None, help="Process only a specific index in the JSONL")
     parser.add_argument("--input-wav", type=str, default=None, help="Process only a specific WAV path in the JSONL")
     parser.add_argument("--device", type=str, default="cuda")
@@ -624,6 +639,9 @@ if __name__ == "__main__":
     parser.add_argument("--suppress-epad", action="store_true",
                         help="Force [EPAD] → [PAD] whenever g_final=0 (VAP says don't speak). "
                              "Word tokens in progress are never replaced.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--world-size", type=int, default=1, help="Total number of processes for inference")
+    parser.add_argument("--rank", type=int, default=0, help="Rank of the current process")
     
     args = parser.parse_args()
     torch.set_grad_enabled(False)

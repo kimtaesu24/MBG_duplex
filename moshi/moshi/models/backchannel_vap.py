@@ -38,8 +38,11 @@ def gumbel_softmax_st(
 
     Returns [*, 2] one-hot (hard=True) or soft probabilities.
     """
-    gumbels = -torch.empty_like(logits).exponential_().log()
-    gumbels = (logits + gumbels) / temperature
+    if torch.is_grad_enabled():
+        gumbels = -torch.empty_like(logits).exponential_().log()
+        gumbels = (logits + gumbels) / temperature
+    else:
+        gumbels = logits / temperature
     y_soft = F.softmax(gumbels, dim=-1)
     if hard:
         index = y_soft.max(dim=-1, keepdim=True)[1]
@@ -175,6 +178,12 @@ class BackchannelModule(nn.Module):
         epad_emb = emb_cb0(epad_ids)  # [1, depformer_dim]
         g_soft_exp = g_soft.unsqueeze(-1)
         bc_token_emb = g_soft_exp * epad_emb + (1.0 - g_soft_exp) * pad_emb  # [B, T, depformer_dim]
+
+        '''
+        # hyades_taesoo version (train with)
+        y_bc_exp = y_bc.unsqueeze(-1)
+        bc_token_emb = y_bc_exp * epad_emb + (1.0 - y_bc_exp) * pad_emb
+        '''
 
         return BackchannelOutput(
             bc_embeddings=bc_token_emb,

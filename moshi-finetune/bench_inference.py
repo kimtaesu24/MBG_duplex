@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import os
+import random
 import sys
 
 from tqdm import tqdm
@@ -42,6 +43,15 @@ from moshi.offline import warmup
 
 # Shared helpers and the canonical per-sample inference function live in test_inference.
 from test_inference import log, _strip_peft_prefixes, load_checkpoint, infer_one
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
 
 V1_TASKS = [
@@ -74,6 +84,7 @@ def collect_input_files(data_dir: Path, tasks: list[str], overwrite: bool) -> li
 
 
 def run(args):
+    set_seed(args.seed)
     data_dir = Path(args.data_dir)
     device = args.device
 
@@ -167,7 +178,7 @@ def run(args):
         frame_rate=mimi.frame_rate,
         use_sampling=True,
         temp=0.8,
-        temp_text=0.7,
+        temp_text=args.temp,
         top_k=250,
         top_k_text=25,
         mimi=mimi,
@@ -200,8 +211,12 @@ def run(args):
     # ── Main loop ─────────────────────────────────────────────────────────────
     failed = 0
 
+    # already_processed_idx = 600
+
     with tqdm(input_files, unit="sample") as pbar:
-        for inp in pbar:
+        for i, inp in enumerate(pbar):
+            # if i < already_processed_idx:
+            #     continue
             out = inp.parent / "output.wav"
             pbar.set_postfix_str(inp.parent.name)
             try:
@@ -252,6 +267,8 @@ if __name__ == "__main__":
                              "Word tokens in progress are never replaced.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--cpu-offload", action="store_true")
+    parser.add_argument("--temp", type=float, default=0.7)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     args = parser.parse_args()
     torch.set_grad_enabled(False)

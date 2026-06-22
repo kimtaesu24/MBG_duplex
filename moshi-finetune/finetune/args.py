@@ -60,6 +60,8 @@ class BackchannelArgs(Serializable):
     vap_gpt_cross_layers: int = 3
     vap_gpt_num_heads: int = 4
     vap_gpt_dropout: float = 0.1
+
+    use_silence_ctx_proj: bool = True
     # CPC 인코더 고정 여부 (사전학습 가중치 사용 시 True 권장)
     # checkpoint_path가 설정된 경우 CPC는 체크포인트에서 로드되므로 별도 다운로드 없음.
     vap_gpt_freeze_encoder: bool = True
@@ -147,6 +149,11 @@ class FaceGenArgs(Serializable):
     # Sliding context window (in face frames at 25 fps) for autoregressive generation.
     max_context_frames: int = 25
 
+    # When True, the audio feature fed to the face module is decoded from the
+    # model's own predicted audio codes (argmax of depformer logits) rather than
+    # from the ground-truth codes (teacher forcing).
+    use_generated_audio_feat: bool = False
+
     # ── ARTalkCodec (VAE) for z-space loss computation ────────────────────
     # Frozen codec used only to compute z_target = quant_to_sum_feat(gt_face_motion).
     codec_ckpt_path: str | None = None   # e.g. /home6/duplex/VAE_ami_dualtalk/checkpoints/iter_100000.pt
@@ -162,11 +169,6 @@ class FaceGenArgs(Serializable):
     # where speaker ∈ {"bc", "ut"} and split ∈ {"train", "valid", "test"}.
     flame_root: str = ""
     flame_speaker: str = "bc"  # primary speaker suffix for the agent channel
-
-    # When True, the audio feature fed to the face module is decoded from the
-    # model's own predicted audio codes (argmax of depformer logits) rather than
-    # from the ground-truth codes (teacher forcing).
-    use_generated_audio_feat: bool = False
 
     # ── Per-component loss weights (from reference pretraining) ───────────
     # Overall weight applied to the sum of all face sub-losses.
@@ -204,7 +206,7 @@ class TrainArgs(Serializable):
     # 비어 있으면 프롬프트 없이 학습 (기존 동작 유지).
     # 설정 시 매 학습 스텝에서 codes의 앞에 접두사로 삽입되어
     # inference의 step_system_prompts() 와 동일한 방식으로 LM에 제공됩니다.
-    text_prompt: str = ""
+    text_prompt: str | list[str] | None = None
 
     optim: OptimArgs = field(default_factory=OptimArgs)
     seed: int = 0
