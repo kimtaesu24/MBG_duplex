@@ -224,6 +224,14 @@ class TrainArgs(Serializable):
     do_ckpt: bool = True
     num_ckpt_keep: int | None = 3
 
+    # Best-checkpoint 유지 (EPAD 예측 점수 기준)
+    # None이면 기존 recency(최근 num_ckpt_keep개) 정책을 사용.
+    # 설정 시(예: "epad_f1") eval에서 해당 metric이 갱신된 스텝에만 저장하고
+    # 점수 상위 ckpt_keep_best_n개만 남깁니다.
+    # 지원 metric: epad_f1 / epad_recall / epad_precision / epad_acc
+    ckpt_keep_best_metric: str | None = None
+    ckpt_keep_best_n: int = 3
+
     # 평가
     eval_freq: int = 0
     do_eval: bool = False

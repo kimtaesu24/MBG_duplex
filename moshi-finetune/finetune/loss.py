@@ -138,6 +138,62 @@ def compute_face_loss(
     return total
 
 
+@torch.no_grad()
+def epad_confusion_counts(
+    text_logits: torch.Tensor,
+    target: torch.Tensor,
+    target_mask: torch.Tensor,
+    epad_id: int,
+) -> torch.Tensor:
+    """Confusion-matrix counts for [EPAD] prediction by the text head.
+
+    Treats "is the predicted text token [EPAD]?" as a binary classification
+    against the ground-truth text token, restricted to valid (masked) frames.
+
+    Args:
+        text_logits: [B, Kt, T, V] text head logits.
+        target:      [B, Kt, T]    ground-truth text tokens.
+        target_mask: [B, Kt, T]    bool — True = valid frame counted in the loss.
+        epad_id:     end-of-text-padding token id (model.end_of_text_padding_id).
+
+    Returns:
+        Float tensor [tp, fp, fn, tn] on the logits' device (sum over all valid
+        positions). Accumulate these across microbatches/ranks, then derive
+        acc/precision/recall/F1 with `epad_metrics_from_counts`.
+    """
+    pred = text_logits.argmax(dim=-1)          # [B, Kt, T]
+    valid = target_mask.bool()
+    is_pred = pred == epad_id
+    is_tgt = target == epad_id
+    tp = (valid & is_pred & is_tgt).sum()
+    fp = (valid & is_pred & ~is_tgt).sum()
+    fn = (valid & ~is_pred & is_tgt).sum()
+    tn = (valid & ~is_pred & ~is_tgt).sum()
+    return torch.stack([tp, fp, fn, tn]).float()
+
+
+def epad_metrics_from_counts(
+    counts: torch.Tensor, prefix: str = "epad"
+) -> dict[str, float]:
+    """Derive accuracy/precision/recall/F1 from [tp, fp, fn, tn] counts."""
+    tp, fp, fn, tn = (float(x) for x in counts.tolist())
+    total = tp + fp + fn + tn
+    acc = (tp + tn) / total if total > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+    return {
+        f"{prefix}_acc": acc,
+        f"{prefix}_precision": precision,
+        f"{prefix}_recall": recall,
+        f"{prefix}_f1": f1,
+    }
+
+
 def compute_loss_with_mask(
     logits: torch.Tensor,
     target: torch.Tensor,

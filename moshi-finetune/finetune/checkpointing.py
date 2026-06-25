@@ -38,6 +38,8 @@ class Checkpointer:
         optimizer: torch.optim.Optimizer | None = None,
         num_ckpt_keep: int | None = None,
         full_finetuning: bool = False,
+        keep_best_metric: str | None = None,
+        keep_best_n: int = 3,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -47,6 +49,9 @@ class Checkpointer:
         self.num_ckpt_keep = num_ckpt_keep
         self.full_finetuning = full_finetuning
         self.config = config
+        # Best-checkpoint 유지: keep_best_metric 설정 시 점수 상위 keep_best_n개만 보존.
+        self.keep_best_metric = keep_best_metric
+        self.keep_best_n = keep_best_n
 
     @property
     def ckpt_dir(self) -> Path:
@@ -83,6 +88,59 @@ class Checkpointer:
                 main_logger_info(f"Error deleting directory {ckpt_to_delete}: {e}")
 
         return ckpts_to_delete
+
+    @property
+    def best_registry_path(self) -> Path:
+        """JSON registry of {step: score} for best-checkpoint retention."""
+        return self.ckpt_dir / "best_checkpoints.json"
+
+    def prune_by_best(self, step: int, score: float) -> list[Path]:
+        """Record *score* for *step* and keep only the top ``keep_best_n`` ckpts.
+
+        Higher score = better. Checkpoints whose score drops out of the top-N
+        (including the one just saved, if it doesn't qualify) are deleted along
+        with their registry entry. Only meaningful on rank 0.
+        """
+        registry: dict[str, float] = {}
+        if self.best_registry_path.exists():
+            try:
+                registry = json.loads(self.best_registry_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                registry = {}
+        registry[str(step)] = float(score)
+
+        # Drop registry entries whose checkpoint dir no longer exists (manual rm).
+        registry = {
+            s: v
+            for s, v in registry.items()
+            if (self.ckpt_dir / f"checkpoint_{int(s):06d}").exists()
+        }
+
+        # Sort by score (desc); ties broken by newer step first.
+        ordered = sorted(registry.items(), key=lambda kv: (kv[1], int(kv[0])), reverse=True)
+        keep = dict(ordered[: self.keep_best_n])
+        drop = ordered[self.keep_best_n :]
+
+        deleted: list[Path] = []
+        for step_str, _ in drop:
+            ckpt_path = self.ckpt_dir / f"checkpoint_{int(step_str):06d}"
+            if ckpt_path.exists():
+                try:
+                    shutil.rmtree(ckpt_path)
+                    deleted.append(ckpt_path)
+                except OSError as e:
+                    main_logger_info(f"Error deleting directory {ckpt_path}: {e}")
+            registry.pop(step_str, None)
+
+        self.best_registry_path.write_text(json.dumps(registry, indent=2))
+        kept_desc = ", ".join(
+            f"step {s}={registry[s]:.4f}"
+            for s in sorted(keep, key=lambda s: registry[s], reverse=True)
+        )
+        main_logger_info(
+            f"[Checkpointer] best-{self.keep_best_n} by '{self.keep_best_metric}': {kept_desc}"
+        )
+        return deleted
 
     def write_params_info(self, tmp_dst: Path):
         params_path = tmp_dst / "config.json"
@@ -225,6 +283,7 @@ class Checkpointer:
         self,
         save_only_lora: bool,
         dtype: torch.dtype = torch.float16,
+        score: float | None = None,
     ):
         if self.full_finetuning:
             assert not save_only_lora, "Cannot save LoRA checkpoint in full finetuning"
@@ -260,8 +319,13 @@ class Checkpointer:
                 f"Done dumping checkpoint in {self.dst_dir} for step: {self.state.step}"
             )
 
-            # delete last n checkpoints
-            if self.num_ckpt_keep is not None:
+            # 보존 정책: best 모드(점수 기준 top-N) 또는 recency 모드(최근 N개)
+            if self.keep_best_metric is not None and score is not None:
+                ckpts_to_delete = self.prune_by_best(self.state.step, score)
+                logger.info(
+                    f"Done deleting checkpoints {', '.join([str(c) for c in ckpts_to_delete])}"
+                )
+            elif self.num_ckpt_keep is not None:
                 ckpts_to_delete = self.delete_old_ckpts()
                 logger.info(
                     f"Done deleting checkpoints {', '.join([str(c) for c in ckpts_to_delete])}"

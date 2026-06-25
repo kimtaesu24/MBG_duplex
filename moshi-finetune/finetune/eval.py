@@ -11,7 +11,12 @@ from finetune.args import TrainArgs
 
 from .data.data_loader import Batch
 from .distributed import get_rank, get_world_size
-from .loss import compute_loss_with_mask, compute_face_loss
+from .loss import (
+    compute_loss_with_mask,
+    compute_face_loss,
+    epad_confusion_counts,
+    epad_metrics_from_counts,
+)
 from .utils import TrainState
 
 logger = logging.getLogger("eval")
@@ -43,6 +48,7 @@ def evaluate(
     commitment_loss_accum = torch.tensor(0.0, device="cuda")
     face_loss_accum       = torch.tensor(0.0, device="cuda")
     bc_event_loss_accum   = torch.tensor(0.0, device="cuda")
+    epad_counts           = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for [EPAD]
 
     max_eval_batches = max(40 // get_world_size(), 1)
     model.eval()
@@ -154,6 +160,14 @@ def evaluate(
             text_loss_accum  += text_loss
             audio_loss_accum += audio_loss
 
+            # [EPAD] 예측 confusion counts 집계
+            epad_counts += epad_confusion_counts(
+                output.text_logits[:, :, T_p:],
+                codes[:, : model.audio_offset],
+                text_mask,
+                model.end_of_text_padding_id,
+            )
+
             # ── VAP / commitment / bc-event losses ────────────────────────
             if args.backchannel.enable:
                 vap_logits = output.vap_logits[:, T_p:] if output.vap_logits is not None else None
@@ -248,6 +262,17 @@ def evaluate(
     state.this_eval_perplexity  = (2 ** eval_loss).item()
     state.this_audio_loss       = audio_loss_accum.item()
     state.this_text_loss        = text_loss_accum.item()
+
+    # [EPAD] 예측 metric: confusion counts를 전체 rank에서 합산 후 acc/recall/f1 계산
+    dist.all_reduce(epad_counts, op=dist.ReduceOp.SUM)
+    state.this_eval_epad_metrics = epad_metrics_from_counts(epad_counts, prefix="epad")
+    main_logger_info(
+        "[EPAD] eval "
+        f"acc={state.this_eval_epad_metrics['epad_acc']:.4f} "
+        f"precision={state.this_eval_epad_metrics['epad_precision']:.4f} "
+        f"recall={state.this_eval_epad_metrics['epad_recall']:.4f} "
+        f"f1={state.this_eval_epad_metrics['epad_f1']:.4f}"
+    )
 
     if args.backchannel.enable:
         for t in (vap_loss_accum, commitment_loss_accum):

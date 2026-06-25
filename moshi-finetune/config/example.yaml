@@ -1,70 +1,157 @@
-# Personaplex MBG Finetuning 설정 예시
-# 실행: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml
+# Personaplex MBG — VapGPT Backchannel + Face Generation (end-to-end)
+#
+# Face module: CausalSoftVQContinuousTransformer trained on AMI+DualTalk.
+# Training uses teacher-forcing; inference uses autoregressive streaming.
+# Inputs to the face module:
+#   - audio_feat: Mimi latent features decoded from agent audio tokens [B, T, 512] @ 12.5 fps
+#   - llm_feat:   Main transformer embedding z [B, T, 4096] @ 12.5 fps
+# Both are internally upsampled 2x inside the face module to match 25 fps face output.
+#
+# 실행: torchrun --nproc_per_node=<N_GPUS> train.py config/ami_vap_gpt_voice_face.yaml
 
-data:
-  # JSONL 파일 또는 JSONL을 포함한 디렉토리 경로
-  # 각 라인: {"path": "/path/to/audio.wav", "duration": 10.0}
-  # 오디오 파일과 같은 경로에 .json 파일 (word-alignment 정보)이 있어야 합니다.
-  train_data: ./daily-talk-contiguous/dailytalk.jsonl
-  shuffle: false
-  # eval_data: /path/to/your/eval.jsonl  # 평가 데이터 (선택)
 
-# 출력 디렉토리 (존재하면 안 됨, 또는 overwrite_run_dir: true 설정)
-run_dir: ./personaplex_testrun_lora
+
+# check
+run_dir: ./output/example_epad_log
 overwrite_run_dir: true
+
+wandb:
+  project: "personaplex_finetune_AAAI"
+  run_name: "test_run_0623_epad_log"
+
+# ── 데이터 설정 ─────────────────────────────────────────────────────────────
+data:
+  train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
+  shuffle: true
+  eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
+  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
 
 # ── Personaplex 모델 경로 ────────────────────────────────────────────────
 moshi_paths:
   hf_repo_id: nvidia/personaplex-7b-v1
-  # 로컬 경로 지정 시 HuggingFace 다운로드 생략:
-  # moshi_path:     /path/to/model.safetensors
-  # mimi_path:      /path/to/tokenizer-e351c8d8-checkpoint125.safetensors
-  # tokenizer_path: /path/to/tokenizer_spm_32k_3.model
 
-# ── W&B 로깅 ─────────────────────────────────────────────────────────────
-wandb:
-  project: null           # null이면 wandb 미사용
-  # project: "personaplex_finetune"
-  # run_name: "experiment_01"
+# ── 학습 설정 ─────────────────────────────────────────────────────────────
+max_steps: 2000
+batch_size: 2
+num_microbatches: 64
+duration_sec: 10
 
-# ── 학습 설정 ──────────────────────────────────────────────────────────
-max_steps: 100000
-batch_size: 64
-num_microbatches: 4       # 그래디언트 누적 횟수
-duration_sec: 15         # 학습 세그먼트 길이(초) - OOM 방지를 위해 단축
-
-# Personaplex: LoRA 파인튜닝 지원.
+# Full finetuning (LM + VapGPT + FaceModule 전체 학습)
 lora:
   enable: true
   rank: 64
   scaling: 2.0
 full_finetuning: false
+freeze_depformer: false
 
-# ── Mixed precision ──────────────────────────────────────────────────────
 param_dtype: bfloat16
-
-# ── 그래디언트 체크포인팅 (메모리 절약) ──────────────────────────────────
 gradient_checkpointing: true
 
-# ── 로깅 ─────────────────────────────────────────────────────────────────
+# ── 로깅 / 체크포인트 / 평가 ─────────────────────────────────────────────
 log_freq: 10
-
-# ── 체크포인트 ────────────────────────────────────────────────────────────
 do_ckpt: true
-ckpt_freq: 100            # 0이면 마지막 스텝에만 저장
+ckpt_freq: 100
 num_ckpt_keep: 3
 save_adapters: true
+do_eval: true
+eval_freq: 100
+ckpt_keep_best_metric: epad_f1   # epad_recall / epad_precision / epad_acc 도 가능
+ckpt_keep_best_n: 3
 
-# ── 평가 ─────────────────────────────────────────────────────────────────
-do_eval: false
-eval_freq: 0
 
 # ── 옵티마이저 ────────────────────────────────────────────────────────────
 optim:
-  lr: 1.0e-5              # full finetuning은 낮은 lr 권장 (1e-5~5e-5)
+  lr: 1.0e-5
   weight_decay: 0.1
   pct_start: 0.05
 
 # ── 손실 가중치 ───────────────────────────────────────────────────────────
-text_padding_weight: 0.5
+text_padding_weight: 0.5   # PAD 토큰 손실 가중치 (낮을수록 PAD에 집중 감소)
+epad_weight: 2.0            # EPAD 토큰 손실 가중치 (PAD run 끝 전환 지점 강조)
 first_codebook_weight_multiplier: 1.0
+
+# ── 텍스트 프롬프트 (에이전트 지시문) ────────────────────────────────────
+# inference의 lm_gen.text_prompt_tokens 와 동일한 문자열을 설정합니다.
+# 빈 문자열("")이면 프롬프트 없이 학습합니다.
+text_prompt: "<system> [Attentive Mode] You are an attentive and supportive listener. You specialize in active listening, providing calm and consistent backchannels to support the speaker's flow without leading the conversation. <system>"
+
+# ── Backchannel VAP (VapGPT, LM 내부) ────────────────────────────────────
+backchannel:
+  enable: true
+  module_type: vap_gpt
+  pad_token_id: 3
+  epad_token_id: 0
+
+  vap_dim: 256
+  bc_hidden: 512
+  gumbel_temp_init: 1.0
+  gumbel_temp_min: 0.3
+  gumbel_anneal_rate: 0.001
+  vap_loss_weight: 0.5         # was 0.1
+  commitment_loss_weight: 0.0  # replaced by bc_event_loss
+  bc_event_loss_weight: 0.3
+  bc_focal_gamma: 2.0
+  bc_focal_pos_weight: 15.0
+  bc_warmup_steps: 200
+
+  vap_gpt_repo_path: /home2/s20235100/Conversational-AI/VoiceActivityProjection
+  vap_gpt_checkpoint: /home2/s20235100/Conversational-AI/VoiceActivityProjection/example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt
+  vap_gpt_dim: 256
+  vap_gpt_channel_layers: 1
+  vap_gpt_cross_layers: 3
+  vap_gpt_num_heads: 4
+  vap_gpt_dropout: 0.1
+  vap_use_silence_ctx_proj: true
+
+# ── Face Generation Module ────────────────────────────────────────────────
+# CausalSoftVQContinuousTransformer — end-to-end trained alongside the LM.
+# Training: teacher-forced (gt 3DMM shifted by 1 frame as prev_motion input).
+# Inference: autoregressive streaming via model.generate().
+face_gen:
+  enable: true
+  use_generated_audio_feat: true 
+
+  # Pretrained face model checkpoint (CausalSoftVQContinuousTransformer)
+  ckpt_path: /home2/s20235100/Conversational-AI/personaplex_MBG/moshi-finetune/checkpoint_epoch_800.ckpt
+
+  # Architecture — read from ckpt["args"] when available; values below are fallbacks.
+  hidden_dim: 512
+  layers: 6
+  heads: 8
+  code_dim: 32
+  prior_warmup_frames: 10
+
+  # Autoregressive context window for streaming inference (face frames @ 25 fps)
+  max_context_frames: 25
+
+  # ── ARTalkCodec (VAE) — frozen, used only for z_target computation ──────
+  codec_ckpt_path: /home6/duplex/VAE_ami_dualtalk/checkpoints/iter_100000.pt
+  codec_stats_path: /home6/duplex/dataset/artalk_mimi54_stats.json
+  codec_hidden_dim: 512
+  codec_depth: 8
+  codec_heads: 8
+  # ── FLAME / 3DMM training data ────────────────────────────────────────
+  # Root dir: {flame_root}/{speaker}/{split}/{stem}_{speaker}.npy
+  # speaker ∈ {"bc", "ut"}, split ∈ {"train", "valid", "test"}
+  flame_root: /home6/duplex/dataset/ami_flame
+  flame_speaker: bc   # agent (moshi) = backchannel speaker in AMI
+
+  # ── Combined face loss weight ──────────────────────────────────────────
+  # Multiplied onto the sum of all face sub-losses below.
+  face_loss_weight: 1.0
+
+  # Sub-loss weights — match softvq_continuous_online_train.py defaults.
+  motion_weight: 1.0       # L1(pred_motion, gt)
+  prior_weight: 0.5        # L1(prior_motion, gt)
+  z_weight: 0.2            # MSE(z_pred, z_target)
+  z_bce_weight: 0.1        # BCE on z_pred bits vs z_target bits
+  jaw_weight: 2.0          # extra L1 weight on jaw dim [50:51]
+  vel_weight: 0.5          # MSE on frame-to-frame velocity
+  reg_weight: 0.02         # regularisation on delta and residual
+  gate_weight: 1.0         # gate target MSE
+  gate_target_expr: 0.45
+  gate_target_jaw: 0.25
+  gate_target_neck: 0.65
+  gate_loss_expr_weight: 4.0
+  gate_loss_jaw_weight: 4.0
+  gate_loss_neck_weight: 1.0

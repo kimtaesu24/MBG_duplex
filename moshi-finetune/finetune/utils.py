@@ -26,6 +26,7 @@ class TrainState:
     this_commitment_loss: float | None = None
     this_face_loss: float | None = None
     this_bc_stats: dict | None = None
+    this_eval_epad_metrics: dict | None = None
 
     def start_step(self):
         self.step += 1

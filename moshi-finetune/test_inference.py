@@ -628,10 +628,10 @@ def run_test_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test Dataset Inference")
-    parser.add_argument("--config", type=str, default='./output/example_5e-5/args.yaml', help="Path to args.yaml or training config yaml")
+    parser.add_argument("--config", type=str, default='./output/example_epad_log/args.yaml', help="Path to args.yaml or training config yaml")
     parser.add_argument("--test-jsonl", type=str, default='./data/stereo_ami_balanced_test/data_with_voice_sample.jsonl', help="Path to data.jsonl for the test dataset")
-    parser.add_argument("--output-dir", type=str, default='./result/example_5e-5', help="Directory to save generated outputs")
-    parser.add_argument("--ckpt-dir", type=str, default="./output/example_5e-5/checkpoints/checkpoint_002000", help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument("--output-dir", type=str, default='./result/best_reproduce', help="Directory to save generated outputs")
+    parser.add_argument("--ckpt-dir", type=str, default="./output/best/hyades_checkpoint_001900", help="Directory containing consolidated/lora.safetensors")
     parser.add_argument("--sample-idx", type=int, default=None, help="Process only a specific index in the JSONL")
     parser.add_argument("--input-wav", type=str, default=None, help="Process only a specific WAV path in the JSONL")
     parser.add_argument("--device", type=str, default="cuda")

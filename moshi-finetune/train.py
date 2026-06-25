@@ -40,7 +40,12 @@ from finetune.distributed import (
     set_device,
 )
 from finetune.eval import evaluate
-from finetune.loss import compute_loss_with_mask, compute_face_loss
+from finetune.loss import (
+    compute_loss_with_mask,
+    compute_face_loss,
+    epad_confusion_counts,
+    epad_metrics_from_counts,
+)
 from finetune.monitoring.metrics_logger import (
     MetricsLogger,
     eval_log_msg,
@@ -363,6 +368,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             optimizer=optimizer,
             num_ckpt_keep=args.num_ckpt_keep,
             full_finetuning=args.full_finetuning,
+            keep_best_metric=args.ckpt_keep_best_metric,
+            keep_best_n=args.ckpt_keep_best_n,
         )
 
     # ── 12. 학습 준비 ──────────────────────────────────────────────────────
@@ -385,6 +392,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         face_loss_val = torch.tensor([0.0], device="cuda")
         bc_event_loss_val = torch.tensor([0.0], device="cuda")
         bc_stats_accum: dict | None = None
+        epad_counts = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for [EPAD] prediction
         n_batch_tokens: int = 0
         n_real_tokens: int = 0
         face_loss_skipped_no_data: int = 0   # batches where face_motion_gt was None (missing FLAME files)
@@ -510,6 +518,14 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     audio_mask,
                     mode="audio",
                     first_codebook_weight_multiplier=args.first_codebook_weight_multiplier,
+                )
+
+                # [EPAD] 예측 정확도(acc/precision/recall/f1) 집계용 confusion counts
+                epad_counts += epad_confusion_counts(
+                    output.text_logits[:, :, T_p:],
+                    codes[:, : model.audio_offset],
+                    text_mask,
+                    model.end_of_text_padding_id,
                 )
 
                 mb_loss = text_loss + audio_loss
@@ -700,9 +716,10 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             state.this_face_loss = avg_aggregate(face_loss_val.item())
 
         # 평가
-        if args.do_eval and (
+        did_eval = args.do_eval and (
             (args.eval_freq > 0 and state.step % args.eval_freq == 0) or is_last_step
-        ):
+        )
+        if did_eval:
             eval_data_loader = build_data_loader(
                 instruct_tokenizer=interleaved_tokenizer,
                 args=args.data,
@@ -724,6 +741,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 state.this_eval_perplexity,
                 state.this_eval_loss,
             )
+            # [EPAD] eval metric (acc/precision/recall/f1)을 eval 로그에 포함
+            if state.this_eval_epad_metrics is not None:
+                eval_logs.update(state.this_eval_epad_metrics)
             main_logger_info(eval_log_msg(eval_logs))
             eval_logger.log(eval_logs, step=state.step)
 
@@ -758,7 +778,19 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 torch.cuda.memory_allocated(),
                 args,
             )
+            # [EPAD] 예측 metric: rank별 confusion counts를 합산한 뒤 acc/recall/f1 계산
+            epad_counts_global = epad_counts.clone()
+            dist.all_reduce(epad_counts_global, op=dist.ReduceOp.SUM)
+            train_logs.update(epad_metrics_from_counts(epad_counts_global, prefix="epad"))
             main_logger_info(train_log_msg(state, logs=train_logs, loss=avg_loss))
+            if get_rank() == 0:
+                logger.info(
+                    f"[step {state.step}] [EPAD] train "
+                    f"acc={train_logs['epad_acc']:.4f} "
+                    f"precision={train_logs['epad_precision']:.4f} "
+                    f"recall={train_logs['epad_recall']:.4f} "
+                    f"f1={train_logs['epad_f1']:.4f}"
+                )
             metrics_logger.log(train_logs, step=state.step)
             if args.backchannel.enable and args.backchannel.bc_event_loss_weight > 0:
                 bc_evt = avg_aggregate(bc_event_loss_val.item())
@@ -770,13 +802,29 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             torch.cuda.empty_cache()
 
         # 체크포인트 저장
-        if args.do_ckpt and (
-            (args.ckpt_freq > 0 and state.step % args.ckpt_freq == 0) or is_last_step
-        ):
+        # best 모드(ckpt_keep_best_metric 설정)에서는 eval로 EPAD 점수가 갱신된
+        # 스텝에만 저장하고 점수 상위 N개만 유지. 그 외엔 ckpt_freq/last_step 기준.
+        epad_score = None
+        if args.ckpt_keep_best_metric is not None:
+            save_now = (
+                args.do_ckpt
+                and did_eval
+                and state.this_eval_epad_metrics is not None
+                and args.ckpt_keep_best_metric in state.this_eval_epad_metrics
+            )
+            if save_now:
+                epad_score = state.this_eval_epad_metrics[args.ckpt_keep_best_metric]
+        else:
+            save_now = args.do_ckpt and (
+                (args.ckpt_freq > 0 and state.step % args.ckpt_freq == 0) or is_last_step
+            )
+
+        if save_now:
             torch.cuda.empty_cache()
             checkpointer.save_checkpoint(
                 save_only_lora=args.lora.enable,
                 dtype=param_dtype,
+                score=epad_score,
             )
 
     main_logger_info("학습 완료!")
@@ -784,4 +832,5 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
 if __name__ == "__main__":
     """사용법: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml"""
+    """ torchrun --nproc_per_node=1 train.py config/example.yaml """
     fire.Fire(train)
