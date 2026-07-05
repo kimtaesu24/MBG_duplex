@@ -702,42 +702,55 @@ class VapGPTBackchannelModule(nn.Module):
         # ── Alt 1: Silence gate on user audio features (IPU boundary detection) ──
         # x_user encodes per-frame user speech activity; silence gate learns to detect
         # Inter-Pausal Units (pauses) where backchannels are appropriate.
-        s_pad_logits = self.silence_gate_mlp(x_user)  # [B, T, 2]
-        s_pad_onehot = gumbel_softmax_st(s_pad_logits, temperature=temp, hard=True)
-        s_pad = s_pad_onehot[..., 1]  # [B, T]
+        z_sil = self.silence_gate_mlp(out["x1"])  # [B, T, 2]
+        z_sil_onehot = gumbel_softmax_st(z_sil, temperature=temp, hard=True)
+        y_sil = z_sil_onehot[..., 1]  # [B, T]
 
         # ── Step 5: BC gate — agent context modulated by user silence ─────
         # User silence probability gates the silence context into agent representation:
         # when user is silent, silence_ctx_proj(x_user) contributes to bc_mlp input,
         # steering bc_mlp toward firing precisely at IPU boundaries.
-        s_pad_soft_exp = F.softmax(s_pad_logits, dim=-1)[..., 1:2]  # [B, T, 1] soft silence prob
-        if self.silence_ctx_proj is not None:
-            z_bc_input = out["x2"] + self.silence_ctx_proj(x_user) * s_pad_soft_exp
-        else:
-            z_bc_input = out["x2"]
+        # y_sil_soft_exp = F.softmax(z_sil, dim=-1)[..., 1:2]  # [B, T, 1] soft silence prob
+
+        # if self.silence_ctx_proj is not None:
+        #     z_bc_input = out["x2"] + self.silence_ctx_proj(x_user) * y_sil_soft_exp
+        # else:
+        #     z_bc_input = out["x2"]
+        
+        z_bc_input = out["x2"]
         z_bc = self.bc_mlp(z_bc_input)   # [B, T, 2]
         y_bc_onehot = gumbel_softmax_st(z_bc, temperature=temp, hard=True)
         y_bc = y_bc_onehot[..., 1]       # [B, T]
 
-        # Hard gate used at inference for discrete token replacement.
-        g_final = s_pad * y_bc  # [B, T]
+        # Hard gate (Gumbel, temperature-annealed) used at inference for discrete
+        # token replacement, and as the forward value of the straight-through gate below.
+        g_final = y_sil * y_bc  # [B, T]
 
-        # Soft gate for training embedding — product of raw softmax probs (no Gumbel, no ST).
-        # Both gates contribute gradient at every timestep; no blocking from the other being 0.
+        # Soft gate — product of raw softmax probs. Both terms are in (0,1), so gradient
+        # reaches both bc_mlp and silence_gate_mlp at every timestep without the
+        # multiplicative-gate blocking that a hard 0 on either side would cause.
         y_bc_soft = F.softmax(z_bc, dim=-1)[..., 1]          # [B, T]
-        s_pad_soft = F.softmax(s_pad_logits, dim=-1)[..., 1]  # [B, T]
-        g_soft = y_bc_soft * s_pad_soft                        # [B, T], always in (0,1)
+        y_sil_soft = F.softmax(z_sil, dim=-1)[..., 1]  # [B, T]
+        g_soft = y_bc_soft * y_sil_soft                        # [B, T], always in (0,1)
+
+        # Straight-through gate: forward value = g_final (discrete {0,1}, matching the
+        # clean PAD/EPAD embedding the depformer sees at inference — no blend), backward
+        # gradient = g_soft (dense, no blocking). This restores the Gumbel exploration +
+        # temperature annealing on the actual training path and removes the train/inference
+        # mismatch of feeding an interpolated PAD↔EPAD embedding.
+        g_st = (g_final - g_soft).detach() + g_soft  # [B, T]
 
         pad_ids = torch.full((1,), self.pad_token_id, device=device, dtype=torch.long)
         epad_ids = torch.full((1,), self.epad_token_id, device=device, dtype=torch.long)
         pad_emb = emb_cb0(pad_ids)    # [1, depformer_dim]
         epad_emb = emb_cb0(epad_ids)  # [1, depformer_dim]
-        g_soft_exp = g_soft.unsqueeze(-1)
-        bc_token_emb = g_soft_exp * epad_emb + (1.0 - g_soft_exp) * pad_emb  # [B, T, depformer_dim]
+        g_st_exp = g_st.unsqueeze(-1)
+        bc_token_emb = g_st_exp * epad_emb + (1.0 - g_st_exp) * pad_emb  # [B, T, depformer_dim]
+        
         return BackchannelOutput(
             bc_embeddings=bc_token_emb,
             vap_logits=vap_logits,
             bc_gate=g_final,
             bc_logits=z_bc,
-            silence_gate_logits=s_pad_logits,
+            silence_gate_logits=z_sil,
         )

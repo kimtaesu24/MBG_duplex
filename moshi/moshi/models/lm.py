@@ -74,6 +74,7 @@ class LMOutput:
     face_outputs: Optional[dict] = None                # full CausalSoftVQContinuousTransformer output dict
     bc_stats: Optional[dict] = None                    # scalar tensors: y_bc_mean, s_pad_mean, g_soft_mean, g_final_rate
     bc_logits: Optional[torch.Tensor] = None  # [B, T, 2] — raw bc_mlp logits for focal loss
+    silence_gate_logits: Optional[torch.Tensor] = None  # [B, T, 2] — raw silence_gate_mlp logits for silence supervision
 
 
 def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -775,8 +776,10 @@ class LMModel(StreamingContainer):
 
             # Build a differentiable conditioned embedding for the depformer's text slot:
             #   - PAD positions : bc_result.bc_embeddings
-            #                     = g_soft * epad_emb + (1-g_soft) * pad_emb
-            #                     g_soft = y_bc_soft * s_pad_soft (raw softmax, no ST)
+            #                     = g_st * epad_emb + (1-g_st) * pad_emb, straight-through:
+            #                       forward value g_st = g_final ∈ {0,1} (clean PAD/EPAD emb,
+            #                       matching inference — no interpolated blend), backward
+            #                       gradient = g_soft = y_bc_soft * s_pad_soft (raw softmax)
             #                     → gradient flows to both bc_mlp and silence_gate_mlp
             #                       at every PAD timestep without blocking.
             #   - non-PAD positions : GT token embedding (word tokens / EPAD already in data)
@@ -927,7 +930,8 @@ class LMModel(StreamingContainer):
             text_logits, text_logits_mask, 
             vap_logits, commitment_loss,
             face_pred, face_outputs, bc_stats,
-            bc_logits=bc_result.bc_logits if bc_result is not None else None)
+            bc_logits=bc_result.bc_logits if bc_result is not None else None,
+            silence_gate_logits=bc_result.silence_gate_logits if bc_result is not None else None)
 
 @dataclass
 class _LMGenState:

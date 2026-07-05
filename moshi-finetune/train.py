@@ -391,6 +391,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         # commitment_loss_val = torch.tensor([0.0], device="cuda")
         face_loss_val = torch.tensor([0.0], device="cuda")
         bc_event_loss_val = torch.tensor([0.0], device="cuda")
+        silence_loss_val = torch.tensor([0.0], device="cuda")
         bc_stats_accum: dict | None = None
         epad_counts = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for [EPAD] prediction
         n_batch_tokens: int = 0
@@ -594,6 +595,32 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                         mb_loss = mb_loss + args.backchannel.bc_event_loss_weight * bc_event_loss
                         bc_event_loss_val += bc_event_loss.detach()
 
+                # ── Direct silence-gate supervision (BCE against "user is silent") ────
+                # Target = user NOT speaking, from VAP label bit 7 (spk0_bin0).
+                # NOTE: this is NOT 1 - bc_target. At backchannel frames (user silent AND
+                # agent speaking) the user is still silent, so the silence target must
+                # stay 1 there — a naive flip of bc_target would wrongly teach 0.
+                if (args.backchannel.enable
+                        and args.backchannel.silence_loss_weight > 0
+                        and output.silence_gate_logits is not None
+                        and batch.vap_targets is not None):
+                    vap_t = batch.vap_targets.to(codes.device)  # [B, T] long, -100 = unknown
+                    valid_sil = vap_t != -100
+                    if batch.valid_mask is not None:
+                        valid_sil = valid_sil & batch.valid_mask.to(codes.device)
+                    if valid_sil.any():
+                        # bit 7 = user speaking in next 200ms; clamp so masked -100 doesn't
+                        # corrupt the shift (those positions are excluded by valid_sil anyway).
+                        user_speaking = (vap_t.clamp(min=0) >> 7) & 1  # [B, T]
+                        sil_target = (user_speaking == 0).float()      # [B, T], 1 = user silent
+                        sil_logit_pos = output.silence_gate_logits[:, T_p:, 1]  # [B, T] strip prefix
+                        silence_loss = F.binary_cross_entropy_with_logits(
+                            sil_logit_pos[valid_sil],
+                            sil_target[valid_sil],
+                        )
+                        mb_loss = mb_loss + args.backchannel.silence_loss_weight * silence_loss
+                        silence_loss_val += silence_loss.detach()
+
                 # ── Face motion reconstruction loss (full reference loss) ──
                 face_loss = None
                 if args.face_gen.enable:
@@ -674,6 +701,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 vap_loss_val /= args.num_microbatches
                 # commitment_loss_val /= args.num_microbatches
                 bc_event_loss_val /= args.num_microbatches
+                silence_loss_val /= args.num_microbatches
                 if bc_stats_accum is not None:
                     for k in bc_stats_accum:
                         bc_stats_accum[k] = bc_stats_accum[k] / args.num_microbatches
@@ -777,6 +805,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 torch.cuda.max_memory_allocated(),
                 torch.cuda.memory_allocated(),
                 args,
+                vap_loss=state.this_vap_loss,   # → wandb "vap_loss" (None when backchannel disabled)
             )
             # [EPAD] 예측 metric: rank별 confusion counts를 합산한 뒤 acc/recall/f1 계산
             epad_counts_global = epad_counts.clone()
@@ -791,11 +820,14 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     f"recall={train_logs['epad_recall']:.4f} "
                     f"f1={train_logs['epad_f1']:.4f}"
                 )
+            # VAP-module auxiliary losses → wandb. avg_aggregate is a collective
+            # (all-reduce), so it must run on every rank — keep it outside any rank guard.
+            if args.backchannel.enable:
+                if args.backchannel.bc_event_loss_weight > 0:
+                    train_logs["bc_event_loss"] = avg_aggregate(bc_event_loss_val.item())
+                if args.backchannel.silence_loss_weight > 0:
+                    train_logs["silence_loss"] = avg_aggregate(silence_loss_val.item())
             metrics_logger.log(train_logs, step=state.step)
-            if args.backchannel.enable and args.backchannel.bc_event_loss_weight > 0:
-                bc_evt = avg_aggregate(bc_event_loss_val.item())
-                if get_rank() == 0:
-                    logger.info(f"[step {state.step}] bc_event_loss={bc_evt:.4f}")
 
         # 주기적 CUDA 캐시 비우기 (메모리 단편화 방지)
         if state.step % 200 == 0:
@@ -806,14 +838,25 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         # 스텝에만 저장하고 점수 상위 N개만 유지. 그 외엔 ckpt_freq/last_step 기준.
         epad_score = None
         if args.ckpt_keep_best_metric is not None:
-            save_now = (
-                args.do_ckpt
-                and did_eval
-                and state.this_eval_epad_metrics is not None
-                and args.ckpt_keep_best_metric in state.this_eval_epad_metrics
-            )
+            metric = args.ckpt_keep_best_metric
+            # Resolve the selection score. prune_by_best keeps the top-N by score
+            # (higher = better). EPAD metrics are higher-is-better → used directly.
+            # Loss metrics are lower-is-better → negated so the LOWEST loss wins.
+            # Only eligible on eval steps, when the metrics are freshly computed.
+            sel_score = None
+            if did_eval:
+                if (state.this_eval_epad_metrics is not None
+                        and metric in state.this_eval_epad_metrics):
+                    sel_score = state.this_eval_epad_metrics[metric]
+                elif metric == "text_loss" and state.this_text_loss is not None:
+                    sel_score = -state.this_text_loss
+                elif metric == "audio_loss" and state.this_audio_loss is not None:
+                    sel_score = -state.this_audio_loss
+                elif metric in ("eval_loss", "loss") and state.this_eval_loss is not None:
+                    sel_score = -state.this_eval_loss
+            save_now = args.do_ckpt and sel_score is not None
             if save_now:
-                epad_score = state.this_eval_epad_metrics[args.ckpt_keep_best_metric]
+                epad_score = sel_score
         else:
             save_now = args.do_ckpt and (
                 (args.ckpt_freq > 0 and state.step % args.ckpt_freq == 0) or is_last_step
@@ -832,5 +875,5 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
 if __name__ == "__main__":
     """사용법: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml"""
-    """ torchrun --nproc_per_node=1 train.py config/example.yaml """
+    """ torchrun --nproc_per_node=1 --master_port=29510 train.py config/example.yaml """
     fire.Fire(train)

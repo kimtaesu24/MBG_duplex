@@ -35,6 +35,11 @@ class BackchannelArgs(Serializable):
     bc_event_loss_weight: float = 0.3      # weight for focal BCE on bc_mlp vs EPAD events
     bc_focal_gamma: float = 2.0            # focal loss exponent (down-weights easy negatives)
     bc_focal_pos_weight: float = 15.0      # pos_weight in BCE (~97/3 ratio, tuned down)
+
+    # Direct silence-gate supervision (BCE against "user is silent" ground truth).
+    # Target = user NOT speaking, derived from VAP label bit 7. Roughly balanced,
+    # so plain BCE (no focal / pos_weight) is used. 0 disables.
+    silence_loss_weight: float = 0.3
     # VapGPT warm-up: freeze GPT layers for this many steps so projections stabilise first
     bc_warmup_steps: int = 200
 
@@ -228,7 +233,9 @@ class TrainArgs(Serializable):
     # None이면 기존 recency(최근 num_ckpt_keep개) 정책을 사용.
     # 설정 시(예: "epad_f1") eval에서 해당 metric이 갱신된 스텝에만 저장하고
     # 점수 상위 ckpt_keep_best_n개만 남깁니다.
-    # 지원 metric: epad_f1 / epad_recall / epad_precision / epad_acc
+    # 지원 metric:
+    #   - higher-is-better: epad_f1 / epad_recall / epad_precision / epad_acc
+    #   - lower-is-better (내부적으로 부호 반전해 최저값 유지): text_loss / audio_loss / eval_loss
     ckpt_keep_best_metric: str | None = None
     ckpt_keep_best_n: int = 3
 
