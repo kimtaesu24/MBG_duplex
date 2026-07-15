@@ -481,7 +481,7 @@ class Combinator(nn.Module):
 
 ######## code for backchannel #########
 import sys
-from .backchannel_vap import BackchannelOutput, gumbel_softmax_st, compute_temperature
+from .backchannel_vap import BackchannelOutput
 
 
 def _load_vap_state_dict(path: str) -> dict:
@@ -532,7 +532,8 @@ class VapGPTBackchannelModule(nn.Module):
         bc_hidden: Hidden size of the BC gate MLP.
         pad_token_id / epad_token_id: Silence / backchannel token IDs.
         gumbel_temp_init / gumbel_temp_min / gumbel_anneal_rate:
-            Gumbel-Softmax temperature schedule (same as BackchannelModule).
+            DEPRECATED, ignored. The gate is now a deterministic straight-through
+            argmax (no Gumbel, no temperature). Kept only for config/API compat.
     """
 
     def __init__(
@@ -566,9 +567,7 @@ class VapGPTBackchannelModule(nn.Module):
         assert self.pad_token_id < card
         assert self.epad_token_id < card
 
-        self.gumbel_temp_init = gumbel_temp_init
-        self.gumbel_temp_min = gumbel_temp_min
-        self.gumbel_anneal_rate = gumbel_anneal_rate
+        # gumbel_temp_* are deprecated no-ops (gate is deterministic straight-through now).
         self.use_silence_ctx_proj = use_silence_ctx_proj
 
         # ── Pseudo-speaker projections (LM-dim fallbacks) ────────────────
@@ -653,9 +652,6 @@ class VapGPTBackchannelModule(nn.Module):
         own_sd.update(to_load)
         self.load_state_dict(own_sd)
 
-    def get_temperature(self, step: int) -> float:
-        return compute_temperature(step, self.gumbel_temp_init, self.gumbel_temp_min, self.gumbel_anneal_rate)
-
     def forward(
         self,
         z_s: torch.Tensor,
@@ -671,7 +667,7 @@ class VapGPTBackchannelModule(nn.Module):
             emb_cb0:          PAD/EPAD를 조회할 임베딩 테이블. PAD/EPAD가 텍스트 어휘에
                               속하므로 호출 측에서 depformer_text_emb를 전달해야 함.
                               bc_embeddings는 cb_index=0 입력 교체에 사용됨 (Alt 2).
-            step:             training step for temperature annealing.
+            step:             unused (kept for API compat; temperature/gumbel removed).
             agent_audio_feat: [B, T, 512] real per-speaker Mimi latents for agent (optional).
             user_audio_feat:  [B, T, 512] real per-speaker Mimi latents for user (optional).
 
@@ -680,7 +676,6 @@ class VapGPTBackchannelModule(nn.Module):
                                 bc_logits, silence_gate_logits.
         """
         B, T, _ = z_s.shape
-        temp = self.get_temperature(step)
         device = z_s.device
 
         # ── Step 1: Project → two pseudo-speaker streams ──────────────────
@@ -703,8 +698,11 @@ class VapGPTBackchannelModule(nn.Module):
         # x_user encodes per-frame user speech activity; silence gate learns to detect
         # Inter-Pausal Units (pauses) where backchannels are appropriate.
         z_sil = self.silence_gate_mlp(out["x1"])  # [B, T, 2]
-        z_sil_onehot = gumbel_softmax_st(z_sil, temperature=temp, hard=True)
-        y_sil = z_sil_onehot[..., 1]  # [B, T]
+        # Deterministic hard gate (argmax) — identical to inference. Gumbel/temperature
+        # removed: this sample only feeds g_final, which sits in the detached branch of the
+        # straight-through g_st below, so its gradient was discarded regardless. The gate's
+        # learning signal flows through g_soft (softmax product) instead.
+        y_sil = (z_sil.argmax(dim=-1) == 1).to(z_sil.dtype)  # [B, T], hard {0,1}
 
         # ── Step 5: BC gate — agent context modulated by user silence ─────
         # User silence probability gates the silence context into agent representation:
@@ -719,11 +717,10 @@ class VapGPTBackchannelModule(nn.Module):
         
         z_bc_input = out["x2"]
         z_bc = self.bc_mlp(z_bc_input)   # [B, T, 2]
-        y_bc_onehot = gumbel_softmax_st(z_bc, temperature=temp, hard=True)
-        y_bc = y_bc_onehot[..., 1]       # [B, T]
+        y_bc = (z_bc.argmax(dim=-1) == 1).to(z_bc.dtype)  # [B, T], hard {0,1} (deterministic)
 
-        # Hard gate (Gumbel, temperature-annealed) used at inference for discrete
-        # token replacement, and as the forward value of the straight-through gate below.
+        # Hard gate used at inference for discrete token replacement, and as the forward
+        # value of the straight-through gate below.
         g_final = y_sil * y_bc  # [B, T]
 
         # Soft gate — product of raw softmax probs. Both terms are in (0,1), so gradient
@@ -735,9 +732,8 @@ class VapGPTBackchannelModule(nn.Module):
 
         # Straight-through gate: forward value = g_final (discrete {0,1}, matching the
         # clean PAD/EPAD embedding the depformer sees at inference — no blend), backward
-        # gradient = g_soft (dense, no blocking). This restores the Gumbel exploration +
-        # temperature annealing on the actual training path and removes the train/inference
-        # mismatch of feeding an interpolated PAD↔EPAD embedding.
+        # gradient = g_soft (dense, no blocking). Removes the train/inference mismatch of
+        # feeding an interpolated PAD↔EPAD embedding.
         g_st = (g_final - g_soft).detach() + g_soft  # [B, T]
 
         pad_ids = torch.full((1,), self.pad_token_id, device=device, dtype=torch.long)

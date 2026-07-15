@@ -49,7 +49,7 @@ from ..modules.transformer import (
     StreamingTransformer,
     create_norm_fn,
 )
-from .backchannel_vap import BackchannelModule
+from .backchannel_vap import BackchannelModule, BackchannelOutput
 from .vap_gpt_module import VapGPTBackchannelModule
 
 logger = logging.getLogger(__name__)
@@ -1044,6 +1044,7 @@ class LMGen(StreamingModule[_LMGenState]):
         frame_rate: int = FRAME_RATE_HZ,
         mimi=None,
         suppress_epad: bool = False,
+        bc_context_frames: int = 250,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -1087,6 +1088,28 @@ class LMGen(StreamingModule[_LMGenState]):
         # written to state.cache, so the model's autoregressive history sees [PAD] and is
         # therefore prevented from starting a word in the next step.
         self.suppress_epad = suppress_epad
+        # Rolling-window history for the VapGPT backchannel module: its GPT layers have no
+        # KV cache, so at inference we replay the same causal context seen during training
+        # by buffering past frames (transformer_out + per-speaker audio feats) up to
+        # bc_context_frames, running the module over the whole window, and taking the last
+        # (current) frame's decision. Set bc_context_frames to the training sequence length
+        # (duration_sec * frame_rate) for exact train/inference parity.
+        self.bc_context_frames = bc_context_frames
+        self._bc_hist_tout: Optional[torch.Tensor] = None
+        self._bc_hist_agent: Optional[torch.Tensor] = None
+        self._bc_hist_user: Optional[torch.Tensor] = None
+
+    def _reset_bc_history(self) -> None:
+        self._bc_hist_tout = None
+        self._bc_hist_agent = None
+        self._bc_hist_user = None
+
+    def reset_streaming(self):
+        # reset_streaming() only calls state.reset() (not _init_streaming_state), so the
+        # rolling backchannel history — stored on self — must be cleared here too, otherwise
+        # it leaks across clips (callers reset_streaming per utterance).
+        super().reset_streaming()
+        self._reset_bc_history()
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -1110,6 +1133,7 @@ class LMGen(StreamingModule[_LMGenState]):
         graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
+        self._reset_bc_history()
         return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
     
     @torch.no_grad()
@@ -1291,10 +1315,10 @@ class LMGen(StreamingModule[_LMGenState]):
         # PAD, replace it with EPAD so the model signals "about to talk".
         # transformer_out is [B, 1, dim] in streaming mode; bc_gate is [B, 1].
         if lm_model.backchannel is not None:
+            is_vapgpt = isinstance(lm_model.backchannel, VapGPTBackchannelModule)
             agent_af = None
             user_af = None
-            if (self.mimi is not None and input_codes is not None
-                    and isinstance(lm_model.backchannel, VapGPTBackchannelModule)):
+            if is_vapgpt and self.mimi is not None and input_codes is not None:
                 # input_codes: [B, K, 1] — decode a single frame of per-speaker latents.
                 # Sentinel values: initial_token_id = card (out-of-range high),
                 # ungenerated = -2, zero = -1 (out-of-range low).
@@ -1306,13 +1330,49 @@ class LMGen(StreamingModule[_LMGenState]):
                 user_af = self.mimi.decode_latent(
                     input_codes[:, 9:17, :].clamp(0, max_code)
                 ).transpose(1, 2).to(dtype=transformer_out.dtype)  # [B, 1, 512]
+
+            if is_vapgpt:
+                # Rolling-window history: the VapGPT layers have no KV cache, so replay the
+                # same causal context seen during training by buffering past frames and
+                # running the module over the whole window (clone/cat copies out of the
+                # CUDA-graph static buffer that transformer_out may alias).
+                W = self.bc_context_frames
+                self._bc_hist_tout = (
+                    transformer_out.clone() if self._bc_hist_tout is None
+                    else torch.cat([self._bc_hist_tout, transformer_out], dim=1)
+                )[:, -W:]
+                tout_in = self._bc_hist_tout
+                if agent_af is not None:
+                    self._bc_hist_agent = (
+                        agent_af if self._bc_hist_agent is None
+                        else torch.cat([self._bc_hist_agent, agent_af], dim=1)
+                    )[:, -W:]
+                    self._bc_hist_user = (
+                        user_af if self._bc_hist_user is None
+                        else torch.cat([self._bc_hist_user, user_af], dim=1)
+                    )[:, -W:]
+                    agent_in, user_in = self._bc_hist_agent, self._bc_hist_user
+                else:
+                    agent_in, user_in = None, None
+            else:
+                # Non-VapGPT (MLP) module is per-frame; no history needed.
+                tout_in, agent_in, user_in = transformer_out, agent_af, user_af
+
             bc_result = lm_model.backchannel(
-                transformer_out, emb_cb0=lm_model.depformer_text_emb, step=999_999,
-                agent_audio_feat=agent_af, user_audio_feat=user_af,
+                tout_in, emb_cb0=lm_model.depformer_text_emb, step=999_999,
+                agent_audio_feat=agent_in, user_audio_feat=user_in,
             )
-            lm_model._last_bc_result = bc_result  # expose for external logging
+            # Current step's decision = last frame of the (possibly windowed) output.
+            gate_fires = bc_result.bc_gate[:, -1].bool()  # [B]
+            # Expose only the current frame so external logging (which reads [:, 0]) stays correct.
+            lm_model._last_bc_result = BackchannelOutput(
+                bc_embeddings=bc_result.bc_embeddings[:, -1:],
+                vap_logits=(bc_result.vap_logits[:, -1:] if bc_result.vap_logits is not None else None),
+                bc_gate=bc_result.bc_gate[:, -1:],
+                bc_logits=bc_result.bc_logits[:, -1:],
+                silence_gate_logits=bc_result.silence_gate_logits[:, -1:],
+            )
             is_pad = (sampled_text_token == lm_model.text_padding_token_id)
-            gate_fires = bc_result.bc_gate[:, 0].bool()  # [B]
             sampled_text_token = torch.where(
                 is_pad & gate_fires,
                 sampled_text_token.new_full(sampled_text_token.shape, lm_model.end_of_text_padding_id),
