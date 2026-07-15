@@ -241,7 +241,10 @@ def infer_one(
 
             generated_frames.append(decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens))
 
-            if collect_bc_log:
+            # Text-token collection is independent of backchannel logging: collect
+            # whenever a tokenizer is available (e.g. backbone-only runs), so the JSON
+            # "text_tokens" is populated even when backchannel is disabled.
+            if text_tokenizer is not None:
                 text_id = tokens[0, 0, 0].item()
                 if text_id in special_token_map:
                     generated_text_tokens.append(special_token_map[text_id])
@@ -250,7 +253,8 @@ def infer_one(
                         text_tokenizer.id_to_piece(text_id).replace("▁", " ")
                     )
                 _label = "PAD" if text_id == _PAD else ("EPAD" if text_id == _EPAD else f"WORD({text_id})")
-                if getattr(lm_gen.lm_model, "backchannel", None) is not None and _prev_bc_result is not None:
+                # bc gate log / print stays gated on backchannel being enabled.
+                if collect_bc_log and getattr(lm_gen.lm_model, "backchannel", None) is not None and _prev_bc_result is not None:
                     _y_bc   = _prev_bc_result.bc_logits[0, 0].softmax(-1)[1].item()
                     _s_pad  = _prev_bc_result.silence_gate_logits[0, 0].softmax(-1)[1].item()
                     _g_soft = _y_bc * _s_pad
@@ -628,10 +632,10 @@ def run_test_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test Dataset Inference")
-    parser.add_argument("--config", type=str, default='./output/example_VA_update/args.yaml', help="Path to args.yaml or training config yaml")
+    parser.add_argument("--config", type=str, default='./output/exp3_stage1/ev1.0_pw15_sil1.0/args.yaml', help="Path to args.yaml or training config yaml")
     parser.add_argument("--test-jsonl", type=str, default='./data/stereo_ami_balanced_test/data_with_voice_sample.jsonl', help="Path to data.jsonl for the test dataset")
-    parser.add_argument("--output-dir", type=str, default='./result/example_VA_update', help="Directory to save generated outputs")
-    parser.add_argument("--ckpt-dir", type=str, default="./output/example_VA_update/checkpoints/checkpoint_000900", help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument("--output-dir", type=str, default='./result/exp3', help="Directory to save generated outputs")
+    parser.add_argument("--ckpt-dir", type=str, default="./output/exp3_stage1/ev1.0_pw15_sil1.0/checkpoints/checkpoint_000800", help="Directory containing consolidated/lora.safetensors")
     parser.add_argument("--sample-idx", type=int, default=None, help="Process only a specific index in the JSONL")
     parser.add_argument("--input-wav", type=str, default=None, help="Process only a specific WAV path in the JSONL")
     parser.add_argument("--device", type=str, default="cuda")

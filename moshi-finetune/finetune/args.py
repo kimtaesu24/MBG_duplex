@@ -38,8 +38,13 @@ class BackchannelArgs(Serializable):
 
     # Direct silence-gate supervision (BCE against "user is silent" ground truth).
     # Target = user NOT speaking, derived from VAP label bit 7. Roughly balanced,
-    # so plain BCE (no focal / pos_weight) is used. 0 disables.
+    # so plain BCE (no focal / pos_weight) is used. 0 disables. (v1 module only)
     silence_loss_weight: float = 0.3
+
+    # v2 module (vap_gpt_module2 / lm2 / train2): current-frame VAD supervision.
+    # BCE(vad_logits, per-frame energy-VAD targets from the stereo waveform),
+    # both streams (user, agent). 0 disables.
+    vad_loss_weight: float = 0.3
     # VapGPT warm-up: freeze GPT layers for this many steps so projections stabilise first
     bc_warmup_steps: int = 200
 

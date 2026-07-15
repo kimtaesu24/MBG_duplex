@@ -39,6 +39,7 @@ class Sample:
     valid_mask: torch.Tensor | None = None        # [T_mimi] bool: True = real audio, False = silence-padded
     valid_face_frames: int | None = None          # number of valid face frames (25 fps)
     bc_timing_targets: torch.Tensor | None = None  # [1, T] float32: 1=good BC, 0=not, -100=unknown
+    vad_targets: torch.Tensor | None = None        # [1, 2, T] float32 current-frame VA (row0=user, row1=agent)
 
 
 @dataclass
@@ -51,6 +52,7 @@ class Batch:
     valid_mask: torch.Tensor | None = None        # [B, T_mimi] bool
     valid_face_frames: torch.Tensor | None = None # [B] int: valid face frame count per sample
     bc_timing_targets: torch.Tensor | None = None  # [B, T] float32
+    vad_targets: torch.Tensor | None = None        # [B, 2, T] float32 current-frame VA (user, agent)
 
     @classmethod
     def collate(cls, batch: list[Sample]) -> "Batch":
@@ -91,15 +93,21 @@ class Batch:
         if all(b.bc_timing_targets is not None for b in batch):
             bc_timing_targets = torch.cat([b.bc_timing_targets for b in batch])  # [B, T]
 
+        vad_targets = None
+        if all(b.vad_targets is not None for b in batch):
+            vad_targets = torch.cat([b.vad_targets for b in batch])  # [B, 2, T]
+
         if batch[0].condition_attributes is None:
             return Batch(codes, vap_targets=vap_targets, voice_prompt_embs=voice_prompt_embs,
                          face_motion_gt=face_motion_gt, valid_mask=valid_mask,
                          valid_face_frames=valid_face_frames,
-                         bc_timing_targets=bc_timing_targets)
+                         bc_timing_targets=bc_timing_targets,
+                         vad_targets=vad_targets)
         return Batch(codes, [b.condition_attributes for b in batch], vap_targets=vap_targets,
                      voice_prompt_embs=voice_prompt_embs, face_motion_gt=face_motion_gt,
                      valid_mask=valid_mask, valid_face_frames=valid_face_frames,
-                     bc_timing_targets=bc_timing_targets)
+                     bc_timing_targets=bc_timing_targets,
+                     vad_targets=vad_targets)
 
 
 def tokenize(
@@ -325,6 +333,7 @@ class InterleavedTokenizer:
         vap_manifest_path: str = "",
         flame_root: str = "",
         flame_speaker: str = "bc",
+        vad_energy_threshold: float = 0.01,
     ):
         """
         Args:
@@ -342,6 +351,8 @@ class InterleavedTokenizer:
         self.duration_sec = duration_sec
         self.num_audio_frames = math.ceil(duration_sec * mimi.frame_rate)
         self.mimi_sample_rate = mimi.sample_rate  # typically 24000
+        # Energy threshold for current-frame VAD target extraction (v2 backchannel).
+        self.vad_energy_threshold = vad_energy_threshold
 
         # VAP manifest lookup table
         self.vap_lookup = {}  # (file_id, vap_step_index) -> label_int
@@ -370,6 +381,7 @@ class InterleavedTokenizer:
         path: str,
         voice_prompt_emb: torch.Tensor | None = None,
         actual_wav_samples: int | None = None,
+        wav: torch.Tensor | None = None,
     ) -> Sample:
         """Finish tokenization given pre-encoded mimi tokens.
 
@@ -456,6 +468,28 @@ class InterleavedTokenizer:
                 bc[valid] = ((spk1_bin0 == 1) & (spk0_bin0 == 0)).float()
             bc_timing_targets = bc.unsqueeze(0)  # [1, T]
 
+        # ── Current-frame VAD targets (v2 backchannel: vad_logits supervision) ──
+        # Per-channel per-mimi-frame RMS energy VAD on the raw stereo waveform,
+        # mirroring the manifest's vad_threshold-style extraction but aligned exactly
+        # with mimi frames (80 ms @ 12.5 Hz). wav: [C>=2, T_wav] at mimi sample rate;
+        # ch0 = agent, ch1 = user (same convention as codes rows 1:9 = agent, 9:17 =
+        # user in lm.py). Output row order = (user, agent) to match vad_logits
+        # ([..., 0] = user from out["x1"], [..., 1] = agent from out["x2"]).
+        vad_targets = None
+        if wav is not None and wav.dim() == 2 and wav.shape[0] >= 2:
+            frame_size = int(round(self.mimi_sample_rate / self.mimi.frame_rate))
+            n_va = min(self.num_audio_frames, wav.shape[-1] // frame_size)
+            if actual_wav_samples is not None:
+                # Zero-padded tail is silence by construction; restrict to real audio.
+                n_va = min(n_va, actual_wav_samples // frame_size)
+            if n_va > 0:
+                w = wav[:2, : n_va * frame_size].reshape(2, n_va, frame_size).float()
+                rms = w.pow(2).mean(dim=-1).sqrt()                     # [2, n_va]
+                va = (rms > self.vad_energy_threshold).float().cpu()
+                va_full = torch.zeros(2, self.num_audio_frames, dtype=torch.float32)
+                va_full[:, :n_va] = va
+                vad_targets = va_full[[1, 0]].unsqueeze(0)  # (agent,user)→(user,agent), [1, 2, T]
+
         # ── FLAME / 3DMM face motion ─────────────────────────────────────────
         face_motion_gt = None
         if self.flame_root:
@@ -487,6 +521,7 @@ class InterleavedTokenizer:
         return Sample(codes, data.get("text_conditions", None), vap_targets=vap_targets,
                       voice_prompt_emb=voice_prompt_emb, face_motion_gt=face_motion_gt,
                       valid_mask=valid_mask, valid_face_frames=valid_face_frames,
+                      vad_targets=vad_targets,
                       bc_timing_targets=bc_timing_targets)
 
     def _find_flame_path(self, stem: str) -> Optional[Path]:
