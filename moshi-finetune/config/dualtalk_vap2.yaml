@@ -1,0 +1,86 @@
+run_dir: ./output/exp5_dualtalk_weight_1.0
+overwrite_run_dir: true
+
+wandb:
+  project: "personaplex_finetune_AAAI_dualtalk"
+  run_name: "exp5_dualtalk_weight_1.0"
+
+data:
+  # train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
+  train_data: ./data/dualtalk/train/data.jsonl
+  shuffle: true
+  # eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
+  eval_data: ./data/dualtalk/test/data.jsonl
+  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest_dualtalk.json
+
+moshi_paths:
+  hf_repo_id: nvidia/personaplex-7b-v1
+
+max_steps: 2000
+batch_size: 64
+num_microbatches: 2
+duration_sec: 10
+
+lora:
+  enable: true
+  rank: 64
+  scaling: 2.0
+full_finetuning: false
+freeze_depformer: false
+
+param_dtype: bfloat16
+gradient_checkpointing: true
+
+log_freq: 10
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 3
+save_adapters: true
+do_eval: true
+eval_freq: 100
+ckpt_keep_best_metric: epad_f1
+ckpt_keep_best_n: 10
+
+optim:
+  lr: 1.0e-5
+  weight_decay: 0.1
+  pct_start: 0.05
+
+text_padding_weight: 0.5
+epad_weight: 1.0
+first_codebook_weight_multiplier: 1.0
+
+# text_prompt: "<system> [Attentive Mode] You are an attentive and supportive listener. You specialize in active listening, providing calm and consistent backchannels to support the speaker's flow without leading the conversation. <system>"
+text_prompt: "<system> [Casual Mode] You are a warm and reactive partner. You talk like a close friend, using enthusiastic backchannels and contributing small talk to keep the mood light and fun. <system>"
+
+# ── Backchannel v2 (VapGPT heads: vap + bc(3-class) + vad(current VA)) ────
+backchannel:
+  enable: true
+  module_type: vap_gpt
+  pad_token_id: 3
+  epad_token_id: 0
+
+  vap_dim: 256
+  bc_hidden: 512
+
+  vap_loss_weight: 0.1          # 256-class future VAP CE (표현 학습 보조)
+  bc_event_loss_weight: 1.0     # 3-class PAD/EPAD/WORD CE (핵심 supervision)
+  vad_loss_weight: 0.3          # 현재 프레임 VA BCE (양 스트림)
+  commitment_loss_weight: 0.0   # (v1 유물, no-op)
+  silence_loss_weight: 0.0      # (v1 유물, v2 에서는 vad_loss 로 대체)
+  bc_focal_gamma: 2.0           # (v2 에서는 미사용 — CE 로 대체)
+  bc_focal_pos_weight: 15.0     # v2: EPAD 클래스의 CE class-weight 로 재사용
+  bc_warmup_steps: 200
+  bc_la_tau: 0.75               # {0.5, 0.75, 1.0}
+
+  vap_gpt_repo_path: /home2/s20235100/Conversational-AI/VoiceActivityProjection
+  vap_gpt_checkpoint: /home2/s20235100/Conversational-AI/VoiceActivityProjection/example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt
+  vap_gpt_dim: 256
+  vap_gpt_channel_layers: 1
+  vap_gpt_cross_layers: 3
+  vap_gpt_num_heads: 4
+  vap_gpt_dropout: 0.1
+  use_silence_ctx_proj: false
+
+face_gen:
+  enable: false

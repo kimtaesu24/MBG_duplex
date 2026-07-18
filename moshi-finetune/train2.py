@@ -246,6 +246,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         lm_config["face_module_enabled"] = True
         lm_config["face_module_dir"] = face_dir
         lm_config["face_module_checkpoint"] = args.face_gen.ckpt_path
+        lm_config["face_module_version"] = int(args.face_gen.model_version)
         lm_config["face_module_hidden_dim"] = args.face_gen.hidden_dim
         lm_config["face_module_layers"] = args.face_gen.layers
         lm_config["face_module_heads"] = args.face_gen.heads
@@ -381,6 +382,13 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     model.train()
     torch.cuda.empty_cache()
     main_logger_info("학습 시작!")
+
+    # ── Logit-Adjustment prior for the 3-class BC head (Menon et al., ICLR 2021) ──
+    # Running class counts over valid BC targets (PAD/EPAD/WORD), Laplace-smoothed
+    # (init=1 per class). log π is ADDED to the logits inside the training CE, so
+    # the network's raw logits approximate prior-free scores and plain argmax at
+    # inference is the intended (τ-tempered balanced) rule — no post-hoc correction.
+    bc_class_counts = torch.ones(3, device="cuda", dtype=torch.float64)
 
     while state.step < args.max_steps:
         state.start_step()
@@ -572,40 +580,60 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     #     mb_loss = mb_loss + args.backchannel.commitment_loss_weight * output.commitment_loss
                     #     commitment_loss_val += output.commitment_loss.detach()
 
-                # ── Direct BC supervision (v2: 3-class CE — PAD/EPAD/WORD) ────────────
-                # bc_logits [B, T, 3] predicts the future text-slot class:
-                #   0 = PAD  (no backchannel)            ← bc_timing_targets == 0
-                #   1 = EPAD (backchannel onset coming)  ← bc_timing_targets == 1
-                #   2 = WORD (model already speaking)    ← GT text token is a real word;
-                #       overrides 0/1 since "already talking" precludes a BC onset.
-                # -100 = unknown (VAP label missing and not a word) → ignored by CE.
+                # ── Direct BC supervision (v2.1: 3-class CE from GT text tokens) ──────
+                # bc_logits [B, T, 3] predicts the text-slot class:
+                #   0 = PAD  ← GT text token is [PAD]
+                #   1 = EPAD ← GT text token is [EPAD] — the ACTUAL backchannel onsets
+                #              the dataset agent produced (same ground truth epad_f1
+                #              measures), replacing the heuristic VAP-bin proxy that
+                #              marked "likely-speech-soon" frames with no real EPAD and
+                #              fed the model contradictory supervision (p_epad collapse).
+                #   2 = WORD ← real word token (model already speaking)
+                #   -100     ← BOS/EOS/zero-pad, silence-padded frames, and the
+                #              boundary-ignore band around each true EPAD onset.
+                # Boundary-ignore: onset labels carry ±1–2 frame alignment jitter;
+                # punishing a fire one frame early/late only teaches hedging, so PAD
+                # frames within ±K of a true EPAD are excluded from the loss.
                 if (args.backchannel.enable
                         and args.backchannel.bc_event_loss_weight > 0
-                        and output.bc_logits is not None
-                        and batch.bc_timing_targets is not None):
-                    bc_bin = batch.bc_timing_targets.to(codes.device)  # [B, T] 1/0/-100
+                        and output.bc_logits is not None):
                     txt = codes[:, 0]  # [B, T] GT text tokens (undelayed, content only)
-                    # Real word = not PAD(3)/EPAD(0)/BOS(1)/EOS(2)/zero(-1)
-                    is_word = ((txt != model.text_padding_token_id)
-                               & (txt != model.end_of_text_padding_id)
+                    pad_id = model.text_padding_token_id
+                    epad_id = model.end_of_text_padding_id
+                    is_epad = txt == epad_id
+                    is_pad_t = txt == pad_id
+                    is_word = ((~is_pad_t) & (~is_epad)
                                & (txt != 1) & (txt != 2) & (txt >= 0))
                     cls_tgt = torch.full_like(txt, -100)
-                    cls_tgt[bc_bin == 0] = 0
-                    cls_tgt[bc_bin == 1] = 1
+                    cls_tgt[is_pad_t] = 0
                     cls_tgt[is_word] = 2
+                    cls_tgt[is_epad] = 1
+                    K = int(args.backchannel.bc_onset_ignore_frames)
+                    if K > 0 and is_epad.any():
+                        # Dilate the EPAD mask ±K frames; ambiguous PADs inside → ignore.
+                        dil = F.max_pool1d(
+                            is_epad.float().unsqueeze(1), kernel_size=2 * K + 1,
+                            stride=1, padding=K,
+                        ).squeeze(1).bool()
+                        cls_tgt[dil & is_pad_t] = -100
                     if batch.valid_mask is not None:
                         cls_tgt = cls_tgt.masked_fill(~batch.valid_mask.to(codes.device), -100)
                     bc_logits_c = output.bc_logits[:, T_p:]  # [B, T, 3] — strip prompt prefix
                     if (cls_tgt != -100).any():
-                        # Class weights: EPAD upweighted (rare, ~3%); PAD/WORD = 1.
-                        cls_w = torch.tensor(
-                            [1.0, args.backchannel.bc_focal_pos_weight, 1.0],
+                        # Logit-Adjustment loss (Menon et al., ICLR 2021): CE on
+                        # (logits + τ·log π) instead of class-weighted CE. Unlike
+                        # pos_weight (which multiplies rare-class gradients and
+                        # destabilises training), LA shifts the decision margin
+                        # additively while keeping gradient scales balanced.
+                        valid_t = cls_tgt[cls_tgt != -100]
+                        bc_class_counts += torch.bincount(valid_t, minlength=3).to(bc_class_counts)
+                        log_prior = torch.log(bc_class_counts / bc_class_counts.sum()).to(
                             device=codes.device, dtype=torch.float32,
                         )
+                        bc_logits_adj = bc_logits_c.float() + args.backchannel.bc_la_tau * log_prior
                         bc_event_loss = F.cross_entropy(
-                            bc_logits_c.reshape(-1, 3).float(),
+                            bc_logits_adj.reshape(-1, 3),
                             cls_tgt.reshape(-1),
-                            weight=cls_w,
                             ignore_index=-100,
                         )
                         mb_loss = mb_loss + args.backchannel.bc_event_loss_weight * bc_event_loss
@@ -836,6 +864,10 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             if args.backchannel.enable:
                 if args.backchannel.bc_event_loss_weight > 0:
                     train_logs["bc_event_loss"] = avg_aggregate(bc_event_loss_val.item())
+                    # Running LA prior estimate (rank-local; converges across ranks).
+                    _pri = (bc_class_counts / bc_class_counts.sum())
+                    train_logs["bc_prior_epad"] = float(_pri[1])
+                    train_logs["bc_prior_word"] = float(_pri[2])
                 if args.backchannel.vad_loss_weight > 0:
                     train_logs["vad_loss"] = avg_aggregate(silence_loss_val.item())
             metrics_logger.log(train_logs, step=state.step)
@@ -886,5 +918,5 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
 if __name__ == "__main__":
     """사용법: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml"""
-    """ torchrun --nproc_per_node=1 --master_port=29510 train.py config/example.yaml """
+    """ torchrun --nproc_per_node=1 --master_port=29511 train2.py config/dualtalk_backbone_only.yaml """
     fire.Fire(train)

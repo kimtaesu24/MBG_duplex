@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Ablation exp2 — Backbone + VAP module, VAP loss ONLY.
+#   bc_event_loss / silence_loss 는 비활성 (weight 0), vap_loss_weight 만 스윕.
+#   Face module 은 비활성. best checkpoint 는 eval epad_f1 기준.
+#
+# 이 파일은 base 템플릿입니다. run_exp2_vap_sweep.sh 가 vap_loss_weight /
+# run_dir / wandb.run_name 만 덮어써서 스윕 config 를 생성해 실행합니다.
+# ─────────────────────────────────────────────────────────────────────────
+
+run_dir: ./output/exp2_vap_only/base   # 스윕 스크립트가 덮어씀
+overwrite_run_dir: true
+
+wandb:
+  project: "personaplex_finetune_AAAI"
+  run_name: "exp3_wo_vap_base"        # 스윕 스크립트가 덮어씀
+
+# ── 데이터 ────────────────────────────────────────────────────────────────
+data:
+  train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
+  shuffle: true
+  eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
+  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
+
+# ── Personaplex 모델 경로 ────────────────────────────────────────────────
+moshi_paths:
+  hf_repo_id: nvidia/personaplex-7b-v1
+
+# ── 학습 설정 (single GPU) ───────────────────────────────────────────────
+max_steps: 2000
+batch_size: 64
+num_microbatches: 2
+duration_sec: 10
+
+lora:
+  enable: true
+  rank: 64
+  scaling: 2.0
+full_finetuning: false
+freeze_depformer: false
+
+param_dtype: bfloat16
+gradient_checkpointing: true
+
+# ── 로깅 / 체크포인트 / 평가 ─────────────────────────────────────────────
+log_freq: 10
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 3
+save_adapters: true
+do_eval: true
+eval_freq: 100
+# exp2: best checkpoint 는 eval epad_f1 (higher = better) 기준으로 선별.
+ckpt_keep_best_metric: epad_f1
+ckpt_keep_best_n: 3
+
+# ── 옵티마이저 ────────────────────────────────────────────────────────────
+optim:
+  lr: 1.0e-5
+  weight_decay: 0.1
+  pct_start: 0.05
+
+# ── 손실 가중치 ───────────────────────────────────────────────────────────
+text_padding_weight: 1.0
+epad_weight: 1.0
+first_codebook_weight_multiplier: 1.0
+
+# ── 텍스트 프롬프트 ───────────────────────────────────────────────────────
+text_prompt: "<system> [Attentive Mode] You are an attentive and supportive listener. You specialize in active listening, providing calm and consistent backchannels to support the speaker's flow without leading the conversation. <system>"
+
+# ── Backchannel VAP (VapGPT, LM 내부) — VAP loss ONLY ────────────────────
+backchannel:
+  enable: true
+  module_type: vap_gpt
+  pad_token_id: 3
+  epad_token_id: 0
+
+  vap_dim: 256
+  bc_hidden: 512
+  gumbel_temp_init: 1.0
+  gumbel_temp_min: 0.1
+  gumbel_anneal_rate: 0.001
+
+  # ── 이 실험의 핵심: vap_loss 만 비활성. 나머지 gate 지도손실은 모두 0 ──
+  vap_loss_weight: 0.0          # ← run_exp2_vap_sweep.sh 가 스윕 값으로 덮어씀
+  commitment_loss_weight: 0.0   # (사장됨)
+  bc_event_loss_weight: 1.0     
+  silence_loss_weight: 1.0
+  bc_focal_gamma: 2.0
+  bc_focal_pos_weight: 15.0
+  bc_warmup_steps: 200
+
+  vap_gpt_repo_path: /home2/s20235100/Conversational-AI/VoiceActivityProjection
+  vap_gpt_checkpoint: /home2/s20235100/Conversational-AI/VoiceActivityProjection/example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt
+  vap_gpt_dim: 256
+  vap_gpt_channel_layers: 1
+  vap_gpt_cross_layers: 3
+  vap_gpt_num_heads: 4
+  vap_gpt_dropout: 0.1
+  use_silence_ctx_proj: false
+
+# ── Face 모듈 비활성 ──────────────────────────────────────────────────────
+face_gen:
+  enable: false

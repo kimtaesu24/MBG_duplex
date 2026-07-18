@@ -297,6 +297,7 @@ class LMModel(StreamingContainer):
         face_module_heads: int = 8,
         face_module_code_dim: int = 32,
         face_module_prior_warmup_frames: int = 10,
+        face_module_version: int = 1,
         # ── Mimi Model for internal audio decoding (server) ──────────────────
         # Used by the face module to decode agent audio from predicted logits.
         mimi_enabled: bool = False,
@@ -445,20 +446,38 @@ class LMModel(StreamingContainer):
             if face_module_dir not in sys.path:
                 sys.path.insert(0, face_module_dir)
             try:
-                from softvq_continuous_online_train import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                # Version switch: v2 (softvq_continuous_online_train_v2) adds blink
+                # modelling, block-causal audio chunks and MTP look-ahead. v1/v2
+                # checkpoints are NOT interchangeable (different parameter sets) —
+                # face_module_version must match the checkpoint's training script.
+                if int(face_module_version) >= 2:
+                    from softvq_continuous_online_train_v2 import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                else:
+                    from softvq_continuous_online_train import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
                 # Read architecture hyperparams from checkpoint when available,
                 # falling back to explicit constructor arguments.
                 ckpt_args: dict = {}
                 if face_module_checkpoint is not None:
                     _raw = torch.load(face_module_checkpoint, map_location="cpu", weights_only=False)
                     ckpt_args = _raw.get("args", {})
-                face_net = _FaceModel(
+                _face_kwargs = dict(
                     hidden_dim=int(ckpt_args.get("hidden_dim", face_module_hidden_dim)),
                     layers=int(ckpt_args.get("layers", face_module_layers)),
                     heads=int(ckpt_args.get("heads", face_module_heads)),
                     code_dim=int(ckpt_args.get("code_dim", face_module_code_dim)),
                     prior_warmup_frames=int(ckpt_args.get("prior_warmup_frames", face_module_prior_warmup_frames)),
                 )
+                if int(face_module_version) >= 2:
+                    # v2-only arch args — MUST mirror the checkpoint: the MTP/look-ahead
+                    # modules are only instantiated when lookahead_frames > 0, so a
+                    # mismatch breaks the (strict) state-dict load below.
+                    _face_kwargs.update(
+                        lookahead_frames=int(ckpt_args.get("lookahead_frames", 0)),
+                        chunk_frames=int(ckpt_args.get("chunk_frames", 1)),
+                        token_vocab=int(ckpt_args.get("token_vocab", 2048)),
+                        la_temp=float(ckpt_args.get("la_temp", 0.5)),
+                    )
+                face_net = _FaceModel(**_face_kwargs)
                 if face_module_checkpoint is not None:
                     face_net.load_state_dict(_raw["model"])
                     logger.info(f"[LMModel] Face module loaded from: {face_module_checkpoint}")
@@ -1339,13 +1358,23 @@ class LMGen(StreamingModule[_LMGenState]):
             )
             # Current step's decision = last frame of the (possibly windowed) output.
             # 3-class head: 0=PAD, 1=EPAD (backchannel onset), 2=WORD (already speaking).
+            # Current frame logits, with class-weight correction applied ONCE here.
+            # Both the gate decision below and the exposed _last_bc_result use the
+            # SAME corrected logits, so external logging (softmax/argmax over
+            # _last_bc_result.bc_logits) always matches the actual decision.
+            # Plain argmax over the raw 3-class logits (0=PAD, 1=EPAD, 2=WORD).
+            # No inference-side calibration: the operating point is owned entirely
+            # by the training loss (EPAD class weight in train2's weighted CE).
             pred_cls = bc_result.bc_logits[:, -1].argmax(dim=-1)  # [B]
             gate_fires = pred_cls == 1
+
             # Expose only the current frame so external logging stays per-step.
+            # gate is the ACTUAL decision — loggers read it directly.
             lm_model._last_bc_result = BackchannelOutput2(
                 vap_logits=(bc_result.vap_logits[:, -1:] if bc_result.vap_logits is not None else None),
                 vad_logits=bc_result.vad_logits[:, -1:],
-                bc_logits=bc_result.bc_logits[:, -1:],
+                bc_logits=bc_result.bc_logits[:, -1:],  # [B, 1, 3] raw
+                gate=gate_fires.unsqueeze(1),           # [B, 1] bool
             )
             is_pad = (sampled_text_token == lm_model.text_padding_token_id)
             sampled_text_token = torch.where(
@@ -1452,7 +1481,9 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def load_voice_prompt_embeddings(self, path: str):
         self.voice_prompt = path
-        state = torch.load(path)
+        # Cached embeddings may have been saved from a CUDA session; load to CPU
+        # first (works everywhere), then move to the model's device below.
+        state = torch.load(path, map_location="cpu")
 
         self.voice_prompt_audio = None
         self.voice_prompt_embeddings = state["embeddings"].to(self.lm_model.device)

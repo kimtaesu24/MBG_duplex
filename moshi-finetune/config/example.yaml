@@ -12,19 +12,21 @@
 
 
 # check
-run_dir: ./output/example_epad_log
+run_dir: ./output/example_0715_ACF
 overwrite_run_dir: true
 
 wandb:
   project: "personaplex_finetune_AAAI"
-  run_name: "test_run_0623_epad_log"
+  run_name: "test_run_0715_ACF"
 
 # ── 데이터 설정 ─────────────────────────────────────────────────────────────
 data:
-  train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
+  # train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
+  train_data: ./data/dualtalk/train/data.jsonl
   shuffle: true
-  eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
-  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
+  # eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
+  eval_data: ./data/dualtalk/test/data.jsonl
+  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest_dualtalk.json
 
 # ── Personaplex 모델 경로 ────────────────────────────────────────────────
 moshi_paths:
@@ -32,8 +34,8 @@ moshi_paths:
 
 # ── 학습 설정 ─────────────────────────────────────────────────────────────
 max_steps: 2000
-batch_size: 2
-num_microbatches: 64
+batch_size: 32
+num_microbatches: 4
 duration_sec: 10
 
 # Full finetuning (LM + VapGPT + FaceModule 전체 학습)
@@ -67,17 +69,18 @@ optim:
 
 # ── 손실 가중치 ───────────────────────────────────────────────────────────
 text_padding_weight: 0.5   # PAD 토큰 손실 가중치 (낮을수록 PAD에 집중 감소)
-epad_weight: 2.0            # EPAD 토큰 손실 가중치 (PAD run 끝 전환 지점 강조)
+epad_weight: 1.0            # EPAD 토큰 손실 가중치 (PAD run 끝 전환 지점 강조)
 first_codebook_weight_multiplier: 1.0
 
 # ── 텍스트 프롬프트 (에이전트 지시문) ────────────────────────────────────
 # inference의 lm_gen.text_prompt_tokens 와 동일한 문자열을 설정합니다.
 # 빈 문자열("")이면 프롬프트 없이 학습합니다.
-text_prompt: "<system> [Attentive Mode] You are an attentive and supportive listener. You specialize in active listening, providing calm and consistent backchannels to support the speaker's flow without leading the conversation. <system>"
+# text_prompt: "<system> [Attentive Mode] You are an attentive and supportive listener. You specialize in active listening, providing calm and consistent backchannels to support the speaker's flow without leading the conversation. <system>"
+text_prompt: "<system> [Casual Mode] You are a warm and reactive partner. You talk like a close friend, using enthusiastic backchannels and contributing small talk to keep the mood light and fun. <system>"
 
 # ── Backchannel VAP (VapGPT, LM 내부) ────────────────────────────────────
 backchannel:
-  enable: true
+  enable: false
   module_type: vap_gpt
   pad_token_id: 3
   epad_token_id: 0
@@ -101,7 +104,7 @@ backchannel:
   vap_gpt_cross_layers: 3
   vap_gpt_num_heads: 4
   vap_gpt_dropout: 0.1
-  vap_use_silence_ctx_proj: true
+  use_silence_ctx_proj: false
 
 # ── Face Generation Module ────────────────────────────────────────────────
 # CausalSoftVQContinuousTransformer — end-to-end trained alongside the LM.
@@ -109,10 +112,11 @@ backchannel:
 # Inference: autoregressive streaming via model.generate().
 face_gen:
   enable: true
+  model_version: 2 
   use_generated_audio_feat: true 
 
   # Pretrained face model checkpoint (CausalSoftVQContinuousTransformer)
-  ckpt_path: /home2/s20235100/Conversational-AI/personaplex_MBG/moshi-finetune/checkpoint_epoch_800.ckpt
+  ckpt_path: /home2/s20235100/Conversational-AI/personaplex_MBG/moshi-finetune/checkpoint_epoch_800_v2_blink.ckpt
 
   # Architecture — read from ckpt["args"] when available; values below are fallbacks.
   hidden_dim: 512
@@ -133,8 +137,11 @@ face_gen:
   # ── FLAME / 3DMM training data ────────────────────────────────────────
   # Root dir: {flame_root}/{speaker}/{split}/{stem}_{speaker}.npy
   # speaker ∈ {"bc", "ut"}, split ∈ {"train", "valid", "test"}
-  flame_root: /home6/duplex/dataset/ami_flame
-  flame_speaker: bc   # agent (moshi) = backchannel speaker in AMI
+  # flame_root: /home6/duplex/dataset/ami_flame
+  # flame_speaker: bc   # agent (moshi) = backchannel speaker in AMI
+  flame_root: /home6/duplex/dataset/dualtalk
+  flame_speaker: speaker1   # fallback용 — dualtalk 파일은 per-file로 자동 결정됨 (아래)
+
 
   # ── Combined face loss weight ──────────────────────────────────────────
   # Multiplied onto the sum of all face sub-losses below.

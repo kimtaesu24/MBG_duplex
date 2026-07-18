@@ -47,7 +47,8 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
 
@@ -100,7 +101,13 @@ def load_checkpoint(lm, ckpt_dir):
         log("info", f"Loading full checkpoint from {consolidated_path}")
         state_dict = safetensors.torch.load_file(consolidated_path)
         state_dict = _strip_peft_prefixes(state_dict)
-        missing, _ = lm.load_state_dict(state_dict, strict=False)
+        missing, unexpected = lm.load_state_dict(state_dict, strict=False)
+        bc_dropped = [k for k in unexpected if "backchannel" in k]
+        if bc_dropped and getattr(lm, "backchannel", None) is None:
+            log("warning",
+                f"Checkpoint contains {len(bc_dropped)} backchannel tensors but the module is "
+                f"DISABLED (backchannel.enable=false in config?) — weights dropped, "
+                f"inference will run BACKBONE-ONLY. Enable backchannel in the config if unintended.")
         bc_missing = [k for k in missing if "backchannel" in k]
         face_missing = [k for k in missing if "face_module" in k]
         if bc_missing:
@@ -123,7 +130,13 @@ def load_checkpoint(lm, ckpt_dir):
 
         direct_weights = {k: v for k, v in state_dict.items() if _is_direct_module_key(k)}
         if direct_weights:
-            missing, _ = lm.load_state_dict(direct_weights, strict=False)
+            missing, unexpected = lm.load_state_dict(direct_weights, strict=False)
+            bc_dropped = [k for k in unexpected if "backchannel" in k]
+            if bc_dropped and getattr(lm, "backchannel", None) is None:
+                log("warning",
+                    f"Checkpoint contains {len(bc_dropped)} backchannel tensors but the module is "
+                    f"DISABLED (backchannel.enable=false in config?) — weights dropped, "
+                    f"inference will run BACKBONE-ONLY. Enable backchannel in the config if unintended.")
             bc_missing = [k for k in missing if "backchannel" in k]
             face_missing = [k for k in missing if "face_module" in k]
             if bc_missing:
@@ -199,6 +212,14 @@ def infer_one(
 
     if voice_prompt_path:
         lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+    else:
+        # Explicitly clear any voice prompt from a previous sample so an empty
+        # path truly means "no voice prompt" (training-consistent for datasets
+        # without voice_sample entries).
+        lm_gen.voice_prompt = None
+        lm_gen.voice_prompt_audio = None
+        lm_gen.voice_prompt_embeddings = None
+        lm_gen.voice_prompt_cache = None
 
     if face_gen is not None:
         face_gen.reset()
@@ -262,13 +283,16 @@ def infer_one(
                 _label = "PAD" if text_id == _PAD else ("EPAD" if text_id == _EPAD else f"WORD({text_id})")
                 # v2 bc log: 3-class head (0=PAD, 1=EPAD, 2=WORD) + current-frame VAD.
                 if collect_bc_log and getattr(lm_gen.lm_model, "backchannel", None) is not None and _prev_bc_result is not None:
-                    _probs = _prev_bc_result.bc_logits[0, 0].float().softmax(-1)  # [3]
+                    _probs = _prev_bc_result.bc_logits[0, 0].float().softmax(-1)  # [3] calibrated
                     _p_pad, _p_epad, _p_word = (_probs[0].item(), _probs[1].item(), _probs[2].item())
                     _pred_cls = int(_probs.argmax().item())
                     _pred_label = ("PAD", "EPAD", "WORD")[_pred_cls]
+                    # Actual gate decision from LMGen (threshold rule may differ from argmax).
+                    _gate = (int(_prev_bc_result.gate[0, 0].item())
+                             if _prev_bc_result.gate is not None else int(_pred_cls == 1))
                     _vad = torch.sigmoid(_prev_bc_result.vad_logits[0, 0].float())  # [2] (user, agent)
                     _vad_user, _vad_agent = _vad[0].item(), _vad[1].item()
-                    print(f"token={_label:14s} | pred={_pred_label:4s} "
+                    print(f"token={_label:14s} | gate={_gate} argmax={_pred_label:4s} "
                           f"p_pad={_p_pad:.3f} p_epad={_p_epad:.3f} p_word={_p_word:.3f} "
                           f"| vad_user={_vad_user:.3f} vad_agent={_vad_agent:.3f}")
                     bc_gate_log.append({
@@ -279,7 +303,7 @@ def infer_one(
                         "p_pad": round(_p_pad, 4),
                         "p_epad": round(_p_epad, 4),
                         "p_word": round(_p_word, 4),
-                        "gate": int(_pred_cls == 1),
+                        "gate": _gate,
                         "vad_user": round(_vad_user, 4),
                         "vad_agent": round(_vad_agent, 4),
                     })
@@ -305,6 +329,16 @@ def infer_one(
 def run_test_inference(args):
     set_seed(args.seed)
     device = args.device
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        log("warning", "CUDA requested but not available — falling back to CPU.")
+        device = "cpu"
+    # LM dtype: bfloat16 on GPU (checkpoint native), float32 on CPU (bf16 CPU
+    # kernels are slow/incomplete). Override with --dtype if needed.
+    if args.dtype == "auto":
+        lm_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    else:
+        lm_dtype = getattr(torch, args.dtype)
+    log("info", f"device={device}, lm dtype={lm_dtype}")
     os.makedirs(args.output_dir, exist_ok=True)
     
     log("info", f"Reading config from {args.config}")
@@ -357,6 +391,9 @@ def run_test_inference(args):
     else:
         loaders._lm_kwargs["backchannel_enabled"] = False
         log("info", "Backchannel VAP module disabled.")
+        if args.suppress_epad:
+            log("warning", "--suppress-epad has NO effect without the backchannel module "
+                           "(gate suppression lives inside the module branch).")
 
     # Inject face_gen config into _lm_kwargs BEFORE get_moshi_lm so that
     # lm.face_module is instantiated and load_checkpoint can overwrite its
@@ -368,6 +405,7 @@ def run_test_inference(args):
             "../moshi/moshi/models/face",
         ))
         loaders._lm_kwargs["face_module_enabled"] = True
+        loaders._lm_kwargs["face_module_version"] = int(face_cfg.get("model_version", 1))
         loaders._lm_kwargs["face_module_dir"] = face_dir
         loaders._lm_kwargs["face_module_checkpoint"] = face_cfg.get("ckpt_path")
         loaders._lm_kwargs["face_module_hidden_dim"] = int(face_cfg.get("hidden_dim", 512))
@@ -379,7 +417,7 @@ def run_test_inference(args):
     else:
         loaders._lm_kwargs["face_module_enabled"] = False
 
-    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=args.cpu_offload)
+    lm = loaders.get_moshi_lm(moshi_weight, device=device, dtype=lm_dtype, cpu_offload=args.cpu_offload)
     
     # Apply fine-tuned checkpoint
     if args.ckpt_dir:
@@ -398,9 +436,9 @@ def run_test_inference(args):
         frame_rate=mimi.frame_rate,
         use_sampling=True,
         temp=0.8,
-        temp_text=0.7,
+        temp_text=args.temp_text,
         top_k=250,
-        top_k_text=25,
+        top_k_text=args.top_k_text,
         mimi=mimi,
         suppress_epad=args.suppress_epad,
     )
@@ -494,10 +532,13 @@ def run_test_inference(args):
         lm.zero_token_id,
         keep_main_only=True,
     )
-    # Using 15s duration arbitrarily to fetch codes and VAP targets
+    # Using 15s duration arbitrarily to fetch codes and VAP targets.
+    # The VAP manifest (can be >1 GB) is only consumed by the GT-VAP comparison
+    # section, which is gated on bc_enabled — skip loading it entirely when the
+    # backchannel module is disabled.
     interleaved_tokenizer = InterleavedTokenizer(
         vap_mimi, interleaver, duration_sec=config.get("duration_sec", 15.0),
-        vap_manifest_path=config.get("data", {}).get("vap_manifest", ""),
+        vap_manifest_path=(config.get("data", {}).get("vap_manifest", "") if bc_enabled else ""),
         flame_root=face_cfg.get("flame_root", "") if face_cfg.get("enable", False) else "",
         flame_speaker=face_cfg.get("flame_speaker", "bc"),
     )
@@ -516,7 +557,13 @@ def run_test_inference(args):
         # Determine voice prompt path for this sample
         audio_basename = os.path.basename(input_wav)
         per_sample_pt = voice_sample_lookup.get(audio_basename)
-        if per_sample_pt and os.path.exists(per_sample_pt):
+        if args.no_voice_prompt:
+            # Match training regimes that had no voice prompts (e.g. DualTalk jsonl
+            # lacks voice_sample): skip the NATM1 fallback so inference context is
+            # consistent with what the finetune actually saw.
+            voice_prompt = ""
+            log("info", "  Voice prompt: DISABLED (--no-voice-prompt)")
+        elif per_sample_pt and os.path.exists(per_sample_pt):
             voice_prompt = per_sample_pt
             log("info", f"  Voice prompt: {per_sample_pt}")
         else:
@@ -647,14 +694,24 @@ def run_test_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test Dataset Inference")
-    parser.add_argument("--config", type=str, default="./output/exp5_vap2/args.yaml", help="Path to args.yaml or training config yaml")
-    parser.add_argument("--test-jsonl", type=str, default='./data/stereo_ami_balanced_test/data_with_voice_sample.jsonl', help="Path to data.jsonl for the test dataset")
-    parser.add_argument("--output-dir", type=str, default="./result/exp5_vap2", help="Directory to save generated outputs")
-    parser.add_argument("--ckpt-dir", type=str, default="./output/exp5_vap2/checkpoints/checkpoint_001100", help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument("--config", type=str, default="./output/backcone_only_dualtalk/args.yaml", help="Path to args.yaml or training config yaml")
+    parser.add_argument("--test-jsonl", type=str, default='./data/dualtalk/test/data.jsonl', help="Path to data.jsonl for the test dataset")
+    parser.add_argument("--output-dir", type=str, default="./result/backcone_only_dualtalk", help="Directory to save generated outputs")
+    parser.add_argument("--ckpt-dir", type=str, default="./output/backcone_only_dualtalk/checkpoints/checkpoint_000600", help="Directory containing consolidated/lora.safetensors")
     parser.add_argument("--sample-idx", type=int, default=None, help="Process only a specific index in the JSONL")
     parser.add_argument("--input-wav", type=str, default=None, help="Process only a specific WAV path in the JSONL")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help='"cuda", "cuda:N", or "cpu"')
+    parser.add_argument("--dtype", type=str, default="auto",
+                        choices=["auto", "float32", "bfloat16", "float16"],
+                        help='LM weight dtype. "auto" = bfloat16 on GPU / float32 on CPU.')
     parser.add_argument("--cpu-offload", action="store_true")
+    parser.add_argument("--no-voice-prompt", action="store_true",
+                        help="Disable the voice prompt entirely (no NATM1 fallback). Use when the "
+                             "training data had no voice_sample entries (e.g. DualTalk) so the "
+                             "inference context matches training.")
+    parser.add_argument("--temp-text", type=float, default=0.7, help="Text sampling temperature.")
+    parser.add_argument("--top-k-text", type=int, default=25, help="Text sampling top-k.")
     parser.add_argument("--suppress-epad", action="store_true",
                         help="Force [EPAD] → [PAD] whenever g_final=0 (VAP says don't speak). "
                              "Word tokens in progress are never replaced.")

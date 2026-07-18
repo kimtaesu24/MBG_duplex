@@ -246,6 +246,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         lm_config["face_module_enabled"] = True
         lm_config["face_module_dir"] = face_dir
         lm_config["face_module_checkpoint"] = args.face_gen.ckpt_path
+        lm_config["face_module_version"] = int(args.face_gen.model_version)
         lm_config["face_module_hidden_dim"] = args.face_gen.hidden_dim
         lm_config["face_module_layers"] = args.face_gen.layers
         lm_config["face_module_heads"] = args.face_gen.heads

@@ -45,6 +45,21 @@ class BackchannelArgs(Serializable):
     # BCE(vad_logits, per-frame energy-VAD targets from the stereo waveform),
     # both streams (user, agent). 0 disables.
     vad_loss_weight: float = 0.3
+
+    # v2.1 BC target: boundary-ignore radius (frames). PAD frames within ±K of a
+    # true [EPAD] token are set to ignore (-100) in the 3-class CE — onset labels
+    # carry ±1–2 frame alignment jitter, and punishing near-misses teaches the
+    # model to hedge (collapses p_epad toward the base rate). 0 disables.
+    bc_onset_ignore_frames: int = 2
+
+    # v2.1 BC loss: Logit-Adjustment temperature τ (Menon et al., ICLR 2021).
+    # Training CE is computed on (logits + τ·log π) with running class priors π,
+    # so plain argmax at inference approximates argmax P(c|x)/π_c^τ — no
+    # inference-side correction needed. τ=0 → plain CE (under-fires the rare
+    # EPAD class); τ=1 → balanced rule (over-fires). Sweep ~{0.5, 0.75, 1.0}
+    # selecting by eval epad_f1. Replaces bc_focal_pos_weight in the v2.1 path
+    # (that field remains for the v1 trainer only).
+    bc_la_tau: float = 0.75
     # VapGPT warm-up: freeze GPT layers for this many steps so projections stabilise first
     bc_warmup_steps: int = 200
 
@@ -146,6 +161,12 @@ class FaceGenArgs(Serializable):
     # Path to a CausalSoftVQContinuousTransformer checkpoint (.ckpt).
     # Must be set when enable=True.
     ckpt_path: str | None = None
+
+    # Face model version: 1 = softvq_continuous_online_train (original),
+    # 2 = softvq_continuous_online_train_v2 (blink + block-causal chunks + MTP
+    # look-ahead). Must match the checkpoint's training script — v1/v2 state
+    # dicts are not interchangeable.
+    model_version: int = 1
 
     # Model architecture — must match the saved checkpoint.
     # Defaults are read from the checkpoint's saved args when ckpt_path is given,

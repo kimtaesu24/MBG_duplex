@@ -49,6 +49,8 @@ def evaluate(
     face_loss_accum       = torch.tensor(0.0, device="cuda")
     bc_event_loss_accum   = torch.tensor(0.0, device="cuda")
     vad_loss_accum        = torch.tensor(0.0, device="cuda")
+    # LA prior counts, local to this eval run (mirrors train2's running counts).
+    bc_class_counts       = torch.ones(3, device="cuda", dtype=torch.float64)
     epad_counts           = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for [EPAD]
 
     max_eval_batches = max(40 // get_world_size(), 1)
@@ -196,31 +198,42 @@ def evaluate(
                         and not torch.isnan(output.commitment_loss)):
                     commitment_loss_accum += output.commitment_loss
 
-                # v2: 3-class CE (PAD/EPAD/WORD) — mirrors train2.py target construction.
+                # v2.1: 3-class CE from GT text tokens — mirrors train2.py exactly
+                # (EPAD = actual [EPAD] token positions; boundary-ignore ±K PADs).
                 if (args.backchannel.bc_event_loss_weight > 0
-                        and output.bc_logits is not None
-                        and batch.bc_timing_targets is not None):
-                    bc_bin = batch.bc_timing_targets.to(codes.device)  # [B, T] 1/0/-100
+                        and output.bc_logits is not None):
                     txt = codes[:, 0]
-                    is_word = ((txt != model.text_padding_token_id)
-                               & (txt != model.end_of_text_padding_id)
+                    pad_id = model.text_padding_token_id
+                    epad_id = model.end_of_text_padding_id
+                    is_epad = txt == epad_id
+                    is_pad_t = txt == pad_id
+                    is_word = ((~is_pad_t) & (~is_epad)
                                & (txt != 1) & (txt != 2) & (txt >= 0))
                     cls_tgt = torch.full_like(txt, -100)
-                    cls_tgt[bc_bin == 0] = 0
-                    cls_tgt[bc_bin == 1] = 1
+                    cls_tgt[is_pad_t] = 0
                     cls_tgt[is_word] = 2
+                    cls_tgt[is_epad] = 1
+                    K = int(getattr(args.backchannel, "bc_onset_ignore_frames", 2))
+                    if K > 0 and is_epad.any():
+                        dil = F.max_pool1d(
+                            is_epad.float().unsqueeze(1), kernel_size=2 * K + 1,
+                            stride=1, padding=K,
+                        ).squeeze(1).bool()
+                        cls_tgt[dil & is_pad_t] = -100
                     if batch.valid_mask is not None:
                         cls_tgt = cls_tgt.masked_fill(~batch.valid_mask.to(codes.device), -100)
                     bc_logits_c = output.bc_logits[:, T_p:]  # [B, T, 3]
                     if (cls_tgt != -100).any():
-                        cls_w = torch.tensor(
-                            [1.0, args.backchannel.bc_focal_pos_weight, 1.0],
+                        # Logit-Adjustment loss — mirrors train2.py.
+                        valid_t = cls_tgt[cls_tgt != -100]
+                        bc_class_counts += torch.bincount(valid_t, minlength=3).to(bc_class_counts)
+                        log_prior = torch.log(bc_class_counts / bc_class_counts.sum()).to(
                             device=codes.device, dtype=torch.float32,
                         )
+                        bc_logits_adj = bc_logits_c.float() + args.backchannel.bc_la_tau * log_prior
                         bc_event_loss = F.cross_entropy(
-                            bc_logits_c.reshape(-1, 3).float(),
+                            bc_logits_adj.reshape(-1, 3),
                             cls_tgt.reshape(-1),
-                            weight=cls_w,
                             ignore_index=-100,
                         )
                         bc_event_loss_accum += bc_event_loss

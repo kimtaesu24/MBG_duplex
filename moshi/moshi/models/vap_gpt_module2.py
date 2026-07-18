@@ -498,6 +498,10 @@ class BackchannelOutput2:
     vap_logits: torch.Tensor
     vad_logits: torch.Tensor
     bc_logits: torch.Tensor
+    # Inference only (set by LMGen): the actual gate decision for the exposed frame,
+    # [B, 1] bool. May differ from bc_logits argmax when a threshold rule is active —
+    # loggers should read THIS, not recompute from logits.
+    gate: Optional[torch.Tensor] = None
 
 
 def _load_vap_state_dict(path: str) -> dict:
@@ -598,6 +602,19 @@ class VapGPTBackchannelModule(nn.Module):
         # self.proj_agent_audio = nn.Linear(512, vap_dim, bias=False)
         self.proj_audio = nn.Linear(512, vap_dim, bias=False)
 
+        # ── LM-context projection (z_s stream restoration, head-level late fusion) ─
+        # z_s (lm_dim=4096) is projected down to vap_dim and LayerNorm'd. It is added
+        # to the VAP and BC heads as ZERO-INIT additive residuals (adapter pattern):
+        #   • pretrained VapGPT layers (ar_channel/ar/vap_head) keep their original
+        #     shapes and inputs → checkpoint loading is untouched, and at init the
+        #     module behaves exactly like the pretrained audio-only model;
+        #   • vap_loss and bc_loss now backprop through z_ctx_proj into the LM
+        #     backbone → multi-task shaping of the backbone representation.
+        # VAD stays purely acoustic by design (current-frame VA is solvable from
+        # audio alone; z_s residual excluded there).
+        self.z_ctx_proj = nn.Linear(lm_dim, vap_dim, bias=False)
+        self.z_ctx_norm = nn.LayerNorm(vap_dim)
+
         # ── VapGPT GPT layers ─────────────────────────────────────────────
         if vap_repo_path not in sys.path:
             sys.path.insert(0, vap_repo_path)
@@ -620,12 +637,20 @@ class VapGPTBackchannelModule(nn.Module):
         )
 
         # ── VAP head ──────────────────────────────────────────────────────
-        # 256 = 2^(2 * n_bins) with n_bins=4 (VapGPT default)
+        # 256 = 2^(2 * n_bins) with n_bins=4 (VapGPT default).
+        # NOTE: input stays vap_dim (NOT concat) so the pretrained vap_head weights
+        # load cleanly; the z_s contribution enters via the zero-init residual below.
         self.vap_head = nn.Linear(vap_dim, 256)
+        self.vap_z_head = nn.Linear(vap_dim, 256, bias=False)
+        nn.init.zeros_(self.vap_z_head.weight)
 
-        self.va_classifier = nn.Linear(vap_dim, 1)
+        self.va_classifier = nn.Linear(vap_dim, 1)  # purely acoustic (no z_s)
 
-        self.bc_head = nn.Linear(vap_dim, 3)  # BC one-hot logits (PAD/EPAD/WORD)
+        # BC head: audio/turn-taking pathway + zero-init z_s residual (additive,
+        # symmetric with vap_head; replaces the earlier concat design).
+        self.bc_head = nn.Linear(vap_dim, 3)  # BC logits (PAD/EPAD/WORD)
+        self.bc_z_head = nn.Linear(vap_dim, 3, bias=False)
+        nn.init.zeros_(self.bc_z_head.weight)
 
         # ── Load pretrained VapGPT weights (GPT layers + vap_head) ───────
         if checkpoint_path is not None:
@@ -676,21 +701,34 @@ class VapGPTBackchannelModule(nn.Module):
         B, T, _ = z_s.shape
         device = z_s.device
 
-        x_user  = self.proj_audio(user_audio_feat)  # [B, T, vap_dim]
-        x_agent = self.proj_audio(z_s)                   # [B, T, vap_dim]
+        # v2: both pseudo-speaker streams come from REAL per-speaker Mimi latents
+        # (512-dim) through a single shared projection — symmetric VapGPT-style
+        # input. z_s is no longer projected into the streams (proj_agent removed).
+        assert user_audio_feat is not None and agent_audio_feat is not None, (
+            "VapGPTBackchannelModule(v2) requires per-speaker audio latents: "
+            "pass mimi to LMModel.forward_train / LMGen so agent/user feats are auto-extracted."
+        )
+        x_user  = self.proj_audio(user_audio_feat)   # [B, T, vap_dim]
+        x_agent = self.proj_audio(agent_audio_feat)  # [B, T, vap_dim]
 
         h_user = self.ar_channel(x_user)["x"]   # [B, T, vap_dim]
         h_agent = self.ar_channel(x_agent)["x"] # [B, T, vap_dim]
 
         out = self.ar(h_user, h_agent)  # {"x", "x1", "x2"}
 
+        # VAD: purely acoustic per-stream heads (z_s intentionally excluded —
+        # current-frame VA is solvable from audio; keeps this head untangled).
         v1 = self.va_classifier(out["x1"])
         v2 = self.va_classifier(out["x2"])
         vad_logits = torch.cat((v1, v2), dim=-1)
 
-        vap_logits = self.vap_head(out["x"])  # [B, T, 256]
+        # z_s stream (head-level late fusion): shared projected LM context, added
+        # as zero-init residuals so training starts at the pretrained audio-only
+        # behaviour and vap/bc losses backprop into the LM backbone through z_s.
+        z_ctx = self.z_ctx_norm(self.z_ctx_proj(z_s))               # [B, T, vap_dim]
 
-        bc_logits = self.bc_head(out["x"])  # [B, T, 3]
+        vap_logits = self.vap_head(out["x"]) + self.vap_z_head(z_ctx)  # [B, T, 256]
+        bc_logits = self.bc_head(out["x"]) + self.bc_z_head(z_ctx)     # [B, T, 3]
 
 
 
