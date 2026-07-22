@@ -753,10 +753,10 @@ def run_test_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test Dataset Inference")
-    parser.add_argument("--config", type=str, default="./output/ami_exp_ami_pureft_no_vap/args.yaml", help="Path to args.yaml or training config yaml")
-    parser.add_argument("--test-jsonl", type=str, default='./experiments_ami/ami_test_10.jsonl', help="Path to data.jsonl for the test dataset")
-    parser.add_argument("--output-dir", type=str, default="./result/ami_exp_ami_pureft_no_vap", help="Directory to save generated outputs")
-    parser.add_argument("--ckpt-dir", type=str, default="/home/s20235100/MBG_duplex/moshi-finetune/output/ami_exp_ami_pureft_no_vap/checkpoints/checkpoint_000100", help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument("--config", type=str, default="./output/exp_vap_base/args.yaml", help="Path to args.yaml or training config yaml")
+    parser.add_argument("--test-jsonl", type=str, default='./data/dualtalk/test/data.jsonl', help="Path to data.jsonl for the test dataset")
+    parser.add_argument("--output-dir", type=str, default="./result/exp_vap_base", help="Directory to save generated outputs")
+    parser.add_argument("--ckpt-dir", type=str, default="./output/exp_vap_base/checkpoints/checkpoint_002000", help="Directory containing consolidated/lora.safetensors")
     parser.add_argument("--sample-idx", type=int, default=None, help="Process only a specific index in the JSONL")
     parser.add_argument("--input-wav", type=str, default=None, help="Process only a specific WAV path in the JSONL")
     parser.add_argument("--device", type=str, default="cuda",

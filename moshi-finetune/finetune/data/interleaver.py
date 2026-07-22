@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 from collections import deque
 from dataclasses import dataclass
 from functools import reduce
@@ -620,7 +621,8 @@ class InterleavedTokenizer:
     ) -> Optional[Path]:
         """Return the FLAME .npy path for *stem*, or None if not found.
 
-        Search order: configured primary speaker, then fallback speaker.
+        Search order: *speaker* override (per-file agent) when given, else the
+        configured primary speaker then fallback speaker.
         For each speaker, tries subdirectory patterns:
           {flame_root}/{speaker}/{split}/{stem}_{speaker}.npy
           {flame_root}/{split}/{stem}_{speaker}.npy   (flat layout)
