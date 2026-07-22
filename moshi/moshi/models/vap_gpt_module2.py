@@ -502,6 +502,12 @@ class BackchannelOutput2:
     # [B, 1] bool. May differ from bc_logits argmax when a threshold rule is active —
     # loggers should read THIS, not recompute from logits.
     gate: Optional[torch.Tensor] = None
+    # Inference-only fusion diagnostics (all [B, 1] when populated by LMGen).
+    implicit_log_odds: Optional[torch.Tensor] = None
+    explicit_log_odds: Optional[torch.Tensor] = None
+    vap_agent_near: Optional[torch.Tensor] = None
+    fusion_score: Optional[torch.Tensor] = None
+    fusion_prob: Optional[torch.Tensor] = None
 
 
 def _load_vap_state_dict(path: str) -> dict:

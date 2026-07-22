@@ -324,6 +324,23 @@ def dicho(alignment, val, i=0, j=None):
 _FLAME_PATH_CACHE: dict[str, Optional[Path]] = {}  # stem → resolved FLAME .npy path (or None)
 
 
+def _is_ami_stereo_path(path: str) -> bool:
+    """Return True for the balanced AMI stereo dataset.
+
+    AMI files are stored as [utterance/user, backchannel/agent], whereas the
+    training model convention is [agent, user].
+    """
+    return any(
+        part == "stereo_ami_balanced" or part.startswith("stereo_ami_balanced_")
+        for part in Path(path).parts
+    )
+
+
+def _swap_vap_speaker_nibbles(labels: np.ndarray) -> np.ndarray:
+    """Swap VAP spk0 bits [7:4] with spk1 bits [3:0]."""
+    return ((labels & 0x0F) << 4) | ((labels >> 4) & 0x0F)
+
+
 class InterleavedTokenizer:
     def __init__(
         self,
@@ -390,6 +407,16 @@ class InterleavedTokenizer:
         Called by the batched encoding path in data_loader so mimi.encode is invoked
         only once per batch rather than once per sample.
         """
+        is_ami_stereo = _is_ami_stereo_path(path)
+        if is_ami_stereo:
+            if audio_tokens.shape[0] != 2:
+                raise ValueError(
+                    f"Expected two AMI stereo channels, got {audio_tokens.shape[0]}: {path}"
+                )
+            # AMI source: ch0=utterance/user, ch1=backchannel/main agent.
+            # Model:      ch0=agent,          ch1=user.
+            audio_tokens = audio_tokens[[1, 0]]
+
         audio_tokens = audio_tokens[..., : self.num_audio_frames]
         this_num_audio_frames = audio_tokens.shape[-1]
         audio_tokens = torch.nn.functional.pad(
@@ -425,9 +452,36 @@ class InterleavedTokenizer:
         if self.vap_lookup:
             vap_targets = torch.full((1, self.num_audio_frames), -100, dtype=torch.long, device=codes.device)
             raw_file_id = os.path.splitext(os.path.basename(path))[0]
+            is_ami_switched = (
+                is_ami_stereo and raw_file_id.endswith("_switch_stereo")
+            )
 
-            base = raw_file_id.replace("_stereo", "")
-            file_id_candidates = [raw_file_id, base + "_ut", base]
+            # DualTalk: the two stereo files of a conversation are named
+            # "{sid}_speaker" and "{sid}_listener" and share a single VAP manifest
+            # entry "{sid}_speaker1_cleaned" (generated with spk0=speaker1, spk1=speaker2).
+            # The training channel convention is ch0=agent(spk1), ch1=user(spk0), and by
+            # audio correlation "_speaker" has ch0=speaker1 while "_listener" has ch0=speaker2:
+            #   - "_speaker"  → agent=speaker1 ≠ manifest spk1 → reverse the label (swap spk0/spk1)
+            #   - "_listener" → agent=speaker2 = manifest spk1 → keep the label as-is
+            dt_reverse = False
+            if raw_file_id.endswith("_speaker"):
+                file_id_candidates = [raw_file_id[: -len("_speaker")] + "_speaker1_cleaned"]
+                dt_reverse = True
+            elif raw_file_id.endswith("_listener"):
+                file_id_candidates = [raw_file_id[: -len("_listener")] + "_speaker1_cleaned"]
+            elif is_ami_switched:
+                # The switched AMI file reuses the original pair's VAP labels.
+                # Example:
+                #   audio:    EN2001a_0_switch_stereo.wav
+                #   manifest: EN2001a_0_ut
+                original_base = raw_file_id[: -len("_switch_stereo")]
+                file_id_candidates = [
+                    original_base + "_ut",
+                    original_base,
+                ]
+            else:
+                base = raw_file_id.replace("_stereo", "")
+                file_id_candidates = [raw_file_id, base + "_ut", base]
 
             moshi_frame_duration = 1.0 / self.mimi.frame_rate
             t_arr = np.arange(self.num_audio_frames, dtype=np.float64)
@@ -443,6 +497,21 @@ class InterleavedTokenizer:
                 )
                 valid = labels != -100
                 if valid.any():
+                    if dt_reverse:
+                        # Swap spk0 (label bits 7-4) and spk1 (bits 3-0), preserving the
+                        # within-speaker bin order (bin0 = nearest 200ms stays the MSB of its nibble).
+                        rev = _swap_vap_speaker_nibbles(labels)
+                        labels = np.where(valid, rev, labels)
+                    elif is_ami_stereo and not is_ami_switched:
+                        # AMI manifest: spk0=backchannel agent (original ch1),
+                        # spk1=utterance user (original ch0). Audio was swapped
+                        # above to model convention ch0=agent/ch1=user, whose
+                        # downstream VAP convention is spk0=user/spk1=agent.
+                        rev = _swap_vap_speaker_nibbles(labels)
+                        labels = np.where(valid, rev, labels)
+                    # Switched AMI needs no nibble swap: after its audio is
+                    # normalized above, utterance=agent and backchannel=user,
+                    # already matching manifest spk1=agent / spk0=user.
                     vap_targets[0, valid] = torch.from_numpy(labels[valid]).to(codes.device)
                     matched_fid = fid
                     break
@@ -477,6 +546,9 @@ class InterleavedTokenizer:
         # ([..., 0] = user from out["x1"], [..., 1] = agent from out["x2"]).
         vad_targets = None
         if wav is not None and wav.dim() == 2 and wav.shape[0] >= 2:
+            if is_ami_stereo:
+                # Keep raw-wave VAD aligned with the audio-token swap above.
+                wav = wav[[1, 0]]
             frame_size = int(round(self.mimi_sample_rate / self.mimi.frame_rate))
             n_va = min(self.num_audio_frames, wav.shape[-1] // frame_size)
             if actual_wav_samples is not None:
@@ -524,7 +596,28 @@ class InterleavedTokenizer:
                       vad_targets=vad_targets,
                       bc_timing_targets=bc_timing_targets)
 
-    def _find_flame_path(self, stem: str) -> Optional[Path]:
+    def _resolve_flame_target(self, audio_path: str) -> tuple[str, str, bool]:
+        """Resolve FLAME stem/speaker for one audio sample.
+
+        Returns ``(stem, speaker, exact)``. In AMI auto mode, the original
+        sample trains the backchannel agent (bc), while a channel-switched
+        sample trains the utterance agent (ut). The switched FLAME arrays reuse
+        the original pair stem, so the synthetic ``_switch`` suffix is removed.
+        ``exact=True`` prevents falling back to the other person's motion.
+        """
+        stem = os.path.splitext(os.path.basename(audio_path))[0]
+        if stem.endswith("_stereo"):
+            stem = stem[: -len("_stereo")]
+
+        if self.flame_speaker == "auto":
+            if stem.endswith("_switch"):
+                return stem[: -len("_switch")], "ut", True
+            return stem, "bc", True
+        return stem, self.flame_speaker, False
+
+    def _find_flame_path(
+        self, stem: str, speaker: Optional[str] = None, exact: bool = False
+    ) -> Optional[Path]:
         """Return the FLAME .npy path for *stem*, or None if not found.
 
         Search order: configured primary speaker, then fallback speaker.
@@ -533,12 +626,17 @@ class InterleavedTokenizer:
           {flame_root}/{split}/{stem}_{speaker}.npy   (flat layout)
         Results are cached per (stem, speaker) pair.
         """
-        cache_key = f"{stem}|{self.flame_speaker}"
+        primary_speaker = speaker or self.flame_speaker
+        cache_key = f"{stem}|{primary_speaker}|exact={exact}"
         if cache_key in _FLAME_PATH_CACHE:
             return _FLAME_PATH_CACHE[cache_key]
 
         root = Path(self.flame_root)
-        speakers = [self.flame_speaker, "ut" if self.flame_speaker == "bc" else "bc"]
+        if exact:
+            speakers = [primary_speaker]
+        else:
+            fallback = "ut" if primary_speaker == "bc" else "bc"
+            speakers = [primary_speaker, fallback]
         splits = ["train", "valid", "val", "test"]
         result: Optional[Path] = None
 
@@ -570,11 +668,8 @@ class InterleavedTokenizer:
         n_face_frames = int(self.duration_sec * self._motion_fps)
         start_frame = int(start_sec * self._motion_fps)
 
-        # Derive the base stem by stripping the audio extension and "_stereo" suffix.
-        stem = os.path.splitext(os.path.basename(audio_path))[0]
-        stem = stem.replace("_stereo", "")
-
-        flame_path = self._find_flame_path(stem)
+        stem, speaker, exact = self._resolve_flame_target(audio_path)
+        flame_path = self._find_flame_path(stem, speaker=speaker, exact=exact)
         if flame_path is None:
             return None
 
@@ -623,8 +718,8 @@ class InterleavedTokenizer:
         """
         if not self.flame_root:
             return True
-        stem = os.path.splitext(os.path.basename(path))[0].replace("_stereo", "")
-        return self._find_flame_path(stem) is not None
+        stem, speaker, exact = self._resolve_flame_target(path)
+        return self._find_flame_path(stem, speaker=speaker, exact=exact) is not None
 
     def __call__(self, wav: np.ndarray, start_sec: float, path: str, voice_prompt_emb: torch.Tensor | None = None) -> Sample:
         with torch.no_grad():

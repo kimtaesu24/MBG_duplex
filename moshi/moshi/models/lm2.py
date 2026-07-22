@@ -447,10 +447,17 @@ class LMModel(StreamingContainer):
                 sys.path.insert(0, face_module_dir)
             try:
                 # Version switch: v2 (softvq_continuous_online_train_v2) adds blink
-                # modelling, block-causal audio chunks and MTP look-ahead. v1/v2
-                # checkpoints are NOT interchangeable (different parameter sets) —
-                # face_module_version must match the checkpoint's training script.
-                if int(face_module_version) >= 2:
+                # modelling, block-causal audio chunks and MTP look-ahead over v1.
+                # v6 additionally adds partner-context cross-attention (partner_layers,
+                # use_vap). v7 drops that v6-only feature and otherwise refines the
+                # v2-era architecture — its constructor matches v2's, not v6's.
+                # Checkpoints from different versions are NOT interchangeable —
+                # face_module_version must match the checkpoint's training script exactly.
+                if int(face_module_version) >= 7:
+                    from softvq_continuous_online_train_v7 import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                elif int(face_module_version) == 6:
+                    from softvq_continuous_online_train_v6 import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                elif int(face_module_version) >= 2:
                     from softvq_continuous_online_train_v2 import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
                 else:
                     from softvq_continuous_online_train import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
@@ -468,7 +475,7 @@ class LMModel(StreamingContainer):
                     prior_warmup_frames=int(ckpt_args.get("prior_warmup_frames", face_module_prior_warmup_frames)),
                 )
                 if int(face_module_version) >= 2:
-                    # v2-only arch args — MUST mirror the checkpoint: the MTP/look-ahead
+                    # v2+ arch args — MUST mirror the checkpoint: the MTP/look-ahead
                     # modules are only instantiated when lookahead_frames > 0, so a
                     # mismatch breaks the (strict) state-dict load below.
                     _face_kwargs.update(
@@ -476,6 +483,13 @@ class LMModel(StreamingContainer):
                         chunk_frames=int(ckpt_args.get("chunk_frames", 1)),
                         token_vocab=int(ckpt_args.get("token_vocab", 2048)),
                         la_temp=float(ckpt_args.get("la_temp", 0.5)),
+                    )
+                if int(face_module_version) == 6:
+                    # v6-only arch args (partner-context cross-attention). Not present
+                    # in v7 — its constructor reverted to the v2 parameter set.
+                    _face_kwargs.update(
+                        partner_layers=int(ckpt_args.get("partner_layers", 2)),
+                        use_vap=bool(ckpt_args.get("use_vap", True)),
                     )
                 face_net = _FaceModel(**_face_kwargs)
                 if face_module_checkpoint is not None:
@@ -1039,6 +1053,11 @@ class LMGen(StreamingModule[_LMGenState]):
         mimi=None,
         suppress_epad: bool = False,
         bc_context_frames: int = 250,
+        epad_control: str = "fusion",
+        fusion_bc_weight: float = 1.0,
+        fusion_vap_weight: float = 0.0,
+        fusion_vad_weight: float = 0.0,
+        fusion_threshold: float = 0.5,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -1082,6 +1101,17 @@ class LMGen(StreamingModule[_LMGenState]):
         # written to state.cache, so the model's autoregressive history sees [PAD] and is
         # therefore prevented from starting a word in the next step.
         self.suppress_epad = suppress_epad
+        if epad_control not in ("none", "legacy", "fusion"):
+            raise ValueError(
+                f"epad_control must be one of none/legacy/fusion, got {epad_control!r}"
+            )
+        if not 0.0 < fusion_threshold < 1.0:
+            raise ValueError("fusion_threshold must be strictly between 0 and 1")
+        self.epad_control = epad_control
+        self.fusion_bc_weight = float(fusion_bc_weight)
+        self.fusion_vap_weight = float(fusion_vap_weight)
+        self.fusion_vad_weight = float(fusion_vad_weight)
+        self.fusion_threshold = float(fusion_threshold)
         # Rolling-window history for the VapGPT backchannel module: its GPT layers have no
         # KV cache, so at inference we replay the same causal context seen during training
         # by buffering past frames (transformer_out + per-speaker audio feats) up to
@@ -1356,17 +1386,47 @@ class LMGen(StreamingModule[_LMGenState]):
                 tout_in, emb_cb0=lm_model.depformer_text_emb, step=999_999,
                 agent_audio_feat=agent_in, user_audio_feat=user_in,
             )
-            # Current step's decision = last frame of the (possibly windowed) output.
-            # 3-class head: 0=PAD, 1=EPAD (backchannel onset), 2=WORD (already speaking).
-            # Current frame logits, with class-weight correction applied ONCE here.
-            # Both the gate decision below and the exposed _last_bc_result use the
-            # SAME corrected logits, so external logging (softmax/argmax over
-            # _last_bc_result.bc_logits) always matches the actual decision.
-            # Plain argmax over the raw 3-class logits (0=PAD, 1=EPAD, 2=WORD).
-            # No inference-side calibration: the operating point is owned entirely
-            # by the training loss (EPAD class weight in train2's weighted CE).
-            pred_cls = bc_result.bc_logits[:, -1].argmax(dim=-1)  # [B]
-            gate_fires = pred_cls == 1
+            # Current step's explicit decision = last frame of the windowed output.
+            # 3-class head: 0=PAD, 1=EPAD (onset), 2=WORD (already speaking).
+            bc_now = bc_result.bc_logits[:, -1]  # [B, 3]
+            pred_cls = bc_now.argmax(dim=-1)
+
+            implicit_log_odds = (
+                text_logits[:, 0, 0, lm_model.end_of_text_padding_id]
+                - text_logits[:, 0, 0, lm_model.text_padding_token_id]
+            ).float()
+            explicit_log_odds = (bc_now[:, 1] - bc_now[:, 0]).float()
+
+            # Marginalise the 256 VAP classes instead of taking their argmax.
+            # Normalised training labels use spk0=user in bits [7:4] and
+            # spk1=agent in bits [3:0]. Bit 3 is the agent's nearest future bin.
+            vap_agent_near = implicit_log_odds.new_full(implicit_log_odds.shape, 0.5)
+            vap_log_odds = implicit_log_odds.new_zeros(implicit_log_odds.shape)
+            if bc_result.vap_logits is not None:
+                vap_probs = bc_result.vap_logits[:, -1].float().softmax(dim=-1)
+                class_ids = torch.arange(256, device=vap_probs.device)
+                agent_near_mask = (class_ids & 0x08) != 0
+                vap_agent_near = vap_probs[:, agent_near_mask].sum(dim=-1)
+                vap_agent_near = vap_agent_near.clamp(1e-6, 1.0 - 1e-6)
+                vap_log_odds = torch.logit(vap_agent_near)
+
+            # vad_logits[..., 0] is the user-active log-odds, therefore its
+            # negative is exactly the user-quiet log-odds.
+            user_quiet_log_odds = -bc_result.vad_logits[:, -1, 0].float()
+            fusion_score = (
+                implicit_log_odds
+                + self.fusion_bc_weight * explicit_log_odds
+                + self.fusion_vap_weight * vap_log_odds
+                + self.fusion_vad_weight * user_quiet_log_odds
+            )
+            fusion_prob = torch.sigmoid(fusion_score)
+
+            if self.epad_control == "fusion":
+                gate_fires = fusion_prob >= self.fusion_threshold
+            elif self.epad_control == "legacy":
+                gate_fires = pred_cls == 1
+            else:
+                gate_fires = torch.zeros_like(pred_cls, dtype=torch.bool)
 
             # Expose only the current frame so external logging stays per-step.
             # gate is the ACTUAL decision — loggers read it directly.
@@ -1375,24 +1435,55 @@ class LMGen(StreamingModule[_LMGenState]):
                 vad_logits=bc_result.vad_logits[:, -1:],
                 bc_logits=bc_result.bc_logits[:, -1:],  # [B, 1, 3] raw
                 gate=gate_fires.unsqueeze(1),           # [B, 1] bool
+                implicit_log_odds=implicit_log_odds.unsqueeze(1),
+                explicit_log_odds=explicit_log_odds.unsqueeze(1),
+                vap_agent_near=vap_agent_near.unsqueeze(1),
+                fusion_score=fusion_score.unsqueeze(1),
+                fusion_prob=fusion_prob.unsqueeze(1),
             )
-            is_pad = (sampled_text_token == lm_model.text_padding_token_id)
-            sampled_text_token = torch.where(
-                is_pad & gate_fires,
-                sampled_text_token.new_full(sampled_text_token.shape, lm_model.end_of_text_padding_id),
-                sampled_text_token,
-            )
-            # Suppression (inverse of the injection above): when the gate says "don't speak"
-            # (g_final == 0) but the model sampled [EPAD] (premature speech onset), force it
-            # back to [PAD]. This runs before the cache write below, so the model's history
-            # sees [PAD] and is prevented from emitting a word on the following step.
-            if self.suppress_epad:
-                is_epad = (sampled_text_token == lm_model.end_of_text_padding_id)
+
+            if self.epad_control == "fusion":
+                # Fuse only at the PAD/EPAD onset boundary. WORD tokens are never
+                # overwritten, so once speech begins lexical generation remains the
+                # backbone's responsibility.
+                is_onset_candidate = (
+                    (sampled_text_token == lm_model.text_padding_token_id)
+                    | (sampled_text_token == lm_model.end_of_text_padding_id)
+                )
+                fused_onset_token = torch.where(
+                    gate_fires,
+                    sampled_text_token.new_full(
+                        sampled_text_token.shape, lm_model.end_of_text_padding_id
+                    ),
+                    sampled_text_token.new_full(
+                        sampled_text_token.shape, lm_model.text_padding_token_id
+                    ),
+                )
                 sampled_text_token = torch.where(
-                    is_epad & ~gate_fires,
-                    sampled_text_token.new_full(sampled_text_token.shape, lm_model.text_padding_token_id),
+                    is_onset_candidate, fused_onset_token, sampled_text_token
+                )
+            elif self.epad_control == "legacy":
+                is_pad = sampled_text_token == lm_model.text_padding_token_id
+                sampled_text_token = torch.where(
+                    is_pad & gate_fires,
+                    sampled_text_token.new_full(
+                        sampled_text_token.shape, lm_model.end_of_text_padding_id
+                    ),
                     sampled_text_token,
                 )
+                # Preserve the old optional explicit veto for legacy ablations.
+                if self.suppress_epad:
+                    is_epad = sampled_text_token == lm_model.end_of_text_padding_id
+                    sampled_text_token = torch.where(
+                        is_epad & ~gate_fires,
+                        sampled_text_token.new_full(
+                            sampled_text_token.shape, lm_model.text_padding_token_id
+                        ),
+                        sampled_text_token,
+                    )
+            elif self.suppress_epad:
+                # suppress_epad has no controller to consult in `none` mode.
+                pass
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
@@ -1682,4 +1773,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_logits
         else:
             return tokens
-

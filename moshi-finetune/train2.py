@@ -502,14 +502,19 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                                audio_feat=audio_feat, gt_face_motion=gt_face_motion,
                                mimi=mimi_for_model, bc_audio_feats=bc_audio_feats)
 
-                # Silence-padded frames (mimi tokens from zero-padded waveform) are kept
-                # in audio/text loss intentionally: they provide backbone regularization,
-                # teaching the model to suppress output after real content ends.
                 # Text at padded positions is already zero_token_id (-1) → text_mask=False
-                # regardless; the audio silence tokens are the meaningful signal here.
+                # regardless, so no extra masking is needed there.
                 # Slice off the T_p prompt-prefix frames — loss is on the conversation only.
                 text_mask = output.text_mask[:, :, T_p:]
                 audio_mask = output.mask[:, :, T_p:]
+
+                # Exclude the zero-padded tail of short clips/windows (batch.valid_mask
+                # is False past the real audio length) from the audio loss. Without this,
+                # every batch's last window contributes an artificial "predict silence"
+                # signal proportional to how much of it is padding, on top of any real
+                # silence in the content — biasing the model toward under-talking.
+                if batch.valid_mask is not None:
+                    audio_mask = audio_mask & batch.valid_mask.to(audio_mask.device).unsqueeze(1)
 
                 text_loss = compute_loss_with_mask(
                     output.text_logits[:, :, T_p:],
@@ -918,5 +923,5 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
 if __name__ == "__main__":
     """사용법: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml"""
-    """ torchrun --nproc_per_node=1 --master_port=29511 train2.py config/dualtalk_backbone_only.yaml """
+    """ torchrun --nproc_per_node=1 --master_port=29512 train2.py config/dualtalk_backbone_only.yaml """
     fire.Fire(train)

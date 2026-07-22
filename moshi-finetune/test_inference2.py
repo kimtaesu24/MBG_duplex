@@ -92,7 +92,7 @@ def _strip_peft_prefixes(state_dict: dict) -> dict:
     return cleaned
 
 
-def load_checkpoint(lm, ckpt_dir):
+def load_checkpoint(lm, ckpt_dir, lora_config: Optional[dict] = None):
     """Loads the finetuned checkpoint (consolidated or lora-only)."""
     consolidated_path = os.path.join(ckpt_dir, "consolidated", "consolidated.safetensors")
     lora_path = os.path.join(ckpt_dir, "consolidated", "lora.safetensors")
@@ -161,16 +161,20 @@ def load_checkpoint(lm, ckpt_dir):
                 # Exclude depformer if the checkpoint has no depformer LoRA keys
                 # (happens when freeze_depformer=true was used during training).
                 extra_exclude = "|depformer" if not any("depformer" in k for k in lora_weights) else ""
+                lora_cfg = lora_config or {}
+                lora_rank = int(lora_cfg.get("rank", 64))
+                lora_scaling = float(lora_cfg.get("scaling", 2.0))
                 lora_config = LoraConfig(
                     task_type=TaskType.FEATURE_EXTRACTION,
-                    r=64,
-                    lora_alpha=128,
+                    r=lora_rank,
+                    lora_alpha=lora_scaling * lora_rank,
                     target_modules=(
                         rf"(?!.*(face_module|backchannel{extra_exclude}))"
                         r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj|linear_in|linear_out)"
                     ),
                     bias="none",
                 )
+                log("info", f"Constructing LoRA adapter (rank={lora_rank}, scaling={lora_scaling}).")
                 peft_lm = get_peft_model(lm, lora_config)
                 prefixed = {f"base_model.model.{k}": v for k, v in lora_weights.items()}
                 missing_lora, _ = peft_lm.load_state_dict(prefixed, strict=False)
@@ -229,8 +233,19 @@ def infer_one(
 
     user_audio = lm_load_audio(inp_path, mimi.sample_rate)
     if user_audio.ndim == 2 and user_audio.shape[0] == 2:
-        log("info", f"Swapping channels for {inp_path}...")
-        user_audio = user_audio[[1, 0], :]
+        is_ami_stereo = any(
+            part == "stereo_ami_balanced" or part.startswith("stereo_ami_balanced_")
+            for part in Path(inp_path).parts
+        )
+        if is_ami_stereo:
+            # AMI source convention is ch0=utterance/user, ch1=backchannel/agent.
+            # _iterate_audio consumes the first channel, so keep AMI unchanged.
+            log("info", f"AMI channel order: using original ch0 as user input for {inp_path}.")
+        else:
+            # DualTalk source is oriented with the target agent on ch0; move its
+            # user channel to ch0 because _iterate_audio consumes only ch0.
+            log("info", f"Swapping channels for {inp_path}...")
+            user_audio = user_audio[[1, 0], :]
     elif user_audio.ndim == 2:
         user_audio = user_audio[0:1]
     else:
@@ -241,7 +256,6 @@ def infer_one(
     generated_text_tokens = []
     bc_gate_log = []
     special_token_map = {0: "EPAD", 1: "BOS", 2: "EOS", 3: "PAD"}
-    _prev_bc_result = None
 
     for user_encoded in lm_encode_from_sphn(
         mimi,
@@ -254,6 +268,14 @@ def infer_one(
             if result is None or result[0] is None:
                 continue
             tokens, z = result
+            # LMGen computes the controller for the same token before returning it.
+            # Read it immediately; delaying this lookup by one loop iteration shifts
+            # every gate/fusion record one frame away from the token it controlled.
+            _current_bc_result = (
+                getattr(lm_gen.lm_model, "_last_bc_result", None)
+                if getattr(lm_gen.lm_model, "backchannel", None) is not None
+                else None
+            )
 
             if face_gen is not None:
                 face_gen.add_step(tokens, z)
@@ -282,19 +304,25 @@ def infer_one(
                     )
                 _label = "PAD" if text_id == _PAD else ("EPAD" if text_id == _EPAD else f"WORD({text_id})")
                 # v2 bc log: 3-class head (0=PAD, 1=EPAD, 2=WORD) + current-frame VAD.
-                if collect_bc_log and getattr(lm_gen.lm_model, "backchannel", None) is not None and _prev_bc_result is not None:
-                    _probs = _prev_bc_result.bc_logits[0, 0].float().softmax(-1)  # [3] calibrated
+                if collect_bc_log and _current_bc_result is not None:
+                    _probs = _current_bc_result.bc_logits[0, 0].float().softmax(-1)  # [3]
                     _p_pad, _p_epad, _p_word = (_probs[0].item(), _probs[1].item(), _probs[2].item())
                     _pred_cls = int(_probs.argmax().item())
                     _pred_label = ("PAD", "EPAD", "WORD")[_pred_cls]
                     # Actual gate decision from LMGen (threshold rule may differ from argmax).
-                    _gate = (int(_prev_bc_result.gate[0, 0].item())
-                             if _prev_bc_result.gate is not None else int(_pred_cls == 1))
-                    _vad = torch.sigmoid(_prev_bc_result.vad_logits[0, 0].float())  # [2] (user, agent)
+                    _gate = (int(_current_bc_result.gate[0, 0].item())
+                             if _current_bc_result.gate is not None else int(_pred_cls == 1))
+                    _vad = torch.sigmoid(_current_bc_result.vad_logits[0, 0].float())  # [2] (user, agent)
                     _vad_user, _vad_agent = _vad[0].item(), _vad[1].item()
+                    _implicit_lo = _current_bc_result.implicit_log_odds[0, 0].item()
+                    _explicit_lo = _current_bc_result.explicit_log_odds[0, 0].item()
+                    _vap_near = _current_bc_result.vap_agent_near[0, 0].item()
+                    _fusion_p = _current_bc_result.fusion_prob[0, 0].item()
                     print(f"token={_label:14s} | gate={_gate} argmax={_pred_label:4s} "
                           f"p_pad={_p_pad:.3f} p_epad={_p_epad:.3f} p_word={_p_word:.3f} "
-                          f"| vad_user={_vad_user:.3f} vad_agent={_vad_agent:.3f}")
+                          f"| implicit_lo={_implicit_lo:.3f} explicit_lo={_explicit_lo:.3f} "
+                          f"fusion_p={_fusion_p:.3f} vap_near={_vap_near:.3f} "
+                          f"vad_user={_vad_user:.3f} vad_agent={_vad_agent:.3f}")
                     bc_gate_log.append({
                         "token_id": text_id,
                         "token_label": _label,
@@ -306,10 +334,11 @@ def infer_one(
                         "gate": _gate,
                         "vad_user": round(_vad_user, 4),
                         "vad_agent": round(_vad_agent, 4),
+                        "implicit_log_odds": round(_implicit_lo, 4),
+                        "explicit_log_odds": round(_explicit_lo, 4),
+                        "vap_agent_near": round(_vap_near, 4),
+                        "fusion_prob": round(_fusion_p, 4),
                     })
-
-            if getattr(lm_gen.lm_model, "backchannel", None) is not None:
-                _prev_bc_result = getattr(lm_gen.lm_model, "_last_bc_result", None)
 
     if not generated_frames:
         return np.zeros(target_samples, dtype=np.float32), mimi.sample_rate, [], [], False
@@ -345,23 +374,36 @@ def run_test_inference(args):
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
         
-    hf_repo = config.get("moshi_paths", {}).get("hf_repo_id", loaders.DEFAULT_REPO)
+    path_cfg = config.get("moshi_paths", {})
+    hf_repo = path_cfg.get("hf_repo_id") or loaders.DEFAULT_REPO
+
+    def resolve_weight(config_key: str, hub_name: str) -> str:
+        local_path = path_cfg.get(config_key)
+        if local_path:
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(
+                    f"moshi_paths.{config_key} does not exist: {local_path}"
+                )
+            log("info", f"Using local {config_key}: {local_path}")
+            return local_path
+        log("info", f"moshi_paths.{config_key} is unset; downloading {hub_name} from {hf_repo}.")
+        return hf_hub_download(hf_repo, hub_name)
     
     # 1) Load Mimi
     log("info", "Loading mimi...")
-    mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)
+    mimi_weight = resolve_weight("mimi_path", loaders.MIMI_NAME)
     mimi = loaders.get_mimi(mimi_weight, device)
     other_mimi = loaders.get_mimi(mimi_weight, device)
     # VAP tokenization용 별도 인스턴스 — streaming_forever를 호출하지 않아 batch 크기 제약 없음
     vap_mimi = loaders.get_mimi(mimi_weight, device)
     
     # 2) Load Text Tokenizer
-    tokenizer_path = hf_hub_download(hf_repo, loaders.TEXT_TOKENIZER_NAME)
+    tokenizer_path = resolve_weight("tokenizer_path", loaders.TEXT_TOKENIZER_NAME)
     text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
     
     # 3) Load Moshi
     log("info", "Loading Moshi base model...")
-    moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)
+    moshi_weight = resolve_weight("moshi_path", loaders.MOSHI_NAME)
     
     # Reset backchannel keys in loaders._lm_kwargs to avoid contamination
     for k in list(loaders._lm_kwargs.keys()):
@@ -391,6 +433,9 @@ def run_test_inference(args):
     else:
         loaders._lm_kwargs["backchannel_enabled"] = False
         log("info", "Backchannel VAP module disabled.")
+        if args.epad_control != "none":
+            log("warning", f"--epad-control={args.epad_control} has no effect without "
+                           "the backchannel module; using backbone output unchanged.")
         if args.suppress_epad:
             log("warning", "--suppress-epad has NO effect without the backchannel module "
                            "(gate suppression lives inside the module branch).")
@@ -421,7 +466,7 @@ def run_test_inference(args):
     
     # Apply fine-tuned checkpoint
     if args.ckpt_dir:
-        lm = load_checkpoint(lm, args.ckpt_dir)
+        lm = load_checkpoint(lm, args.ckpt_dir, config.get("lora", {}))
     
     lm.eval()
     log("info", "Model loaded successfully.")
@@ -441,6 +486,20 @@ def run_test_inference(args):
         top_k_text=args.top_k_text,
         mimi=mimi,
         suppress_epad=args.suppress_epad,
+        bc_context_frames=max(
+            1, int(round(float(config.get("duration_sec", 10.0)) * mimi.frame_rate))
+        ),
+        epad_control=args.epad_control,
+        fusion_bc_weight=args.fusion_bc_weight,
+        fusion_vap_weight=args.fusion_vap_weight,
+        fusion_vad_weight=args.fusion_vad_weight,
+        fusion_threshold=args.fusion_threshold,
+    )
+    log(
+        "info",
+        f"EPAD control={args.epad_control}, bc_weight={args.fusion_bc_weight}, "
+        f"vap_weight={args.fusion_vap_weight}, vad_weight={args.fusion_vad_weight}, "
+        f"threshold={args.fusion_threshold}, context_frames={lm_gen.bc_context_frames}",
     )
     
     # Set streaming mode (critical for LMGen to work)
@@ -694,10 +753,10 @@ def run_test_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test Dataset Inference")
-    parser.add_argument("--config", type=str, default="./output/backcone_only_dualtalk/args.yaml", help="Path to args.yaml or training config yaml")
-    parser.add_argument("--test-jsonl", type=str, default='./data/dualtalk/test/data.jsonl', help="Path to data.jsonl for the test dataset")
-    parser.add_argument("--output-dir", type=str, default="./result/backcone_only_dualtalk", help="Directory to save generated outputs")
-    parser.add_argument("--ckpt-dir", type=str, default="./output/backcone_only_dualtalk/checkpoints/checkpoint_000600", help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument("--config", type=str, default="./output/ami_exp_ami_pureft_no_vap/args.yaml", help="Path to args.yaml or training config yaml")
+    parser.add_argument("--test-jsonl", type=str, default='./experiments_ami/ami_test_10.jsonl', help="Path to data.jsonl for the test dataset")
+    parser.add_argument("--output-dir", type=str, default="./result/ami_exp_ami_pureft_no_vap", help="Directory to save generated outputs")
+    parser.add_argument("--ckpt-dir", type=str, default="/home/s20235100/MBG_duplex/moshi-finetune/output/ami_exp_ami_pureft_no_vap/checkpoints/checkpoint_000100", help="Directory containing consolidated/lora.safetensors")
     parser.add_argument("--sample-idx", type=int, default=None, help="Process only a specific index in the JSONL")
     parser.add_argument("--input-wav", type=str, default=None, help="Process only a specific WAV path in the JSONL")
     parser.add_argument("--device", type=str, default="cuda",
@@ -714,7 +773,20 @@ if __name__ == "__main__":
     parser.add_argument("--top-k-text", type=int, default=25, help="Text sampling top-k.")
     parser.add_argument("--suppress-epad", action="store_true",
                         help="Force [EPAD] → [PAD] whenever g_final=0 (VAP says don't speak). "
-                             "Word tokens in progress are never replaced.")
+                             "Legacy mode only; word tokens in progress are never replaced.")
+    parser.add_argument(
+        "--epad-control", choices=("none", "legacy", "fusion"), default="fusion",
+        help="EPAD controller: none=backbone only, legacy=hard BC-head gate, "
+             "fusion=training-free implicit/explicit log-odds fusion (default).",
+    )
+    parser.add_argument("--fusion-bc-weight", type=float, default=1.0,
+                        help="Weight on explicit BC EPAD-vs-PAD log-odds.")
+    parser.add_argument("--fusion-vap-weight", type=float, default=0.0,
+                        help="Optional weight on marginal agent-near VAP log-odds.")
+    parser.add_argument("--fusion-vad-weight", type=float, default=0.0,
+                        help="Optional weight on user-quiet VAD log-odds.")
+    parser.add_argument("--fusion-threshold", type=float, default=0.5,
+                        help="EPAD onset threshold applied to the fused probability.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--world-size", type=int, default=1, help="Total number of processes for inference")
     parser.add_argument("--rank", type=int, default=0, help="Rank of the current process")

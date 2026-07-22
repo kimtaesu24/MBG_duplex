@@ -199,7 +199,8 @@ class FaceGenArgs(Serializable):
     #   {flame_root}/{speaker}/{split}/{stem}_{speaker}.npy
     # where speaker ∈ {"bc", "ut"} and split ∈ {"train", "valid", "test"}.
     flame_root: str = ""
-    flame_speaker: str = "bc"  # primary speaker suffix for the agent channel
+    # "auto": AMI original → bc, AMI *_switch → ut.
+    flame_speaker: str = "bc"  # "bc" | "ut" | "auto"
 
     # ── Per-component loss weights (from reference pretraining) ───────────
     # Overall weight applied to the sum of all face sub-losses.
@@ -281,6 +282,9 @@ class TrainArgs(Serializable):
     lora: LoraArgs = field(default_factory=LoraArgs)
     # Personaplex는 LoRA 미지원이므로 full_finetuning=True가 기본값
     full_finetuning: bool = True
+    # VAP-only ablation: freeze the Personaplex backbone and train only the
+    # backchannel module (VAP GPT + BC/VAD heads).
+    freeze_backbone: bool = False
     freeze_depformer: bool = False  # True이면 Depformer 전체를 동결 (LM transformer만 학습)
 
     # Backchannel VAP
@@ -304,7 +308,11 @@ class TrainArgs(Serializable):
         assert self.num_ckpt_keep is None or self.num_ckpt_keep >= 1
 
         # Personaplex: LoRA 및 full_finetuning 지원
-        if not self.lora.enable and not self.full_finetuning:
+        if (
+            not self.lora.enable
+            and not self.full_finetuning
+            and not self.freeze_backbone
+        ):
             logging.warning(
                 "LoRA is disabled and full_finetuning is False. "
                 "Forcing full_finetuning=True for Personaplex model."
