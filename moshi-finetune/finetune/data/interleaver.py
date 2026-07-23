@@ -328,8 +328,9 @@ _FLAME_PATH_CACHE: dict[str, Optional[Path]] = {}  # stem → resolved FLAME .np
 def _is_ami_stereo_path(path: str) -> bool:
     """Return True for the balanced AMI stereo dataset.
 
-    AMI files are stored as [utterance/user, backchannel/agent], whereas the
-    training model convention is [agent, user].
+    AMI files are already stored in the model convention [target agent, user].
+    For regular clips target agent=backchannel; for ``_switch_stereo`` clips
+    target agent=utterance after the physical channel swap.
     """
     return any(
         part == "stereo_ami_balanced" or part.startswith("stereo_ami_balanced_")
@@ -414,9 +415,8 @@ class InterleavedTokenizer:
                 raise ValueError(
                     f"Expected two AMI stereo channels, got {audio_tokens.shape[0]}: {path}"
                 )
-            # AMI source: ch0=utterance/user, ch1=backchannel/main agent.
-            # Model:      ch0=agent,          ch1=user.
-            audio_tokens = audio_tokens[[1, 0]]
+            # AMI is already role-normalized: ch0=target agent, ch1=user.
+            # Do not swap; flattened rows become 1:9=agent and 9:17=user.
 
         audio_tokens = audio_tokens[..., : self.num_audio_frames]
         this_num_audio_frames = audio_tokens.shape[-1]
@@ -504,14 +504,13 @@ class InterleavedTokenizer:
                         rev = _swap_vap_speaker_nibbles(labels)
                         labels = np.where(valid, rev, labels)
                     elif is_ami_stereo and not is_ami_switched:
-                        # AMI manifest: spk0=backchannel agent (original ch1),
-                        # spk1=utterance user (original ch0). Audio was swapped
-                        # above to model convention ch0=agent/ch1=user, whose
-                        # downstream VAP convention is spk0=user/spk1=agent.
+                        # AMI manifest: spk0=backchannel agent, spk1=utterance
+                        # user. The downstream VAP convention is the reverse:
+                        # spk0=user, spk1=agent.
                         rev = _swap_vap_speaker_nibbles(labels)
                         labels = np.where(valid, rev, labels)
-                    # Switched AMI needs no nibble swap: after its audio is
-                    # normalized above, utterance=agent and backchannel=user,
+                    # Switched AMI needs no nibble swap: after its physical
+                    # channel swap, utterance=agent and backchannel=user,
                     # already matching manifest spk1=agent / spk0=user.
                     vap_targets[0, valid] = torch.from_numpy(labels[valid]).to(codes.device)
                     matched_fid = fid
@@ -547,9 +546,6 @@ class InterleavedTokenizer:
         # ([..., 0] = user from out["x1"], [..., 1] = agent from out["x2"]).
         vad_targets = None
         if wav is not None and wav.dim() == 2 and wav.shape[0] >= 2:
-            if is_ami_stereo:
-                # Keep raw-wave VAD aligned with the audio-token swap above.
-                wav = wav[[1, 0]]
             frame_size = int(round(self.mimi_sample_rate / self.mimi.frame_rate))
             n_va = min(self.num_audio_frames, wav.shape[-1] // frame_size)
             if actual_wav_samples is not None:

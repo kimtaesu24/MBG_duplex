@@ -1323,21 +1323,15 @@ class LMGen(StreamingModule[_LMGenState]):
         state = self._streaming_state
         lm_model = self.lm_model
 
-        # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
-        sampled_text_token = sample_token(
-            text_logits.float(),
-            self.use_sampling,
-            self.temp_text,
-            self.top_k_text,
-        )
-        assert sampled_text_token.dim() == 3, sampled_text_token.shape
-        assert sampled_text_token.shape[2] == 1
-        assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
-        sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
+        # Fusion may add an explicit turn-taking residual to the backbone's EPAD
+        # logit below. Sampling is deliberately deferred until after that residual
+        # is available, and is performed exactly once so bc_weight=0 reproduces the
+        # original backbone sampling path (including RNG consumption).
+        text_logits_for_sampling = text_logits.float()
+        gate_fires = None
 
-        # Backchannel inference replacement: if bc_gate fires and the sampled token is
-        # PAD, replace it with EPAD so the model signals "about to talk".
-        # transformer_out is [B, 1, dim] in streaming mode; bc_gate is [B, 1].
+        # Compute explicit turn-taking evidence before text sampling. Fusion mode
+        # applies it as an EPAD-logit residual; legacy mode retains hard replacement.
         if lm_model.backchannel is not None:
             is_vapgpt = isinstance(lm_model.backchannel, VapGPTBackchannelModule)
             agent_af = None
@@ -1422,7 +1416,21 @@ class LMGen(StreamingModule[_LMGenState]):
             fusion_prob = torch.sigmoid(fusion_score)
 
             if self.epad_control == "fusion":
-                gate_fires = fusion_prob >= self.fusion_threshold
+                # Residual shallow fusion: preserve every backbone text logit and
+                # add explicit evidence only to EPAD. Unlike the former hard 0.5
+                # decision, this retains the backbone's stochastic implicit onset
+                # prior and lets the normal temperature/top-k sampler decide.
+                explicit_residual = (
+                    self.fusion_bc_weight * explicit_log_odds
+                    + self.fusion_vap_weight * vap_log_odds
+                    + self.fusion_vad_weight * user_quiet_log_odds
+                )
+                text_logits_for_sampling = text_logits.float().clone()
+                text_logits_for_sampling[:, 0, 0, lm_model.end_of_text_padding_id] += (
+                    explicit_residual
+                )
+                # Filled with the actual sampled EPAD decision after sampling.
+                gate_fires = torch.zeros_like(pred_cls, dtype=torch.bool)
             elif self.epad_control == "legacy":
                 gate_fires = pred_cls == 1
             else:
@@ -1442,26 +1450,26 @@ class LMGen(StreamingModule[_LMGenState]):
                 fusion_prob=fusion_prob.unsqueeze(1),
             )
 
+        # Shape: [B, K_text=1, T=1, Card_text]. This is the only text sampling
+        # call in the step, for both backbone-only and fusion modes.
+        sampled_text_token = sample_token(
+            text_logits_for_sampling,
+            self.use_sampling,
+            self.temp_text,
+            self.top_k_text,
+        )
+        assert sampled_text_token.dim() == 3, sampled_text_token.shape
+        assert sampled_text_token.shape[2] == 1
+        assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
+        sampled_text_token = sampled_text_token[:, 0, 0]  # [B]
+
+        if lm_model.backchannel is not None:
             if self.epad_control == "fusion":
-                # Fuse only at the PAD/EPAD onset boundary. WORD tokens are never
-                # overwritten, so once speech begins lexical generation remains the
-                # backbone's responsibility.
-                is_onset_candidate = (
-                    (sampled_text_token == lm_model.text_padding_token_id)
-                    | (sampled_text_token == lm_model.end_of_text_padding_id)
-                )
-                fused_onset_token = torch.where(
-                    gate_fires,
-                    sampled_text_token.new_full(
-                        sampled_text_token.shape, lm_model.end_of_text_padding_id
-                    ),
-                    sampled_text_token.new_full(
-                        sampled_text_token.shape, lm_model.text_padding_token_id
-                    ),
-                )
-                sampled_text_token = torch.where(
-                    is_onset_candidate, fused_onset_token, sampled_text_token
-                )
+                # Diagnostic gate = the actual fused sampler decision. No token is
+                # overwritten in fusion mode.
+                lm_model._last_bc_result.gate = (
+                    sampled_text_token == lm_model.end_of_text_padding_id
+                ).unsqueeze(1)
             elif self.epad_control == "legacy":
                 is_pad = sampled_text_token == lm_model.text_padding_token_id
                 sampled_text_token = torch.where(

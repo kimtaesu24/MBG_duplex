@@ -56,6 +56,57 @@ def set_seed(seed: int):
 def log(level: str, msg: str):
     print(make_log(level, msg))
 
+
+def _wrap_with_system_tags(text: str) -> str:
+    """Match the original PersonaPlex offline prompt normalization."""
+    cleaned = text.strip()
+    if cleaned.startswith("<system>") and cleaned.endswith("<system>"):
+        return cleaned
+    return f"<system> {cleaned} <system>"
+
+
+def _repair_config_paths(config: dict) -> None:
+    """Replace paths from the training server with this server's known paths."""
+    finetune_dir = Path(__file__).resolve().parent
+    conversational_ai_dir = finetune_dir.parent.parent
+    replacements = {
+        ("backchannel", "vap_gpt_repo_path"):
+            str(conversational_ai_dir / "VoiceActivityProjection"),
+        ("backchannel", "vap_gpt_checkpoint"):
+            str(conversational_ai_dir / "VoiceActivityProjection" / "example"
+                / "VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt"),
+        ("face_gen", "ckpt_path"):
+            str(finetune_dir / "checkpoint_epoch_125_v7.ckpt"),
+        ("face_gen", "codec_ckpt_path"):
+            str(finetune_dir / "mimi_codec_50000.pt"),
+        ("face_gen", "codec_stats_path"):
+            str(finetune_dir / "mimi_stats.json"),
+        ("face_gen", "flame_root"):
+            "/home6/duplex/dataset/ami_flame",
+        ("data", "vap_manifest"):
+            str(conversational_ai_dir / "vap_dataset" / "manifest.json"),
+        # None makes resolve_weight() use the configured Hugging Face repository.
+        ("moshi_paths", "mimi_path"): None,
+        ("moshi_paths", "moshi_path"): None,
+        ("moshi_paths", "tokenizer_path"): None,
+    }
+
+    for (section, key), new_path in replacements.items():
+        section_cfg = config.get(section)
+        if not isinstance(section_cfg, dict) or key not in section_cfg:
+            continue
+        old_path = section_cfg.get(key)
+        if old_path is None or old_path == "":
+            continue
+        if isinstance(old_path, str) and os.path.exists(
+            os.path.expandvars(os.path.expanduser(old_path))
+        ):
+            continue
+        if old_path != new_path:
+            section_cfg[key] = new_path
+            log("warning", f"Replaced {section}.{key}: {old_path} -> {new_path}")
+
+
 def list_jsonl(jsonl_path: str):
     samples = []
     with open(jsonl_path, 'r') as f:
@@ -70,6 +121,28 @@ def _label_int_to_bits(label_int, num_bits=8):
     for i in range(num_bits):
         bits.append((label_int >> (num_bits - 1 - i)) & 1)
     return bits
+
+
+def _select_user_audio(audio: np.ndarray, audio_path: str) -> np.ndarray:
+    """Select the same user channel for inference and saved comparison audio."""
+    if audio.ndim != 2:
+        return audio[np.newaxis]
+    if audio.shape[0] != 2:
+        return audio[0:1]
+
+    is_ami_stereo = any(
+        part == "stereo_ami_balanced" or part.startswith("stereo_ami_balanced_")
+        for part in Path(audio_path).parts
+    )
+    if is_ami_stereo:
+        # This AMI test set is intentionally oriented with the user on ch1.
+        log("info", f"AMI channel order: using original ch1 as user input for {audio_path}.")
+        return audio[1:2]
+
+    # DualTalk convention: ch0=target agent, ch1=user.
+    log("info", f"Using original ch1 as user input for {audio_path}.")
+    return audio[1:2]
+
 
 def _strip_peft_prefixes(state_dict: dict) -> dict:
     """Strip training wrapper prefixes so keys match the bare LMModel namespace.
@@ -92,7 +165,23 @@ def _strip_peft_prefixes(state_dict: dict) -> dict:
     return cleaned
 
 
-def load_checkpoint(lm, ckpt_dir, lora_config: Optional[dict] = None):
+def _is_depformer_weight(key: str) -> bool:
+    """Return whether a state-dict key belongs to the complete Depformer path.
+
+    ``linears`` are the per-codebook output heads used exclusively by the
+    Depformer, so they must be restored together with the transformer and its
+    input embeddings/projections.
+    """
+    root = key.split(".", 1)[0]
+    return root == "depformer" or root.startswith("depformer_") or root == "linears"
+
+
+def load_checkpoint(
+    lm,
+    ckpt_dir,
+    lora_config: Optional[dict] = None,
+    use_pretrained_depformer: bool = False,
+):
     """Loads the finetuned checkpoint (consolidated or lora-only)."""
     consolidated_path = os.path.join(ckpt_dir, "consolidated", "consolidated.safetensors")
     lora_path = os.path.join(ckpt_dir, "consolidated", "lora.safetensors")
@@ -101,19 +190,27 @@ def load_checkpoint(lm, ckpt_dir, lora_config: Optional[dict] = None):
         log("info", f"Loading full checkpoint from {consolidated_path}")
         state_dict = safetensors.torch.load_file(consolidated_path)
         state_dict = _strip_peft_prefixes(state_dict)
+        if use_pretrained_depformer:
+            depformer_keys = {k for k in state_dict if _is_depformer_weight(k)}
+            state_dict = {k: v for k, v in state_dict.items() if k not in depformer_keys}
+            log(
+                "info",
+                f"Keeping pretrained PersonaPlex Depformer weights "
+                f"({len(depformer_keys)} checkpoint tensors skipped).",
+            )
         missing, unexpected = lm.load_state_dict(state_dict, strict=False)
         bc_dropped = [k for k in unexpected if "backchannel" in k]
         if bc_dropped and getattr(lm, "backchannel", None) is None:
-            log("warning",
-                f"Checkpoint contains {len(bc_dropped)} backchannel tensors but the module is "
-                f"DISABLED (backchannel.enable=false in config?) — weights dropped, "
-                f"inference will run BACKBONE-ONLY. Enable backchannel in the config if unintended.")
+            raise RuntimeError(
+                f"Checkpoint contains {len(bc_dropped)} backchannel tensors, but the "
+                "backchannel module is disabled by the config."
+            )
         bc_missing = [k for k in missing if "backchannel" in k]
         face_missing = [k for k in missing if "face_module" in k]
         if bc_missing:
-            log("warning", f"Backchannel keys still missing after load: {bc_missing}")
+            raise RuntimeError(f"Backchannel checkpoint keys missing: {bc_missing}")
         if face_missing:
-            log("warning", f"Face module keys still missing after load: {face_missing[:3]}")
+            raise RuntimeError(f"Face checkpoint keys missing: {face_missing[:3]}")
         if not bc_missing and not face_missing:
             log("info", "Checkpoint loaded successfully.")
 
@@ -121,6 +218,14 @@ def load_checkpoint(lm, ckpt_dir, lora_config: Optional[dict] = None):
         log("info", f"Loading LoRA checkpoint from {lora_path}")
         state_dict = safetensors.torch.load_file(lora_path)
         state_dict = _strip_peft_prefixes(state_dict)
+        if use_pretrained_depformer:
+            depformer_keys = {k for k in state_dict if _is_depformer_weight(k)}
+            state_dict = {k: v for k, v in state_dict.items() if k not in depformer_keys}
+            log(
+                "info",
+                f"Keeping pretrained PersonaPlex Depformer weights "
+                f"({len(depformer_keys)} checkpoint tensors skipped).",
+            )
 
         # 1. Load backchannel + face_module weights directly into LMModel.
         #    These modules are full-finetuned (no LoRA) and stored flat in lora.safetensors.
@@ -129,20 +234,26 @@ def load_checkpoint(lm, ckpt_dir, lora_config: Optional[dict] = None):
             return any(seg in ("backchannel", "face_module") or seg.startswith("backchannel") or seg.startswith("face_module") for seg in segments)
 
         direct_weights = {k: v for k, v in state_dict.items() if _is_direct_module_key(k)}
+        has_bc_weights = any("backchannel" in k.split(".") for k in direct_weights)
+        has_face_weights = any("face_module" in k.split(".") for k in direct_weights)
+        if getattr(lm, "backchannel", None) is not None and not has_bc_weights:
+            raise RuntimeError("Backchannel is enabled, but the checkpoint has no backchannel weights.")
+        if getattr(lm, "face_module", None) is not None and not has_face_weights:
+            raise RuntimeError("Face module is enabled, but the checkpoint has no face weights.")
         if direct_weights:
             missing, unexpected = lm.load_state_dict(direct_weights, strict=False)
             bc_dropped = [k for k in unexpected if "backchannel" in k]
             if bc_dropped and getattr(lm, "backchannel", None) is None:
-                log("warning",
-                    f"Checkpoint contains {len(bc_dropped)} backchannel tensors but the module is "
-                    f"DISABLED (backchannel.enable=false in config?) — weights dropped, "
-                    f"inference will run BACKBONE-ONLY. Enable backchannel in the config if unintended.")
+                raise RuntimeError(
+                    f"Checkpoint contains {len(bc_dropped)} backchannel tensors, but the "
+                    "backchannel module is disabled by the config."
+                )
             bc_missing = [k for k in missing if "backchannel" in k]
             face_missing = [k for k in missing if "face_module" in k]
             if bc_missing:
-                log("warning", f"Backchannel keys missing: {bc_missing}")
+                raise RuntimeError(f"Backchannel checkpoint keys missing: {bc_missing}")
             if face_missing:
-                log("warning", f"Face module keys missing: {face_missing[:3]}")
+                raise RuntimeError(f"Face checkpoint keys missing: {face_missing[:3]}")
             if not bc_missing and not face_missing:
                 log("info", f"Direct weights loaded ({len(direct_weights)} tensors).")
 
@@ -180,15 +291,21 @@ def load_checkpoint(lm, ckpt_dir, lora_config: Optional[dict] = None):
                 missing_lora, _ = peft_lm.load_state_dict(prefixed, strict=False)
                 missing_lora = [k for k in missing_lora if "lora_" in k]
                 if missing_lora:
-                    log("warning", f"Some LoRA keys missing: {missing_lora[:3]}")
+                    raise RuntimeError(
+                        f"LoRA checkpoint is incompatible; missing keys: {missing_lora[:3]}"
+                    )
                 else:
                     log("info", f"LoRA weights loaded ({len(lora_weights)} tensors).")
                 # Merge LoRA deltas into base weights and restore a plain LMModel.
                 lm = peft_lm.merge_and_unload()
-            except ImportError:
-                log("error", "LoRA weights found but PEFT is not installed.")
+            except ImportError as exc:
+                raise RuntimeError(
+                    "LoRA weights were found, but PEFT is not installed."
+                ) from exc
     else:
-        log("warning", f"No checkpoint found in {ckpt_dir}, running base model.")
+        raise FileNotFoundError(
+            f"No consolidated.safetensors or lora.safetensors found in {ckpt_dir}"
+        )
     return lm
 
 
@@ -202,6 +319,7 @@ def infer_one(
     face_gen=None,
     text_tokenizer=None,
     collect_bc_log: bool = False,
+    original_personaplex: bool = False,
 ):
     """Run offline inference for a single input WAV.
 
@@ -231,25 +349,10 @@ def infer_one(
     lm_gen.step_system_prompts(mimi)
     mimi.reset_streaming()
 
-    user_audio = lm_load_audio(inp_path, mimi.sample_rate)
-    if user_audio.ndim == 2 and user_audio.shape[0] == 2:
-        is_ami_stereo = any(
-            part == "stereo_ami_balanced" or part.startswith("stereo_ami_balanced_")
-            for part in Path(inp_path).parts
-        )
-        if is_ami_stereo:
-            # AMI source convention is ch0=utterance/user, ch1=backchannel/agent.
-            # _iterate_audio consumes the first channel, so keep AMI unchanged.
-            log("info", f"AMI channel order: using original ch0 as user input for {inp_path}.")
-        else:
-            # DualTalk source is oriented with the target agent on ch0; move its
-            # user channel to ch0 because _iterate_audio consumes only ch0.
-            log("info", f"Swapping channels for {inp_path}...")
-            user_audio = user_audio[[1, 0], :]
-    elif user_audio.ndim == 2:
-        user_audio = user_audio[0:1]
-    else:
-        user_audio = user_audio[np.newaxis]
+    user_audio = _select_user_audio(
+        lm_load_audio(inp_path, mimi.sample_rate),
+        inp_path,
+    )
 
     target_samples = user_audio.shape[-1]
     generated_frames = []
@@ -264,10 +367,18 @@ def infer_one(
     ):
         steps = user_encoded.shape[-1]
         for c in range(steps):
-            result = lm_gen.step(user_encoded[:, :, c : c + 1], return_z=True)
-            if result is None or result[0] is None:
-                continue
-            tokens, z = result
+            if original_personaplex:
+                # Original offline.py calls LMGen.step() without the lm2-only
+                # return_z extension.
+                tokens = lm_gen.step(user_encoded[:, :, c : c + 1])
+                z = None
+                if tokens is None:
+                    continue
+            else:
+                result = lm_gen.step(user_encoded[:, :, c : c + 1], return_z=True)
+                if result is None or result[0] is None:
+                    continue
+                tokens, z = result
             # LMGen computes the controller for the same token before returning it.
             # Read it immediately; delaying this lookup by one loop iteration shifts
             # every gate/fusion record one frame away from the token it controlled.
@@ -356,7 +467,14 @@ def infer_one(
 
 
 def run_test_inference(args):
-    set_seed(args.seed)
+    # Base-model mode keeps the lm2 classes but follows the original PersonaPlex
+    # sampling/step path. Prompt formatting remains independently selectable.
+    original_personaplex = args.base_model_only
+    seed = args.seed
+    if seed is None:
+        seed = -1 if original_personaplex else 42
+    if seed != -1:
+        set_seed(seed)
     device = args.device
     if device.startswith("cuda") and not torch.cuda.is_available():
         log("warning", "CUDA requested but not available — falling back to CPU.")
@@ -373,6 +491,27 @@ def run_test_inference(args):
     log("info", f"Reading config from {args.config}")
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+    if not args.no_auto_fix_config_paths:
+        _repair_config_paths(config)
+    if original_personaplex:
+        config.setdefault("backchannel", {})["enable"] = False
+        config.setdefault("face_gen", {})["enable"] = False
+        args.ckpt_dir = None
+        log(
+            "info",
+            "Pretrained-only mode: finetuned checkpoint, backchannel, and face module disabled.",
+        )
+    if original_personaplex:
+        log("info", "Original PersonaPlex compatibility branch enabled (using lm2 classes).")
+    elif args.ckpt_dir:
+        checkpoint_files = (
+            Path(args.ckpt_dir) / "consolidated" / "consolidated.safetensors",
+            Path(args.ckpt_dir) / "consolidated" / "lora.safetensors",
+        )
+        if not any(path.is_file() for path in checkpoint_files):
+            raise FileNotFoundError(
+                f"No checkpoint weights found under --ckpt-dir: {args.ckpt_dir}"
+            )
         
     path_cfg = config.get("moshi_paths", {})
     hf_repo = path_cfg.get("hf_repo_id") or loaders.DEFAULT_REPO
@@ -395,7 +534,7 @@ def run_test_inference(args):
     mimi = loaders.get_mimi(mimi_weight, device)
     other_mimi = loaders.get_mimi(mimi_weight, device)
     # VAP tokenization용 별도 인스턴스 — streaming_forever를 호출하지 않아 batch 크기 제약 없음
-    vap_mimi = loaders.get_mimi(mimi_weight, device)
+    vap_mimi = None if original_personaplex else loaders.get_mimi(mimi_weight, device)
     
     # 2) Load Text Tokenizer
     tokenizer_path = resolve_weight("tokenizer_path", loaders.TEXT_TOKENIZER_NAME)
@@ -422,6 +561,8 @@ def run_test_inference(args):
         loaders._lm_kwargs["backchannel_gumbel_temp_init"] = bc_cfg.get("gumbel_temp_init", 1.0)
         loaders._lm_kwargs["backchannel_gumbel_temp_min"] = bc_cfg.get("gumbel_temp_min", 0.5)
         loaders._lm_kwargs["backchannel_gumbel_anneal_rate"] = bc_cfg.get("gumbel_anneal_rate", 0.0001)
+        loaders._lm_kwargs["backchannel_pad_token_id"] = bc_cfg.get("pad_token_id", 3)
+        loaders._lm_kwargs["backchannel_epad_token_id"] = bc_cfg.get("epad_token_id", 0)
         if bc_cfg.get("module_type", "mlp") == "vap_gpt":
             loaders._lm_kwargs["backchannel_vap_repo_path"] = bc_cfg.get("vap_gpt_repo_path", "")
             loaders._lm_kwargs["backchannel_vap_checkpoint"] = bc_cfg.get("vap_gpt_checkpoint", None)
@@ -429,11 +570,14 @@ def run_test_inference(args):
             loaders._lm_kwargs["backchannel_vap_cross_layers"] = bc_cfg.get("vap_gpt_cross_layers", 3)
             loaders._lm_kwargs["backchannel_vap_num_heads"] = bc_cfg.get("vap_gpt_num_heads", 4)
             loaders._lm_kwargs["backchannel_vap_dropout"] = bc_cfg.get("vap_gpt_dropout", 0.1)
+            loaders._lm_kwargs["backchannel_vap_use_silence_ctx_proj"] = bc_cfg.get(
+                "use_silence_ctx_proj", True
+            )
         log("info", f"Backchannel module enabled (type={bc_cfg.get('module_type', 'mlp')}).")
     else:
         loaders._lm_kwargs["backchannel_enabled"] = False
         log("info", "Backchannel VAP module disabled.")
-        if args.epad_control != "none":
+        if not original_personaplex and args.epad_control != "none":
             log("warning", f"--epad-control={args.epad_control} has no effect without "
                            "the backchannel module; using backbone output unchanged.")
         if args.suppress_epad:
@@ -466,41 +610,50 @@ def run_test_inference(args):
     
     # Apply fine-tuned checkpoint
     if args.ckpt_dir:
-        lm = load_checkpoint(lm, args.ckpt_dir, config.get("lora", {}))
+        lm = load_checkpoint(
+            lm,
+            args.ckpt_dir,
+            config.get("lora", {}),
+            use_pretrained_depformer=args.use_pretrained_depformer,
+        )
     
     lm.eval()
     log("info", "Model loaded successfully.")
     
     # 4) Construct LMGen
     frame_size = int(mimi.sample_rate / mimi.frame_rate)
-    lm_gen = LMGen(
-        lm,
+    lm_gen_kwargs = dict(
         audio_silence_frame_cnt=int(0.5 * mimi.frame_rate),
         sample_rate=mimi.sample_rate,
         device=device,
         frame_rate=mimi.frame_rate,
         use_sampling=True,
-        temp=0.8,
+        temp=args.temp_audio,
         temp_text=args.temp_text,
-        top_k=250,
+        top_k=args.top_k_audio,
         top_k_text=args.top_k_text,
-        mimi=mimi,
-        suppress_epad=args.suppress_epad,
-        bc_context_frames=max(
-            1, int(round(float(config.get("duration_sec", 10.0)) * mimi.frame_rate))
-        ),
-        epad_control=args.epad_control,
-        fusion_bc_weight=args.fusion_bc_weight,
-        fusion_vap_weight=args.fusion_vap_weight,
-        fusion_vad_weight=args.fusion_vad_weight,
-        fusion_threshold=args.fusion_threshold,
     )
-    log(
-        "info",
-        f"EPAD control={args.epad_control}, bc_weight={args.fusion_bc_weight}, "
-        f"vap_weight={args.fusion_vap_weight}, vad_weight={args.fusion_vad_weight}, "
-        f"threshold={args.fusion_threshold}, context_frames={lm_gen.bc_context_frames}",
-    )
+    if not original_personaplex:
+        lm_gen_kwargs.update(
+            mimi=mimi,
+            suppress_epad=args.suppress_epad,
+            bc_context_frames=max(
+                1, int(round(float(config.get("duration_sec", 10.0)) * mimi.frame_rate))
+            ),
+            epad_control=args.epad_control,
+            fusion_bc_weight=args.fusion_bc_weight,
+            fusion_vap_weight=args.fusion_vap_weight,
+            fusion_vad_weight=args.fusion_vad_weight,
+            fusion_threshold=args.fusion_threshold,
+        )
+    lm_gen = LMGen(lm, **lm_gen_kwargs)
+    if not original_personaplex:
+        log(
+            "info",
+            f"EPAD control={args.epad_control}, bc_weight={args.fusion_bc_weight}, "
+            f"vap_weight={args.fusion_vap_weight}, vad_weight={args.fusion_vad_weight}, "
+            f"context_frames={lm_gen.bc_context_frames}",
+        )
     
     # Set streaming mode (critical for LMGen to work)
     mimi.streaming_forever(1)
@@ -539,12 +692,23 @@ def run_test_inference(args):
             "All samples will use the default voice prompt. "
             "To use per-sample voice prompts, pass data_with_voice_sample.jsonl as --test-jsonl.")
 
-    text_prompt = config.get("text_prompt", "")
-    lm_gen.text_prompt_tokens = text_tokenizer.encode(text_prompt) if text_prompt else []
+    text_prompt = (
+        args.text_prompt
+        if args.text_prompt is not None
+        else config.get("text_prompt", "")
+    )
+    lm_gen.text_prompt_tokens = (
+        text_tokenizer.encode(_wrap_with_system_tags(text_prompt))
+        if text_prompt else None
+    )
     if text_prompt:
-        log("info", f"텍스트 프롬프트 적용 ({len(lm_gen.text_prompt_tokens)}토큰): {text_prompt!r}")
+        log(
+            "info",
+            f"텍스트 프롬프트 적용 "
+            f"({len(lm_gen.text_prompt_tokens)}토큰): {text_prompt!r}",
+        )
     else:
-        log("info", "텍스트 프롬프트 없음 (config에 text_prompt 미설정)")
+        log("info", "텍스트 프롬프트 없음")
 
     # 5-a) Use the end-to-end trained face_module from the finetuned checkpoint.
     # lm.face_module was instantiated with pretrained weights by get_moshi_lm()
@@ -581,26 +745,26 @@ def run_test_inference(args):
     # Resolve base directory for relative WAV paths in the jsonl
     jsonl_dir = os.path.dirname(os.path.abspath(args.test_jsonl))
     
-    # Initialize tokenizer fully to get vap_targets
-    from finetune.data.interleaver import Interleaver, InterleavedTokenizer
-    interleaver = Interleaver(
-        text_tokenizer,
-        mimi.frame_rate,
-        lm.text_padding_token_id,
-        lm.end_of_text_padding_id,
-        lm.zero_token_id,
-        keep_main_only=True,
-    )
-    # Using 15s duration arbitrarily to fetch codes and VAP targets.
-    # The VAP manifest (can be >1 GB) is only consumed by the GT-VAP comparison
-    # section, which is gated on bc_enabled — skip loading it entirely when the
-    # backchannel module is disabled.
-    interleaved_tokenizer = InterleavedTokenizer(
-        vap_mimi, interleaver, duration_sec=config.get("duration_sec", 15.0),
-        vap_manifest_path=(config.get("data", {}).get("vap_manifest", "") if bc_enabled else ""),
-        flame_root=face_cfg.get("flame_root", "") if face_cfg.get("enable", False) else "",
-        flame_speaker=face_cfg.get("flame_speaker", "bc"),
-    )
+    interleaved_tokenizer = None
+    if bc_enabled:
+        # Only the optional GT-VAP comparison needs the training tokenizer.
+        from finetune.data.interleaver import Interleaver, InterleavedTokenizer
+        interleaver = Interleaver(
+            text_tokenizer,
+            mimi.frame_rate,
+            lm.text_padding_token_id,
+            lm.end_of_text_padding_id,
+            lm.zero_token_id,
+            keep_main_only=True,
+        )
+        interleaved_tokenizer = InterleavedTokenizer(
+            vap_mimi,
+            interleaver,
+            duration_sec=config.get("duration_sec", 15.0),
+            vap_manifest_path=config.get("data", {}).get("vap_manifest", ""),
+            flame_root=face_cfg.get("flame_root", "") if face_cfg.get("enable", False) else "",
+            flame_speaker=face_cfg.get("flame_speaker", "bc"),
+        )
     
     for i, sample in enumerate(samples):
         input_wav = sample["path"]
@@ -640,18 +804,15 @@ def run_test_inference(args):
             face_gen=face_gen,
             text_tokenizer=text_tokenizer,
             collect_bc_log=bc_enabled,
+            original_personaplex=original_personaplex,
         )
 
         if has_audio:
-            # Reload input audio for saving _input.wav / _merged.wav.
-            # user ch = original ch1 (before the [1,0] swap applied inside infer_one).
-            raw_audio = lm_load_audio(input_wav, mimi.sample_rate)
-            if raw_audio.ndim == 2 and raw_audio.shape[0] == 2:
-                input_pcm = raw_audio[1]
-            elif raw_audio.ndim == 2:
-                input_pcm = raw_audio[0]
-            else:
-                input_pcm = raw_audio
+            # Save the exact same user channel that was fed to inference.
+            input_pcm = _select_user_audio(
+                lm_load_audio(input_wav, mimi.sample_rate),
+                input_wav,
+            )[0]
 
             # 1) Save input WAV (mono)
             out_input_wav = os.path.join(args.output_dir, f"{base_name}_input.wav")
@@ -753,10 +914,27 @@ def run_test_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test Dataset Inference")
-    parser.add_argument("--config", type=str, default="./output/exp_vap_base/args.yaml", help="Path to args.yaml or training config yaml")
-    parser.add_argument("--test-jsonl", type=str, default='./data/dualtalk/test/data.jsonl', help="Path to data.jsonl for the test dataset")
-    parser.add_argument("--output-dir", type=str, default="./result/exp_vap_base", help="Directory to save generated outputs")
-    parser.add_argument("--ckpt-dir", type=str, default="./output/exp_vap_base/checkpoints/checkpoint_002000", help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument("--config", type=str, default="./output/exp1_backbone_only/args.yaml", help="Path to args.yaml or training config yaml")
+    parser.add_argument(
+        "--no-auto-fix-config-paths",
+        action="store_true",
+        help="Disable automatic rebasing of missing paths copied from another server.",
+    )
+    parser.add_argument("--test-jsonl", type=str, default='./experiments_ami/ami_test_10.jsonl', help="Path to data.jsonl for the test dataset")
+    parser.add_argument("--output-dir", type=str, default="./result/exp1_backbone_only/400", help="Directory to save generated outputs")
+    parser.add_argument("--ckpt-dir", type=str, default="./output/exp1_backbone_only/checkpoints/checkpoint_000400", help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument(
+        "--base-model-only",
+        action="store_true",
+        help="Use pretrained PersonaPlex weights with lm2 while following the original "
+             "offline inference behavior; disables checkpoint/backchannel/face modules.",
+    )
+    parser.add_argument(
+        "--use-pretrained-depformer",
+        action="store_true",
+        help="Keep the Depformer (including its embeddings/input projections and output heads) "
+             "from the pretrained PersonaPlex/Moshi model instead of loading it from --ckpt-dir.",
+    )
     parser.add_argument("--sample-idx", type=int, default=None, help="Process only a specific index in the JSONL")
     parser.add_argument("--input-wav", type=str, default=None, help="Process only a specific WAV path in the JSONL")
     parser.add_argument("--device", type=str, default="cuda",
@@ -769,15 +947,26 @@ if __name__ == "__main__":
                         help="Disable the voice prompt entirely (no NATM1 fallback). Use when the "
                              "training data had no voice_sample entries (e.g. DualTalk) so the "
                              "inference context matches training.")
+    parser.add_argument(
+        "--text-prompt",
+        type=str,
+        default=None,
+        help="Override config.text_prompt; PersonaPlex <system> tags are added if missing.",
+    )
+    parser.add_argument("--temp-audio", type=float, default=0.8,
+                        help="Audio sampling temperature (PersonaPlex default: 0.8).")
+    parser.add_argument("--top-k-audio", type=int, default=250,
+                        help="Audio sampling top-k (PersonaPlex default: 250).")
     parser.add_argument("--temp-text", type=float, default=0.7, help="Text sampling temperature.")
     parser.add_argument("--top-k-text", type=int, default=25, help="Text sampling top-k.")
     parser.add_argument("--suppress-epad", action="store_true",
                         help="Force [EPAD] → [PAD] whenever g_final=0 (VAP says don't speak). "
                              "Legacy mode only; word tokens in progress are never replaced.")
     parser.add_argument(
-        "--epad-control", choices=("none", "legacy", "fusion"), default="fusion",
+        "--epad-control", choices=("none", "legacy", "fusion"), default="none",
         help="EPAD controller: none=backbone only, legacy=hard BC-head gate, "
-             "fusion=training-free implicit/explicit log-odds fusion (default).",
+             "fusion=training-free BC/VAP/VAD residual on the backbone EPAD logit "
+             "followed by normal text sampling (default).",
     )
     parser.add_argument("--fusion-bc-weight", type=float, default=1.0,
                         help="Weight on explicit BC EPAD-vs-PAD log-odds.")
@@ -786,8 +975,15 @@ if __name__ == "__main__":
     parser.add_argument("--fusion-vad-weight", type=float, default=0.0,
                         help="Optional weight on user-quiet VAD log-odds.")
     parser.add_argument("--fusion-threshold", type=float, default=0.5,
-                        help="EPAD onset threshold applied to the fused probability.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+                        help="Deprecated compatibility option; residual fusion samples "
+                             "from adjusted logits and does not use a hard threshold.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed. Defaults to 42 for finetuned/lm2 inference and -1 "
+             "(unseeded) for --base-model-only.",
+    )
     parser.add_argument("--world-size", type=int, default=1, help="Total number of processes for inference")
     parser.add_argument("--rank", type=int, default=0, help="Rank of the current process")
     

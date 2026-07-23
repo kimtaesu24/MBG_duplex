@@ -1172,7 +1172,11 @@ def compute_loss(model, codec, batch, args, autocast_dtype=None, ss_prob=None):
             for _ in range(max(1, int(getattr(args, "ss_passes", 1)))):
                 with torch.autocast(device_type="cuda", dtype=autocast_dtype,
                                     enabled=autocast_dtype is not None):
-                    out0 = model(audio_feat, prev_mixed, llm_feat=llm_feat,
+                    # This rollout is deliberately no-grad and only constructs
+                    # the history for the one gradient-carrying forward below.
+                    # Bypass DDP here: invoking the wrapper twice before one
+                    # backward can rebuild/mark reducer buckets twice.
+                    out0 = raw_model(audio_feat, prev_mixed, llm_feat=llm_feat,
                                  eos_mask=eos_mask, blink_cond=blink_cond)
                 prev_self = shifted_motion(out0["pred_motion"].float(), raw_model)
                 prev_mixed = torch.where(mix, prev_self, prev)
@@ -1267,6 +1271,20 @@ def compute_loss(model, codec, batch, args, autocast_dtype=None, ss_prob=None):
             + args.blink_weight * loss_blink
             + getattr(args, "blink_ap_weight", 0.0) * loss_blink_ap
         )
+        if isinstance(model, DDP):
+            # Some v7 parameters are deliberately conditional (blink/EOS), and
+            # start_motion/spec_feat_head also participate through helper loss
+            # paths outside DDP.forward.  Dynamic unused-parameter discovery
+            # misclassifies the latter, while static_graph is invalid because
+            # the blink path can change between iterations.  Attach one
+            # mathematically-zero scalar from every trainable parameter so the
+            # reducer receives exactly one ready hook per parameter.  This does
+            # not alter the objective, model outputs, or checkpoint structure.
+            ddp_anchor = loss.new_zeros(())
+            for parameter in model.parameters():
+                if parameter.requires_grad:
+                    ddp_anchor = ddp_anchor + parameter.reshape(-1)[0] * 0.0
+            loss = loss + ddp_anchor
     return loss, {
         "loss": float(loss.detach().item()),
         "motion": float(loss_motion.detach().item()),
@@ -1473,10 +1491,13 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--codec-ckpt",
-        default="/home6/duplex/VAE_ami_dualtalk/checkpoints/iter_100000.pt",
+        default=(
+            "/home6/duplex/personaplex/moshi/moshi/ARTalk/train_code/outputs/"
+            "ARTalkCodecMimi54_MimiFlame54/Jul21_0944_empng/checkpoints/iter_50000.pt"
+        ),
     )
-    p.add_argument("--stats-path", default="/home6/duplex/dataset/artalk_mimi54_stats.json")
-    p.add_argument("--output-dir", default="/home6/duplex/personaplex/moshi/moshi/ARTalk/train_code/outputs/SoftVQ_v7_rollout")
+    p.add_argument("--stats-path", default="/home6/duplex/dataset/artalk_mimi54_unils_stats.json")
+    p.add_argument("--output-dir", default="/home6/duplex/personaplex/moshi/moshi/ARTalk/train_code/outputs/SoftVQ_v7_unils")
     p.add_argument("--resume", default="",
                    help="resume/fine-tune from a checkpoint .ckpt (loads model weights only, "
                         "strict=False so new params like eos_embed start fresh; no optimizer state "
@@ -1489,14 +1510,14 @@ def parse_args():
     p.add_argument("--ami-ut-mimi-root", default="/home6/duplex/dataset/mimi_emb")
     p.add_argument("--unils-root", default="/home6/duplex/dataset/unils/SeamlessInteractionTalk/flame56")
     p.add_argument("--unils-mimi-root", default="/home6/duplex/dataset/mimi_emb/unils")
-    p.add_argument("--sources", default="dualtalk,ami_bc,ami_ut")
+    p.add_argument("--sources", default="unils")
     p.add_argument("--length-mismatch-csv", default="/home6/duplex/dataset/artalk_mimi54_length_mismatches.csv")
-    p.add_argument("--epochs", type=int, default=5000)
-    p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=800)
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--clip-length", type=int, default=100)
     p.add_argument("--stride", type=int, default=50)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16")
@@ -1537,23 +1558,23 @@ def parse_args():
                         "its expected embedding is injected into the motion path")
     p.add_argument("--spec-feat-weight", type=float, default=0.1,
                    help="weight of the token->audio_h grounding loss used by speculative decode")
-    p.add_argument("--chunk-frames", type=int, default=1,
+    p.add_argument("--chunk-frames", type=int, default=4,
                    help="block-causal audio context: each frame sees its chunk-frame block "
                         "of real future audio (1 = original strictly-causal model)")
-    p.add_argument("--eos-prob", type=float, default=0.0,
+    p.add_argument("--eos-prob", type=float, default=0.25,
                    help="fraction of training samples augmented with an end-of-audio (EOS) "
                         "tail: audio cut + last pose held, so the model settles at turn-end "
                         "(0 disables; inference auto-uses EOS past the provided audio)")
     # Stochastic blink event head (blinks are audio-independent -> deterministic
     # regression never initiates them in AR; see the model-class comment).
-    p.add_argument("--blink-weight", type=float, default=0.0,
+    p.add_argument("--blink-weight", type=float, default=0.1,
                    help="weight of the blink-event BCE loss; > 0 also teacher-forces the GT "
                         "blink flag into the motion path (0 = feature off, old behaviour)")
     p.add_argument("--blink-pos-weight", type=float, default=10.0,
                    help="BCE positive-class weight (closed frames are ~3-6%% of data)")
     p.add_argument("--blink-thresh", type=float, default=0.6,
                    help="a frame counts as blinking when eyelid aperture < thresh x clip median")
-    p.add_argument("--blink-ap-weight", type=float, default=0.0,
+    p.add_argument("--blink-ap-weight", type=float, default=0.1,
                    help="weight of the differentiable eyelid-aperture L1 (mm, via the linear "
                         "probe) on the final output -- forces blink closure DEPTH, which the "
                         "expr L1 alone trains too slowly (0 = off)")
@@ -1586,20 +1607,20 @@ def parse_args():
                         "prompt; 0 = corrupt anywhere)")
     p.add_argument("--spec-topk", type=int, default=4,
                    help="number of candidate tokens kept per frame in speculative decoding")
-    p.add_argument("--ar-eval-frames", type=int, default=250,
+    p.add_argument("--ar-eval-frames", type=int, default=400,
                    help="cap autoregressive eval length during validation (0 = full sequence)")
     p.add_argument("--val-speculative", action=argparse.BooleanOptionalAction, default=True,
                    help="also run cached speculative decode during validation")
-    p.add_argument("--val-batches", type=int, default=0)
-    p.add_argument("--val-every-epochs", type=int, default=100)
-    p.add_argument("--save-val-samples", type=int, default=0)
-    p.add_argument("--save-every-epochs", type=int, default=100)
-    p.add_argument("--stream-context-frames", type=int, default=25)
+    p.add_argument("--val-batches", type=int, default=16)
+    p.add_argument("--val-every-epochs", type=int, default=25)
+    p.add_argument("--save-val-samples", type=int, default=4)
+    p.add_argument("--save-every-epochs", type=int, default=25)
+    p.add_argument("--stream-context-frames", type=int, default=50)
     p.add_argument("--max-train-batches", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--wandb-project", default="NIPS_duplex_SoftVQ_Continuous")
-    p.add_argument("--wandb-run-name", default="softvq_v7_rollout")
+    p.add_argument("--wandb-run-name", default="softvq_v7_unils")
     args = p.parse_args()
     if not args.codec_ckpt:
         raise ValueError("--codec-ckpt is required")
@@ -1700,7 +1721,12 @@ def main():
                 "run: python prepare_eyelid_probe.py"
             )
     if ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16")
     autocast_dtype = torch.bfloat16 if args.precision == "bf16" else (torch.float16 if args.precision == "fp16" else None)
