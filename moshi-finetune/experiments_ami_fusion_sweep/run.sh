@@ -7,16 +7,16 @@
 #   GPU_ID=0 SEED=42 bash experiments_ami_fusion_sweep/run.sh
 set -uo pipefail
 
-ROOT=/home/s20235100/MBG_duplex/moshi-finetune
-EXPDIR="$ROOT/experiments_ami_fusion_sweep"
-PY=/home/s20235100/.conda/envs/plex/bin/python
+ROOT=/home2/s20235100/Conversational-AI/personaplex_MBG/moshi-finetune
+EXPDIR="$ROOT/experiments_ami_fusion_sweep_2e-5"
+PY=/home2/s20235100/miniconda3/envs/plex/bin/python
 GPU="${GPU_ID:-0}"
 SEED="${SEED:-42}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 CONFIG="$ROOT/experiments_ami/configs/ami_vap_base.yaml"
-CKPT="$ROOT/output/ami_exp_ami_vap_base/checkpoints/checkpoint_000800"
+CKPT="$ROOT/output/hyades/output/ami_vap_2e-5/checkpoints/checkpoint_000500"
 TEST_JSONL="$ROOT/experiments_ami/ami_test_10.jsonl"
-OUT_ROOT="$ROOT/result/ami_fusion_sweep_$RUN_TAG"
+OUT_ROOT="$ROOT/result/ami_fusion_sweep_2e-5_$RUN_TAG"
 LOGDIR="$EXPDIR/logs/$RUN_TAG"
 
 cd "$ROOT"
@@ -66,8 +66,8 @@ run_setting() {
 failed=0
 
 # Baselines: implicit backbone only and the previous explicit hard-gate policies.
-run_setting implicit_only --epad-control none || failed=$((failed + 1))
-run_setting legacy_inject --epad-control legacy || failed=$((failed + 1))
+# run_setting implicit_only --epad-control none || failed=$((failed + 1))
+# run_setting legacy_inject --epad-control legacy || failed=$((failed + 1))
 # Main ablation: change only the explicit BC evidence weight.
 run_setting fusion_bc005 --epad-control fusion --fusion-bc-weight 0.05 || failed=$((failed + 1))
 run_setting fusion_bc010 --epad-control fusion --fusion-bc-weight 0.10 || failed=$((failed + 1))

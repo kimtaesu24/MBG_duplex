@@ -10,7 +10,7 @@ run_dir: ./output/exp1_backbone_only
 overwrite_run_dir: true
 
 wandb:
-  project: "personaplex_finetune_AAAI"
+  project: "personaplex_finetune_AAAI_ami"
   run_name: "exp1_backbone_only"
 
 # ── 데이터 ────────────────────────────────────────────────────────────────
@@ -26,8 +26,8 @@ moshi_paths:
 
 # ── 학습 설정 (single GPU) ───────────────────────────────────────────────
 max_steps: 2000
-batch_size: 2
-num_microbatches: 64
+batch_size: 64
+num_microbatches: 2
 duration_sec: 10
 
 lora:
@@ -54,17 +54,17 @@ ckpt_keep_best_n: 3
 
 # ── 옵티마이저 ────────────────────────────────────────────────────────────
 optim:
-  lr: 1.0e-5
+  lr: 2.0e-5
   weight_decay: 0.1
   pct_start: 0.05
 
 # ── 손실 가중치 ───────────────────────────────────────────────────────────
 text_padding_weight: 0.5
-epad_weight: 2.0
+epad_weight: 1.0
 first_codebook_weight_multiplier: 1.0
 
 # ── 텍스트 프롬프트 ───────────────────────────────────────────────────────
-text_prompt: "<system> [Attentive Mode] You are an attentive and supportive listener. You specialize in active listening, providing calm and consistent backchannels to support the speaker's flow without leading the conversation. <system>"
+text_prompt: "<system> [Casual Mode] You are a warm and reactive partner. You talk like a close friend, using enthusiastic backchannels and contributing small talk to keep the mood light and fun. <system>"
 
 # ── VAP / Face 모듈 비활성 (backbone only) ───────────────────────────────
 backchannel:
