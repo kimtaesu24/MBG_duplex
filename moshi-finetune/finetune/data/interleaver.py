@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import re
@@ -16,6 +17,9 @@ import torch
 # does not use condition tensors, so this is only needed as a type placeholder.
 from dataclasses import field
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -676,13 +680,23 @@ class InterleavedTokenizer:
             if arr.dtype == object:
                 # Array of per-frame dicts → parse each frame
                 motion_list = []
-                for frame in arr:
+                for frame_idx, frame in enumerate(arr):
                     expr = np.asarray(frame.get("expr", []), dtype=np.float32)
                     if expr.shape[0] < 50:
-                        expr = np.pad(expr, (0, 50 - expr.shape[0]))
+                        raise ValueError(
+                            f"FLAME frame {frame_idx} has only {expr.shape[0]} expression "
+                            f"coefficients (expected >=50): {flame_path}"
+                        )
                     expr = expr[:50]
-                    jaw = np.asarray(frame.get("jaw_pose", [0.0, 0.0, 0.0]), dtype=np.float32)[:1]
-                    neck = np.asarray(frame.get("neck_pose", [0.0, 0.0, 0.0]), dtype=np.float32)[:3]
+                    jaw_raw = np.asarray(frame.get("jaw_pose", []), dtype=np.float32)
+                    neck_raw = np.asarray(frame.get("neck_pose", []), dtype=np.float32)
+                    if jaw_raw.shape[0] < 1 or neck_raw.shape[0] < 3:
+                        raise ValueError(
+                            f"FLAME frame {frame_idx} is missing jaw/neck pose values: "
+                            f"{flame_path}"
+                        )
+                    jaw = jaw_raw[:1]
+                    neck = neck_raw[:3]
                     motion_list.append(np.concatenate([expr, jaw, neck]))
                 motion = np.stack(motion_list, axis=0).astype(np.float32)
             else:
@@ -690,17 +704,39 @@ class InterleavedTokenizer:
                 if motion.shape[-1] == 56:
                     # 56-dim (expr50 + jaw3 + neck3) → 54-dim (expr50 + jaw1 + neck3)
                     motion = np.concatenate([motion[..., :50], motion[..., 50:51], motion[..., 53:56]], axis=-1)
-                elif motion.shape[-1] > 54:
-                    motion = motion[..., :54]
-        except Exception:
+                elif motion.shape[-1] != 54:
+                    raise ValueError(
+                        f"Unsupported FLAME dimension {motion.shape[-1]} (expected 54 or 56): "
+                        f"{flame_path}"
+                    )
+        except Exception as exc:
+            logger.warning(
+                "[FLAME] Skipping sample because target could not be read: "
+                f"audio={audio_path}, flame={flame_path}, error={type(exc).__name__}: {exc}"
+            )
             return None
 
         if motion.ndim != 2 or motion.shape[-1] != 54:
+            logger.warning(
+                "[FLAME] Skipping sample with invalid target shape: "
+                f"audio={audio_path}, flame={flame_path}, shape={motion.shape}, expected=[T,54]"
+            )
+            return None
+        if not np.isfinite(motion).all():
+            logger.warning(
+                "[FLAME] Skipping sample because target contains NaN/Inf: "
+                f"audio={audio_path}, flame={flame_path}"
+            )
             return None
 
         # Slice temporal window matching the audio segment.
         end_frame = start_frame + n_face_frames
         if start_frame >= motion.shape[0]:
+            logger.warning(
+                "[FLAME] Skipping out-of-range segment: "
+                f"audio={audio_path}, flame={flame_path}, start={start_frame}, "
+                f"available_frames={motion.shape[0]}"
+            )
             return None
         window = motion[start_frame:end_frame]
         if window.shape[0] < n_face_frames:

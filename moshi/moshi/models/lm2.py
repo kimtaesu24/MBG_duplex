@@ -32,7 +32,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from os.path import splitext
+from os.path import isfile, splitext
 import logging
 import numpy as np
 import sys
@@ -298,6 +298,10 @@ class LMModel(StreamingContainer):
         face_module_code_dim: int = 32,
         face_module_prior_warmup_frames: int = 10,
         face_module_version: int = 1,
+        face_module_ss_prob: float = 0.0,
+        face_module_ss_ramp_steps: int = 0,
+        face_module_ss_start_step: int = 0,
+        face_module_ss_keep_head_frames: int = 0,
         # ── Mimi Model for internal audio decoding (server) ──────────────────
         # Used by the face module to decode agent audio from predicted logits.
         mimi_enabled: bool = False,
@@ -311,6 +315,10 @@ class LMModel(StreamingContainer):
         self.dep_q = dep_q
         self.card = card
         self.text_card = text_card
+        self.face_module_ss_prob = float(face_module_ss_prob)
+        self.face_module_ss_ramp_steps = int(face_module_ss_ramp_steps)
+        self.face_module_ss_start_step = int(face_module_ss_start_step)
+        self.face_module_ss_keep_head_frames = int(face_module_ss_keep_head_frames)
         assert len(delays) == self.num_codebooks, "unexpected number of delays"
         self.delays = delays
         self.dim = dim
@@ -442,9 +450,22 @@ class LMModel(StreamingContainer):
 
         # ── Face Generation Module ────────────────────────────────────────────
         self.face_module = None
+        if face_module_enabled and not face_module_dir:
+            raise ValueError(
+                "face_module_enabled=True requires a non-empty face_module_dir"
+            )
         if face_module_enabled and face_module_dir:
             if face_module_dir not in sys.path:
                 sys.path.insert(0, face_module_dir)
+            if face_module_checkpoint is None:
+                raise ValueError(
+                    "face_module_enabled=True requires face_module_checkpoint; "
+                    "refusing to train an uninitialised face module."
+                )
+            if not isfile(face_module_checkpoint):
+                raise FileNotFoundError(
+                    f"Required face checkpoint does not exist: {face_module_checkpoint}"
+                )
             try:
                 # Version switch: v2 (softvq_continuous_online_train_v2) adds blink
                 # modelling, block-causal audio chunks and MTP look-ahead over v1.
@@ -492,14 +513,29 @@ class LMModel(StreamingContainer):
                         use_vap=bool(ckpt_args.get("use_vap", True)),
                     )
                 face_net = _FaceModel(**_face_kwargs)
-                if face_module_checkpoint is not None:
-                    face_net.load_state_dict(_raw["model"])
-                    logger.info(f"[LMModel] Face module loaded from: {face_module_checkpoint}")
+                if "model" not in _raw:
+                    raise KeyError(
+                        f"Face checkpoint has no 'model' state dict: {face_module_checkpoint}"
+                    )
+                face_net.load_state_dict(_raw["model"], strict=True)
+                # Reset only the newly connected v7 LLM-feature residual after
+                # loading the standalone face checkpoint. This guarantees that
+                # end-to-end step 0 reproduces the pretrained audio-only model.
+                if int(face_module_version) >= 7:
+                    if not hasattr(face_net, "llm_proj"):
+                        raise AttributeError("v7 face model is missing required llm_proj")
+                    torch.nn.init.zeros_(face_net.llm_proj.weight)
+                    if face_net.llm_proj.bias is not None:
+                        torch.nn.init.zeros_(face_net.llm_proj.bias)
+                    logger.info("[LMModel] v7 llm_proj zero-initialized after checkpoint load.")
+                logger.info(f"[LMModel] Face module loaded from: {face_module_checkpoint}")
                 self.face_module = face_net
                 logger.info("[LMModel] Face generation module initialized as submodule.")
             except Exception as _e:
-                logger.warning(f"[LMModel] Face module initialization failed: {_e}. Proceeding without face module.")
-                self.face_module = None
+                raise RuntimeError(
+                    f"Face module initialization failed for {face_module_checkpoint}; "
+                    "training cannot continue without the requested face branch."
+                ) from _e
 
         # ── Internal Mimi for face audio decoding (server) ──────────────────
         # Each rank holds a frozen full copy (small model — no FSDP needed).
@@ -851,12 +887,22 @@ class LMModel(StreamingContainer):
         face_pred = None
         face_outputs = None
 
+        if self.training and self.face_module is None and gt_face_motion is not None:
+            raise RuntimeError(
+                "Face ground truth was provided but face_module is unavailable."
+            )
+
         if self.face_module is not None:
             # 1. Determine expected motion dim and whether this batch has valid data.
             valid_face_batch = True
             dummy_B = max(B, 1)
 
             if gt_face_motion is None:
+                if self.training:
+                    raise RuntimeError(
+                        "Face training requires gt_face_motion for every batch; "
+                        "refusing to run a dummy zero-motion pass."
+                    )
                 valid_face_batch = False
                 expected_dim = getattr(
                     getattr(self.face_module, "module", self.face_module),
@@ -895,6 +941,12 @@ class LMModel(StreamingContainer):
                 # Fallback: use externally provided audio_feat (teacher-forced).
                 audio_feat_run = audio_feat
 
+            if self.training and audio_feat_run is None:
+                raise RuntimeError(
+                    "Face training requires either mimi for generated audio features "
+                    "or a teacher-forced audio_feat tensor; neither was provided."
+                )
+
             # 3. Build prev_motion for teacher forcing, or create dummy tensors.
             if valid_face_batch:
                 start = torch.zeros(
@@ -916,9 +968,43 @@ class LMModel(StreamingContainer):
 
             # 4. Forward the face module (always, for FSDP sync).
             if audio_feat_run is not None:
+                # Exposure-bias mitigation: use a no-grad teacher-forced pass to
+                # replace a scheduled fraction of GT history with self history.
+                ss_prob = 0.0
+                if self.training and valid_face_batch and self.face_module_ss_prob > 0.0:
+                    if step > self.face_module_ss_start_step:
+                        if self.face_module_ss_ramp_steps > 0:
+                            progress = min(
+                                1.0,
+                                (step - self.face_module_ss_start_step)
+                                / self.face_module_ss_ramp_steps,
+                            )
+                        else:
+                            progress = 1.0
+                        ss_prob = self.face_module_ss_prob * progress
+                if ss_prob > 0.0:
+                    with torch.no_grad():
+                        ss_out = self.face_module(
+                            audio_feat_run, prev_motion, llm_feat=transformer_out_run
+                        )
+                        self_prev_motion = torch.cat(
+                            [prev_motion[:, :1], ss_out["pred_motion"][:, :-1]], dim=1
+                        )
+                        ss_mask = (
+                            torch.rand(B, prev_motion.shape[1], 1, device=prev_motion.device)
+                            < ss_prob
+                        )
+                        if self.face_module_ss_keep_head_frames > 0:
+                            ss_mask[:, :self.face_module_ss_keep_head_frames] = False
+                        prev_motion = torch.where(ss_mask, self_prev_motion, prev_motion)
                 face_outputs = self.face_module(
                     audio_feat_run, prev_motion, llm_feat=transformer_out_run
                 )
+                if self.training and face_outputs is None:
+                    raise RuntimeError("v7 face module returned None during training")
+                if self.training and "pred_motion" not in face_outputs:
+                    raise KeyError("v7 face output is missing required 'pred_motion'")
+                face_outputs["scheduled_sampling_prob"] = face_outputs["pred_motion"].new_tensor(ss_prob)
                 if valid_face_batch:
                     face_pred = face_outputs["pred_motion"]
                 else:

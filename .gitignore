@@ -194,3 +194,6 @@ moshi-finetune/data/stereo_ami_balanced_*
 
 moshi-finetune/output
 moshi-finetune/result
+
+moshi-finetune/mimi_codec_50000.pt
+moshi-finetune/mimi_stats.json

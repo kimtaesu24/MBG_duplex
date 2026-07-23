@@ -254,10 +254,13 @@ def evaluate(
                         )
 
             # ── Face loss ─────────────────────────────────────────────────
-            if (args.face_gen.enable
-                    and output.face_outputs is not None
-                    and gt_face_motion is not None
-                    and face_codec is not None):
+            if args.face_gen.enable:
+                if output.face_outputs is None:
+                    raise RuntimeError("Face evaluation received face_outputs=None")
+                if gt_face_motion is None:
+                    raise RuntimeError("Face evaluation requires gt_face_motion for every batch")
+                if face_codec is None:
+                    raise RuntimeError("Face evaluation requires the frozen face codec")
                 T_face_p = T_p * 2
                 valid_face_mask = None
                 if T_p or batch.valid_face_frames is not None:

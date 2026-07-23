@@ -40,7 +40,8 @@ def compute_face_loss(
     codec,
     face_args,
     valid_face_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_components: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the full reference face-motion training loss.
 
     Replicates the loss from softvq_continuous_online_train.py::compute_loss(),
@@ -54,7 +55,8 @@ def compute_face_loss(
         face_args: FaceGenArgs dataclass carrying per-loss weights.
 
     Returns:
-        Scalar loss tensor.
+        Scalar loss tensor.  When ``return_components`` is True, also returns
+        the unweighted component losses for monitoring.
     """
     pred   = face_outputs["pred_motion"]    # [B, T, 54]
     prior  = face_outputs["prior_motion"]   # [B, T, 54]
@@ -135,6 +137,44 @@ def compute_face_loss(
         + face_args.reg_weight * loss_reg
         + face_args.gate_weight * loss_gate
     )
+    if return_components:
+        if use_mask:
+            pred_jaw_abs = _masked_mean(pred[..., 50:51].abs(), mask)
+            gt_jaw_abs = _masked_mean(gt[..., 50:51].abs(), mask)
+            pred_jaw_velocity_abs = _masked_mean(pred_vel[..., 50:51].abs(), vel_mask)
+            gt_jaw_velocity_abs = _masked_mean(gt_vel[..., 50:51].abs(), vel_mask)
+            prior_jaw_abs = _masked_mean(prior[..., 50:51].abs(), mask)
+            delta_jaw_abs = _masked_mean(delta[..., 50:51].abs(), mask)
+            residual_jaw_abs = _masked_mean(residual[..., 50:51].abs(), mask)
+            gate_jaw = _masked_mean(group_gate[..., 1:2], mask)
+        else:
+            pred_jaw_abs = pred[..., 50:51].abs().mean()
+            gt_jaw_abs = gt[..., 50:51].abs().mean()
+            pred_jaw_velocity_abs = pred_vel[..., 50:51].abs().mean()
+            gt_jaw_velocity_abs = gt_vel[..., 50:51].abs().mean()
+            prior_jaw_abs = prior[..., 50:51].abs().mean()
+            delta_jaw_abs = delta[..., 50:51].abs().mean()
+            residual_jaw_abs = residual[..., 50:51].abs().mean()
+            gate_jaw = group_gate[..., 1].mean()
+        return total, {
+            "motion_loss": loss_motion,
+            "prior_loss": loss_prior,
+            "z_mse_loss": loss_z,
+            "z_bce_loss": loss_z_bce,
+            "jaw_loss": loss_jaw,
+            "velocity_loss": loss_vel,
+            "regularization_loss": loss_reg,
+            "gate_loss": loss_gate,
+            "pred_jaw_abs": pred_jaw_abs,
+            "gt_jaw_abs": gt_jaw_abs,
+            "jaw_amplitude_ratio": pred_jaw_abs / gt_jaw_abs.clamp(min=1e-8),
+            "pred_jaw_velocity_abs": pred_jaw_velocity_abs,
+            "gt_jaw_velocity_abs": gt_jaw_velocity_abs,
+            "prior_jaw_abs": prior_jaw_abs,
+            "delta_jaw_abs": delta_jaw_abs,
+            "residual_jaw_abs": residual_jaw_abs,
+            "gate_jaw": gate_jaw,
+        }
     return total
 
 

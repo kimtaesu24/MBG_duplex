@@ -68,24 +68,23 @@ failed=0
 # Baselines: implicit backbone only and the previous explicit hard-gate policies.
 run_setting implicit_only --epad-control none || failed=$((failed + 1))
 run_setting legacy_inject --epad-control legacy || failed=$((failed + 1))
-run_setting legacy_bidirectional --epad-control legacy --suppress-epad || failed=$((failed + 1))
-
 # Main ablation: change only the explicit BC evidence weight.
+run_setting fusion_bc005 --epad-control fusion --fusion-bc-weight 0.05 || failed=$((failed + 1))
+run_setting fusion_bc010 --epad-control fusion --fusion-bc-weight 0.10 || failed=$((failed + 1))
 run_setting fusion_bc025 --epad-control fusion --fusion-bc-weight 0.25 || failed=$((failed + 1))
-run_setting fusion_bc05  --epad-control fusion --fusion-bc-weight 0.5  || failed=$((failed + 1))
-run_setting fusion_bc10  --epad-control fusion --fusion-bc-weight 1.0  || failed=$((failed + 1))
-run_setting fusion_bc20  --epad-control fusion --fusion-bc-weight 2.0  || failed=$((failed + 1))
+run_setting fusion_bc050 --epad-control fusion --fusion-bc-weight 0.50 || failed=$((failed + 1))
+run_setting fusion_bc100 --epad-control fusion --fusion-bc-weight 1.00 || failed=$((failed + 1))
 
-# Auxiliary-evidence ablation around the neutral BC=1 operating point.
-run_setting fusion_bc10_vap05 \
-    --epad-control fusion --fusion-bc-weight 1.0 --fusion-vap-weight 0.5 \
+# Auxiliary-evidence ablation around the moderate BC=0.25 operating point.
+run_setting fusion_bc025_vap025 \
+    --epad-control fusion --fusion-bc-weight 0.25 --fusion-vap-weight 0.25 \
     || failed=$((failed + 1))
-run_setting fusion_bc10_vad05 \
-    --epad-control fusion --fusion-bc-weight 1.0 --fusion-vad-weight 0.5 \
+run_setting fusion_bc025_vad025 \
+    --epad-control fusion --fusion-bc-weight 0.25 --fusion-vad-weight 0.25 \
     || failed=$((failed + 1))
-run_setting fusion_bc10_vap05_vad05 \
-    --epad-control fusion --fusion-bc-weight 1.0 \
-    --fusion-vap-weight 0.5 --fusion-vad-weight 0.5 \
+run_setting fusion_bc025_vap025_vad025 \
+    --epad-control fusion --fusion-bc-weight 0.25 \
+    --fusion-vap-weight 0.25 --fusion-vad-weight 0.25 \
     || failed=$((failed + 1))
 
 "$PY" "$EXPDIR/summarize.py" "$OUT_ROOT" || failed=$((failed + 1))

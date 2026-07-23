@@ -632,6 +632,22 @@ def run_test_inference(args):
         temp_text=args.temp_text,
         top_k=args.top_k_audio,
         top_k_text=args.top_k_text,
+        mimi=mimi,
+        suppress_epad=args.suppress_epad,
+        bc_context_frames=max(
+            1, int(round(float(config.get("duration_sec", 10.0)) * mimi.frame_rate))
+        ),
+        epad_control=args.epad_control,
+        fusion_bc_weight=args.fusion_bc_weight,
+        fusion_vap_weight=args.fusion_vap_weight,
+        fusion_vad_weight=args.fusion_vad_weight,
+        fusion_threshold=args.fusion_threshold,
+    )
+    log(
+        "info",
+        f"EPAD control={args.epad_control}, bc_weight={args.fusion_bc_weight}, "
+        f"vap_weight={args.fusion_vap_weight}, vad_weight={args.fusion_vad_weight}, "
+        f"context_frames={lm_gen.bc_context_frames}",
     )
     if not original_personaplex:
         lm_gen_kwargs.update(
@@ -977,13 +993,7 @@ if __name__ == "__main__":
     parser.add_argument("--fusion-threshold", type=float, default=0.5,
                         help="Deprecated compatibility option; residual fusion samples "
                              "from adjusted logits and does not use a hard threshold.")
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed. Defaults to 42 for finetuned/lm2 inference and -1 "
-             "(unseeded) for --base-model-only.",
-    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--world-size", type=int, default=1, help="Total number of processes for inference")
     parser.add_argument("--rank", type=int, default=0, help="Rank of the current process")
     

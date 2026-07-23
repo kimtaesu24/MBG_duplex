@@ -205,6 +205,18 @@ class FaceGenArgs(Serializable):
     # ── Per-component loss weights (from reference pretraining) ───────────
     # Overall weight applied to the sum of all face sub-losses.
     face_loss_weight: float = 1.0
+    # Do not add face loss to the training objective for the first N steps.
+    # Forward/loss computation and monitoring still run during this period.
+    warmup_steps: int = 0
+    # Separate rates for the pretrained face core and the newly connected
+    # zero-initialized LLM projection. Set either to 0 to inherit optim.lr.
+    core_lr: float = 0.0
+    llm_proj_lr: float = 0.0
+    # Exposure-bias mitigation: replace this fraction of GT previous-motion
+    # frames with a no-grad self prediction, ramped in after warm-up.
+    scheduled_sampling_prob: float = 0.0
+    scheduled_sampling_ramp_steps: int = 0
+    scheduled_sampling_keep_head_frames: int = 0
     # Sub-loss weights (matching softvq_continuous_online_train.py defaults).
     motion_weight: float = 1.0       # L1 on pred_motion vs gt
     prior_weight: float = 0.5        # L1 on prior_motion vs gt

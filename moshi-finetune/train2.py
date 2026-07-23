@@ -106,6 +106,23 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             "torchrun으로 실행하세요."
         )
 
+    # End-to-end face training must never silently degrade to LM/VAP-only
+    # training. Validate every global face dependency before touching run_dir.
+    if args.face_gen.enable:
+        required_files = {
+            "face_gen.ckpt_path": args.face_gen.ckpt_path,
+            "face_gen.codec_ckpt_path": args.face_gen.codec_ckpt_path,
+            "face_gen.codec_stats_path": args.face_gen.codec_stats_path,
+        }
+        for label, path in required_files.items():
+            if not path or not os.path.isfile(path):
+                raise FileNotFoundError(f"Required {label} is missing or unreadable: {path!r}")
+        if not args.face_gen.flame_root or not os.path.isdir(args.face_gen.flame_root):
+            raise NotADirectoryError(
+                "Required face_gen.flame_root is missing or unreadable: "
+                f"{args.face_gen.flame_root!r}"
+            )
+
     # ── 2. run_dir 초기화 ─────────────────────────────────────────────────
     main_logger_info(f"Run dir: {args.run_dir}")
     run_dir = Path(args.run_dir)
@@ -252,6 +269,10 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         lm_config["face_module_heads"] = args.face_gen.heads
         lm_config["face_module_code_dim"] = args.face_gen.code_dim
         lm_config["face_module_prior_warmup_frames"] = args.face_gen.prior_warmup_frames
+        lm_config["face_module_ss_prob"] = args.face_gen.scheduled_sampling_prob
+        lm_config["face_module_ss_ramp_steps"] = args.face_gen.scheduled_sampling_ramp_steps
+        lm_config["face_module_ss_start_step"] = args.face_gen.warmup_steps
+        lm_config["face_module_ss_keep_head_frames"] = args.face_gen.scheduled_sampling_keep_head_frames
         main_logger_info(
             f"Face generation module 활성화 "
             f"(checkpoint={args.face_gen.ckpt_path})"
@@ -341,10 +362,40 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     param_dtype = getattr(torch, args.param_dtype)
 
     # ── 10. 옵티마이저 & 스케줄러 ─────────────────────────────────────────
-    trainable_params = list(model.parameters())
+    base_params = []
+    face_core_params = []
+    face_llm_proj_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "face_module" not in name:
+            base_params.append(param)
+        elif "llm_proj" in name:
+            face_llm_proj_params.append(param)
+        else:
+            face_core_params.append(param)
+
+    param_groups = [{"params": base_params, "lr": args.optim.lr, "group_name": "base"}]
+    max_lrs = [args.optim.lr]
+    if args.face_gen.enable:
+        face_core_lr = args.face_gen.core_lr or args.optim.lr
+        face_llm_proj_lr = args.face_gen.llm_proj_lr or args.optim.lr
+        if not face_core_params:
+            raise RuntimeError("face_gen is enabled but no trainable face core parameters were found")
+        if not face_llm_proj_params:
+            raise RuntimeError("face_gen is enabled but no trainable face llm_proj parameters were found")
+        param_groups.extend([
+            {"params": face_core_params, "lr": face_core_lr, "group_name": "face_core"},
+            {"params": face_llm_proj_params, "lr": face_llm_proj_lr, "group_name": "face_llm_proj"},
+        ])
+        max_lrs.extend([face_core_lr, face_llm_proj_lr])
+        main_logger_info(
+            "Optimizer learning rates: "
+            f"base={args.optim.lr:.2e}, face_core={face_core_lr:.2e}, "
+            f"face_llm_proj={face_llm_proj_lr:.2e}"
+        )
     optimizer = AdamW(
-        trainable_params,
-        lr=args.optim.lr,
+        param_groups,
         betas=(0.9, 0.95),
         eps=1e-08,
         weight_decay=args.optim.weight_decay,
@@ -352,7 +403,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
     scheduler = lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=args.optim.lr,
+        max_lr=max_lrs,
         total_steps=args.max_steps,
         pct_start=args.optim.pct_start,
     )
@@ -398,6 +449,17 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         vap_loss_val = torch.tensor([0.0], device="cuda")
         # commitment_loss_val = torch.tensor([0.0], device="cuda")
         face_loss_val = torch.tensor([0.0], device="cuda")
+        face_component_vals = {
+            name: torch.tensor([0.0], device="cuda")
+            for name in (
+                "motion_loss", "prior_loss", "z_mse_loss", "z_bce_loss",
+                "jaw_loss", "velocity_loss", "regularization_loss", "gate_loss",
+                "pred_jaw_abs", "gt_jaw_abs", "jaw_amplitude_ratio",
+                "pred_jaw_velocity_abs", "gt_jaw_velocity_abs",
+                "prior_jaw_abs", "delta_jaw_abs", "residual_jaw_abs", "gate_jaw",
+                "scheduled_sampling_prob",
+            )
+        }
         bc_event_loss_val = torch.tensor([0.0], device="cuda")
         silence_loss_val = torch.tensor([0.0], device="cuda")
         bc_stats_accum: dict | None = None
@@ -406,6 +468,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         n_real_tokens: int = 0
         face_loss_skipped_no_data: int = 0   # batches where face_motion_gt was None (missing FLAME files)
         face_loss_skipped_nonfinite: int = 0 # batches where face_loss was NaN/Inf
+        face_warmup_active = (
+            args.face_gen.enable
+            and args.face_gen.warmup_steps > 0
+            and state.step <= args.face_gen.warmup_steps
+        )
 
         for i in range(args.num_microbatches):
             batch = next(data_loader)
@@ -669,15 +736,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 face_loss = None
                 if args.face_gen.enable:
                     if output.face_outputs is None:
-                        # Covered above by face_loss_skipped_no_data when batch.face_motion_gt
-                        # was None.  This branch fires when gt_face_motion is None for a
-                        # different reason (face_codec missing, audio_feat None in model, etc.).
-                        if gt_face_motion is not None and get_rank() == 0:
-                            logger.warning(
-                                f"[step {state.step}] face_outputs is None but gt_face_motion "
-                                f"is not None — face_codec={'ok' if face_codec is not None else 'MISSING'}. "
-                                f"Check audio_feat passed to the model."
-                            )
+                        raise RuntimeError(
+                            f"[step {state.step}] face_gen is enabled but face_outputs is None "
+                            f"(gt_face_motion={'ok' if gt_face_motion is not None else 'MISSING'}, "
+                            f"face_codec={'ok' if face_codec is not None else 'MISSING'})."
+                        )
                     elif gt_face_motion is not None and face_codec is not None:
                         # Build [B, T_face] bool mask.
                         # When T_p > 0, gt_face_motion was prepended with 2*T_p zero frames
@@ -700,10 +763,14 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                                 f"T_face_p={T_face_p}, T_face={gt_face_motion.shape[1]}. "
                                 f"Face loss will be 0."
                             )
-                        face_loss = compute_face_loss(
+                        face_loss, face_components = compute_face_loss(
                             output.face_outputs, gt_face_motion, face_codec, args.face_gen,
                             valid_face_mask=valid_face_mask,
+                            return_components=True,
                         )
+                        face_components["scheduled_sampling_prob"] = output.face_outputs[
+                            "scheduled_sampling_prob"
+                        ]
                         if torch.isfinite(face_loss):
                             if face_loss.item() == 0.0 and get_rank() == 0:
                                 logger.warning(
@@ -711,8 +778,14 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                                     f"(mask valid={valid_face_mask.sum().item() if valid_face_mask is not None else 'N/A'} frames). "
                                     f"Check FLAME data quality."
                                 )
-                            mb_loss = mb_loss + args.face_gen.face_loss_weight * face_loss
+                            # During face warm-up, keep forward/loss monitoring active but
+                            # exclude face loss from the objective. This blocks its gradient
+                            # from both the face module and the upstream LM features.
+                            if not face_warmup_active:
+                                mb_loss = mb_loss + args.face_gen.face_loss_weight * face_loss
                             face_loss_val += face_loss.detach()
+                            for name, component in face_components.items():
+                                face_component_vals[name] += component.detach()
                         else:
                             face_loss_skipped_nonfinite += 1
                             logger.warning(f"[step {state.step}] Non-finite face_loss={face_loss.item():.4f}, skipping.")
@@ -751,12 +824,26 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                         bc_stats_accum[k] = bc_stats_accum[k] / args.num_microbatches
             if args.face_gen.enable:
                 face_loss_val /= args.num_microbatches
+                for name in face_component_vals:
+                    face_component_vals[name] /= args.num_microbatches
             for p in model.parameters():
                 if p.requires_grad and p.grad is not None:
                     p.grad.div_(args.num_microbatches)
 
         # 그래디언트 클리핑
         torch.nn.utils.clip_grad_norm_(list(model.parameters()), args.max_norm)
+
+        if args.face_gen.enable and args.face_gen.warmup_steps > 0:
+            if state.step == 1 and get_rank() == 0:
+                logger.info(
+                    f"Face loss warm-up active for steps 1-{args.face_gen.warmup_steps}: "
+                    "face loss is monitored but excluded from backpropagation."
+                )
+            if state.step == args.face_gen.warmup_steps and get_rank() == 0:
+                logger.info(
+                    f"[step {state.step}] Face loss warm-up complete; "
+                    f"face gradients will be enabled from step {state.step + 1}."
+                )
 
         # VapGPT warm-up: protect pretrained GPT/vap_head weights during early steps
         if (args.backchannel.enable
@@ -776,7 +863,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)  # 메모리 즉시 해제
 
-        last_lr = scheduler.get_last_lr()[0]
+        current_lrs = scheduler.get_last_lr()
+        last_lr = current_lrs[0]
         scheduler.step()
 
         loss_item = loss.item()
@@ -850,6 +938,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 torch.cuda.memory_allocated(),
                 args,
                 vap_loss=state.this_vap_loss,   # → wandb "vap_loss" (None when backchannel disabled)
+                face_loss=state.this_face_loss, # → wandb "face_loss" (None when face generation disabled)
             )
             # [EPAD] 예측 metric: rank별 confusion counts를 합산한 뒤 acc/recall/f1 계산
             epad_counts_global = epad_counts.clone()
@@ -875,6 +964,19 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     train_logs["bc_prior_word"] = float(_pri[2])
                 if args.backchannel.vad_loss_weight > 0:
                     train_logs["vad_loss"] = avg_aggregate(silence_loss_val.item())
+            if args.face_gen.enable:
+                # Raw face-loss components make imbalance/collapse visible in W&B.
+                # avg_aggregate performs a distributed collective, so every rank
+                # must execute this block before only rank 0 writes the metrics.
+                for name, value in face_component_vals.items():
+                    train_logs[f"face/{name}"] = avg_aggregate(value.item())
+                train_logs["face/weighted_loss"] = (
+                    0.0 if face_warmup_active else
+                    args.face_gen.face_loss_weight * state.this_face_loss
+                )
+                train_logs["face/warmup_active"] = int(face_warmup_active)
+                train_logs["lr/face_core"] = current_lrs[1]
+                train_logs["lr/face_llm_proj"] = current_lrs[2]
             metrics_logger.log(train_logs, step=state.step)
 
         # 주기적 CUDA 캐시 비우기 (메모리 단편화 방지)

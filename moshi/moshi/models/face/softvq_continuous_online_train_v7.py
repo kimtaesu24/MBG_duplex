@@ -359,6 +359,10 @@ class CausalSoftVQContinuousTransformer(nn.Module):
         nn.init.zeros_(self.delta_head.bias)
         nn.init.zeros_(self.res_head.weight)
         nn.init.zeros_(self.res_head.bias)
+        # This face checkpoint was trained independently of Personaplex. Start
+        # the newly connected LLM residual at zero so step 0 exactly preserves
+        # the pretrained audio-only face behaviour.
+        nn.init.zeros_(self.llm_proj.weight)
         nn.init.zeros_(self.gate_head[-1].weight)
         nn.init.constant_(self.gate_head[-1].bias, -1.5)
         if self.use_lookahead:
@@ -391,15 +395,28 @@ class CausalSoftVQContinuousTransformer(nn.Module):
     def _expand_audio(self, audio_feat: torch.Tensor, face_len: int) -> torch.Tensor:
         audio_rep = audio_feat.repeat_interleave(2, dim=1)
         if audio_rep.shape[1] < face_len:
+            if self.training:
+                raise RuntimeError(
+                    f"Audio feature coverage is too short for face training: "
+                    f"expanded_audio={audio_rep.shape[1]}, face_len={face_len}"
+                )
             pad = audio_rep.new_zeros(audio_rep.shape[0], face_len - audio_rep.shape[1], audio_rep.shape[2])
             audio_rep = torch.cat([audio_rep, pad], dim=1)
         return audio_rep[:, :face_len]
 
     def _expand_llm(self, llm_feat: torch.Tensor | None, audio_feat: torch.Tensor, face_len: int) -> torch.Tensor:
         if llm_feat is None:
-            llm_feat = audio_feat.new_zeros(audio_feat.shape[0], audio_feat.shape[1], 4096)
+            raise RuntimeError(
+                "v7 face generation requires llm_feat; refusing to substitute "
+                "a zero LLM feature."
+            )
         llm_rep = llm_feat.repeat_interleave(2, dim=1)
         if llm_rep.shape[1] < face_len:
+            if self.training:
+                raise RuntimeError(
+                    f"LLM feature coverage is too short for face training: "
+                    f"expanded_llm={llm_rep.shape[1]}, face_len={face_len}"
+                )
             pad = llm_rep.new_zeros(llm_rep.shape[0], face_len - llm_rep.shape[1], llm_rep.shape[2])
             llm_rep = torch.cat([llm_rep, pad], dim=1)
         return llm_rep[:, :face_len]
@@ -1586,7 +1603,7 @@ def parse_args():
     p.add_argument("--blink-refractory", type=int, default=12,
                    help="minimum frames between sampled blinks at inference (~0.5 s)")
     p.add_argument("--eyelid-probe",
-                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "eyelid_probe.pt"),
+                   default="/home/s20235100/MBG_duplex/moshi/moshi/models/face/assets/eyelid_probe.pt",
                    help="linear FLAME eyelid probe from prepare_eyelid_probe.py (blink labels)")
     # v7: exposure-bias mitigation (training-side only, no new params).
     p.add_argument("--prev-noise-std", type=float, default=0.015,
