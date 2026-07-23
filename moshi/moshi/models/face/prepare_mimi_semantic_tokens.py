@@ -38,21 +38,21 @@ from moshi.models import loaders  # noqa: E402
 # (wav dir, mimi-latent dir) pairs, matching make_dataset_cfg in the trainers.
 DEFAULT_PAIRS = [
     # dualtalk
-    # ("/home6/duplex/dataset/dualtalk/train", "/home6/duplex/dataset/mimi_emb/train"),
-    # ("/home6/duplex/dataset/dualtalk/ood", "/home6/duplex/dataset/mimi_emb/ood"),
-    # ("/home6/duplex/dataset/dualtalk/test", "/home6/duplex/dataset/mimi_emb/test"),
+    # ("/home6/duplex/dataset/dualtalk/train", "/home/s20225367/dataset/mimi_emb/train"),
+    # ("/home6/duplex/dataset/dualtalk/ood", "/home/s20225367/dataset/mimi_emb/ood"),
+    # ("/home6/duplex/dataset/dualtalk/test", "/home/s20225367/dataset/mimi_emb/test"),
     # ami utterances
-    ("/home6/duplex/dataset/ami_flame/ut/train", "/home6/duplex/dataset/mimi_emb/ami_train_ut"),
-    ("/home6/duplex/dataset/ami_flame/ut/valid", "/home6/duplex/dataset/mimi_emb/ami_val_ut"),
-    ("/home6/duplex/dataset/ami_flame/ut/test", "/home6/duplex/dataset/mimi_emb/ami_test_ut"),
+    ("/home/s20225367/dataset/ami_flame/ut/train", "/home/s20225367/dataset/mimi_emb/ami_train_ut"),
+    ("/home/s20225367/dataset/ami_flame/ut/valid", "/home/s20225367/dataset/mimi_emb/ami_val_ut"),
+    ("/home/s20225367/dataset/ami_flame/ut/test", "/home/s20225367/dataset/mimi_emb/ami_test_ut"),
     # ami backchannels (not in the current training mix, but cheap to cover)
-    ("/home6/duplex/dataset/ami_flame/bc/train", "/home6/duplex/dataset/mimi_emb/ami_train_bc"),
-    ("/home6/duplex/dataset/ami_flame/bc/valid", "/home6/duplex/dataset/mimi_emb/ami_val_bc"),
-    ("/home6/duplex/dataset/ami_flame/bc/test", "/home6/duplex/dataset/mimi_emb/ami_test_bc"),
+    ("/home/s20225367/dataset/ami_flame/bc/train", "/home/s20225367/dataset/mimi_emb/ami_train_bc"),
+    ("/home/s20225367/dataset/ami_flame/bc/valid", "/home/s20225367/dataset/mimi_emb/ami_val_bc"),
+    ("/home/s20225367/dataset/ami_flame/bc/test", "/home/s20225367/dataset/mimi_emb/ami_test_bc"),
     # unils (SeamlessInteractionTalk flame56 export)
-    # ("/home6/duplex/dataset/unils/SeamlessInteractionTalk/flame56/train", "/home6/duplex/dataset/mimi_emb/unils/train"),
-    # ("/home6/duplex/dataset/unils/SeamlessInteractionTalk/flame56/val", "/home6/duplex/dataset/mimi_emb/unils/val"),
-    # ("/home6/duplex/dataset/unils/SeamlessInteractionTalk/flame56/test", "/home6/duplex/dataset/mimi_emb/unils/test"),
+    # ("/home6/duplex/dataset/unils/SeamlessInteractionTalk/flame56/train", "/home/s20225367/dataset/mimi_emb/unils/train"),
+    # ("/home6/duplex/dataset/unils/SeamlessInteractionTalk/flame56/val", "/home/s20225367/dataset/mimi_emb/unils/val"),
+    # ("/home6/duplex/dataset/unils/SeamlessInteractionTalk/flame56/test", "/home/s20225367/dataset/mimi_emb/unils/test"),
 ]
 
 
