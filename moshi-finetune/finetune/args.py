@@ -118,6 +118,30 @@ class OptimArgs(Serializable):
 
 
 @dataclass
+class ContinualLearningArgs(Serializable):
+    """Frozen PersonaPlex online-teacher distillation settings."""
+    enable: bool = False
+    # None uses moshi_paths.moshi_path, i.e. the original PersonaPlex weights.
+    teacher_checkpoint: str | None = None
+    temperature: float = 2.0
+    text_kd_weight: float = 0.35
+    speech_activity_kd_weight: float = 1.0
+    turn_boundary_kd_weight: float = 0.25
+    hidden_kd_weight: float = 0.05
+
+    def __post_init__(self) -> None:
+        if self.enable:
+            assert self.temperature > 0.0
+            for name in (
+                "text_kd_weight",
+                "speech_activity_kd_weight",
+                "turn_boundary_kd_weight",
+                "hidden_kd_weight",
+            ):
+                assert getattr(self, name) >= 0.0
+
+
+@dataclass
 class WandbArgs(Serializable):
     project: str | None = None  # None이면 wandb 미사용
     offline: bool = False
@@ -184,6 +208,9 @@ class FaceGenArgs(Serializable):
     # model's own predicted audio codes (argmax of depformer logits) rather than
     # from the ground-truth codes (teacher forcing).
     use_generated_audio_feat: bool = False
+    # Keep the v7.2 face model trainable, but prevent face reconstruction loss
+    # from changing the conversational backbone through its LLM feature input.
+    detach_llm_features: bool = False
 
     # ── ARTalkCodec (VAE) for z-space loss computation ────────────────────
     # Frozen codec used only to compute z_target = quant_to_sum_feat(gt_face_motion).
@@ -240,6 +267,10 @@ class TrainArgs(Serializable):
 
     run_dir: str  # 체크포인트와 로그가 저장될 디렉토리 (존재하지 않아야 함)
     moshi_paths: ModelPaths = field(default_factory=ModelPaths)
+    # Optional stage-2 model initialization. Loads model weights only; optimizer,
+    # scheduler, and TrainState start fresh. Face-module tensors are deliberately
+    # excluded so face_gen.ckpt_path remains the face initialization source.
+    init_checkpoint_dir: str | None = None
 
     # 손실 가중치
     first_codebook_weight_multiplier: float = 1.0
@@ -304,6 +335,9 @@ class TrainArgs(Serializable):
 
     # Face generation (inference-only; not used during training)
     face_gen: FaceGenArgs = field(default_factory=FaceGenArgs)
+    continual_learning: ContinualLearningArgs = field(
+        default_factory=ContinualLearningArgs
+    )
 
     param_dtype: str = "bfloat16"
     overwrite_run_dir: bool = False

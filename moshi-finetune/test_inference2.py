@@ -643,12 +643,6 @@ def run_test_inference(args):
         fusion_vad_weight=args.fusion_vad_weight,
         fusion_threshold=args.fusion_threshold,
     )
-    log(
-        "info",
-        f"EPAD control={args.epad_control}, bc_weight={args.fusion_bc_weight}, "
-        f"vap_weight={args.fusion_vap_weight}, vad_weight={args.fusion_vad_weight}, "
-        f"context_frames={lm_gen.bc_context_frames}",
-    )
     if not original_personaplex:
         lm_gen_kwargs.update(
             mimi=mimi,
