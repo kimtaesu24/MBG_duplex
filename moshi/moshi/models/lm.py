@@ -739,6 +739,35 @@ class LMModel(StreamingContainer):
                                   audio_feat=audio_feat, gt_face_motion=gt_face_motion, mimi=mimi,
                                   bc_audio_feats=bc_audio_feats)
 
+    def forward_teacher(
+        self,
+        codes: torch.Tensor,
+        voice_prompt_embs: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Text/hidden-only forward used by frozen online distillation."""
+        batch_size = codes.shape[0]
+        initial = self._get_initial_token().expand(batch_size, -1, -1)
+        delayed_codes = _delay_sequence(self.delays, codes, initial)
+        delayed_codes = torch.cat([initial, delayed_codes], dim=2)
+        if voice_prompt_embs is not None:
+            vp_embs = self.embed_codes(voice_prompt_embs)
+            main_embs = self.embed_codes(delayed_codes[:, :, :-1])
+            transformer_out, text_logits = self.forward_embeddings(
+                torch.cat([vp_embs, main_embs], dim=1)
+            )
+            prompt_len = vp_embs.shape[1]
+            transformer_out = transformer_out[:, prompt_len:]
+            text_logits = text_logits[:, :, prompt_len:]
+        else:
+            transformer_out, text_logits = self.forward_codes(
+                delayed_codes[:, :, :-1]
+            )
+        text_logits, text_mask = _undelay_sequence(
+            self.delays[:1], text_logits, fill_value=float("NaN")
+        )
+        text_mask &= codes[:, :1] != self.zero_token_id
+        return text_logits, text_mask, transformer_out
+
     def forward_train(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
                       audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None,
                       mimi=None, bc_audio_feats: Optional[tuple] = None):  # (agent_audio_feat, user_audio_feat), each [B,T,512]
@@ -1697,4 +1726,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_logits
         else:
             return tokens
-

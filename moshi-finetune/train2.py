@@ -23,6 +23,7 @@ import fire
 import torch
 import torch.cuda
 import torch.distributed as dist
+import safetensors.torch
 from torch.optim import AdamW, lr_scheduler
 
 from torch.nn import functional as F
@@ -76,6 +77,162 @@ def main_logger_info(message: str) -> None:
         logger.info(message)
 
 
+def _load_stage2_init_weights(model, checkpoint_dir: str) -> None:
+    """Load a hybrid/full checkpoint as model-only stage-2 initialization.
+
+    The source checkpoint supplies LoRA, VAP/backchannel, and any other
+    non-face model tensors. Face tensors are always excluded so the standalone
+    face checkpoint configured by face_gen.ckpt_path remains authoritative.
+    Optimizer/scheduler/step state is intentionally not restored.
+    """
+    root = Path(checkpoint_dir)
+    candidates = (
+        root / "consolidated" / "lora.safetensors",
+        root / "consolidated" / "consolidated.safetensors",
+        root / "lora.safetensors",
+        root / "consolidated.safetensors",
+    )
+    checkpoint_path = next((p for p in candidates if p.is_file()), None)
+    if checkpoint_path is None:
+        raise FileNotFoundError(
+            f"No lora.safetensors or consolidated.safetensors found under "
+            f"init_checkpoint_dir={checkpoint_dir!r}"
+        )
+
+    state_dict = safetensors.torch.load_file(str(checkpoint_path), device="cpu")
+    source_count = len(state_dict)
+    state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if "face_module" not in key.split(".")
+    }
+    if not state_dict:
+        raise RuntimeError(f"No non-face tensors found in init checkpoint: {checkpoint_path}")
+    if not any("lora_" in key for key in state_dict):
+        raise RuntimeError(
+            f"Stage-2 checkpoint has no LoRA tensors: {checkpoint_path}. "
+            "It is not compatible with this LoRA training configuration."
+        )
+    if not any("backchannel" in key.split(".") for key in state_dict):
+        raise RuntimeError(
+            f"Stage-2 checkpoint has no backchannel/VAP tensors: {checkpoint_path}"
+        )
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Stage-2 checkpoint contains tensors that did not match the training "
+            f"model ({len(incompatible.unexpected_keys)} unexpected): "
+            f"{incompatible.unexpected_keys[:8]}"
+        )
+    main_logger_info(
+        f"Stage-2 initialization loaded from {checkpoint_path}: "
+        f"{len(state_dict)}/{source_count} non-face tensors; "
+        f"{len(incompatible.missing_keys)} target tensors kept from their original "
+        "initialization (base/frozen/face tensors expected)."
+    )
+    del state_dict
+
+
+def _bernoulli_kl(student_prob: torch.Tensor, teacher_prob: torch.Tensor) -> torch.Tensor:
+    eps = 1.0e-6
+    student_prob = student_prob.float().clamp(eps, 1.0 - eps)
+    teacher_prob = teacher_prob.float().clamp(eps, 1.0 - eps)
+    return (
+        teacher_prob * (teacher_prob.log() - student_prob.log())
+        + (1.0 - teacher_prob)
+        * ((1.0 - teacher_prob).log() - (1.0 - student_prob).log())
+    )
+
+
+def _selected_token_probs(
+    logits: torch.Tensor,
+    token_ids: tuple[int, ...],
+    chunk_size: int = 256,
+) -> torch.Tensor:
+    """Compute a few vocabulary probabilities without materializing full fp32 softmax."""
+    chunks = []
+    for start in range(0, logits.shape[0], chunk_size):
+        chunk = logits[start : start + chunk_size].float()
+        log_z = torch.logsumexp(chunk, dim=-1, keepdim=True)
+        selected = chunk[:, list(token_ids)]
+        chunks.append(torch.exp(selected - log_z))
+    return torch.cat(chunks, dim=0)
+
+
+def _online_teacher_losses(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+    pad_id: int,
+    epad_id: int,
+    temperature: float,
+) -> dict[str, torch.Tensor]:
+    """Selective language, activity, boundary, and representation KD."""
+    student_logits = student_logits[:, 0]
+    teacher_logits = teacher_logits[:, 0]
+    valid_mask = valid_mask.bool()
+    finite = torch.isfinite(student_logits[..., 0]) & torch.isfinite(
+        teacher_logits[..., 0]
+    )
+    valid_mask = valid_mask & finite
+    zero = student_logits.new_zeros((), dtype=torch.float32)
+    if not valid_mask.any():
+        return {
+            "text": zero,
+            "speech_activity": zero,
+            "turn_boundary": zero,
+            "hidden": zero,
+        }
+
+    # Preserve lexical distributions only on actual word frames. Turn/silence
+    # behavior is controlled separately below so AMI can still adapt it.
+    word_mask = valid_mask & (targets != pad_id) & (targets != epad_id)
+    word_mask &= targets >= 0
+    if word_mask.any():
+        student_word = student_logits[word_mask].float() / temperature
+        teacher_word = teacher_logits[word_mask].float() / temperature
+        teacher_prob = F.softmax(teacher_word, dim=-1)
+        text_kd = F.kl_div(
+            F.log_softmax(student_word, dim=-1),
+            teacher_prob,
+            reduction="batchmean",
+        ) * (temperature * temperature)
+    else:
+        text_kd = zero
+
+    # Behavioral retention: preserve the base model's frame-level decision to
+    # remain PAD versus emit any non-PAD token.
+    student_prob = _selected_token_probs(
+        student_logits[valid_mask], (pad_id, epad_id)
+    )
+    teacher_prob = _selected_token_probs(
+        teacher_logits[valid_mask], (pad_id, epad_id)
+    )
+    activity_kd = _bernoulli_kl(
+        1.0 - student_prob[:, 0],
+        1.0 - teacher_prob[:, 0],
+    ).mean()
+    boundary_kd = _bernoulli_kl(
+        student_prob[:, 1],
+        teacher_prob[:, 1],
+    ).mean()
+
+    hidden_mask = valid_mask
+    student_h = student_hidden[hidden_mask].float()
+    teacher_h = teacher_hidden[hidden_mask].float()
+    hidden_kd = (1.0 - F.cosine_similarity(student_h, teacher_h, dim=-1)).mean()
+    return {
+        "text": text_kd,
+        "speech_activity": activity_kd,
+        "turn_boundary": boundary_kd,
+        "hidden": hidden_kd,
+    }
+
+
 def train(config: str):
     """진입점: YAML 설정 파일 경로를 인수로 받습니다.
 
@@ -122,6 +279,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 "Required face_gen.flame_root is missing or unreadable: "
                 f"{args.face_gen.flame_root!r}"
             )
+    if args.init_checkpoint_dir and not os.path.isdir(args.init_checkpoint_dir):
+        raise NotADirectoryError(
+            "init_checkpoint_dir is missing or unreadable: "
+            f"{args.init_checkpoint_dir!r}"
+        )
 
     # ── 2. run_dir 초기화 ─────────────────────────────────────────────────
     main_logger_info(f"Run dir: {args.run_dir}")
@@ -273,6 +435,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         lm_config["face_module_ss_ramp_steps"] = args.face_gen.scheduled_sampling_ramp_steps
         lm_config["face_module_ss_start_step"] = args.face_gen.warmup_steps
         lm_config["face_module_ss_keep_head_frames"] = args.face_gen.scheduled_sampling_keep_head_frames
+        lm_config["face_module_detach_llm_features"] = args.face_gen.detach_llm_features
         main_logger_info(
             f"Face generation module 활성화 "
             f"(checkpoint={args.face_gen.ckpt_path})"
@@ -281,6 +444,36 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     # ── 6. LM 모델 로드 및 FSDP 샤딩 ─────────────────────────────────────
     main_logger_info("Personaplex LM 모델 로드 중...")
     model = get_fsdp_model(args, moshi_path, lm_config)
+    if args.init_checkpoint_dir:
+        _load_stage2_init_weights(model, args.init_checkpoint_dir)
+
+    # Frozen original PersonaPlex reference. Its special forward skips audio
+    # Depformer, VAP, and face computation; only text logits and backbone hidden
+    # states needed for continual-learning losses are retained.
+    teacher_model = None
+    if args.continual_learning.enable:
+        teacher_checkpoint = (
+            args.continual_learning.teacher_checkpoint or moshi_path
+        )
+        if not teacher_checkpoint or not os.path.isfile(teacher_checkpoint):
+            raise FileNotFoundError(
+                "continual_learning teacher checkpoint is missing: "
+                f"{teacher_checkpoint!r}"
+            )
+        main_logger_info(
+            f"Frozen online PersonaPlex teacher loading: {teacher_checkpoint}"
+        )
+        teacher_model = get_moshi_lm(
+            teacher_checkpoint,
+            device="cuda",
+            dtype=getattr(torch, args.param_dtype),
+        )
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad = False
+        main_logger_info(
+            "Online teacher ready (text/hidden-only forward; all parameters frozen)."
+        )
 
     # ── 6-1. ARTalkCodec (VAE) 로드 (face_gen 활성 시) ────────────────────
     # The codec is frozen and used only to compute z_target = quant_to_sum_feat(gt_face_motion).
@@ -462,6 +655,10 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         }
         bc_event_loss_val = torch.tensor([0.0], device="cuda")
         silence_loss_val = torch.tensor([0.0], device="cuda")
+        kd_vals = {
+            name: torch.tensor([0.0], device="cuda")
+            for name in ("text", "speech_activity", "turn_boundary", "hidden")
+        }
         bc_stats_accum: dict | None = None
         epad_counts = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for [EPAD] prediction
         n_batch_tokens: int = 0
@@ -565,6 +762,20 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                             _user  = torch.cat([_zero, _user],  dim=1)
                     bc_audio_feats = (_agent, _user)
 
+                teacher_text_logits = None
+                teacher_text_mask = None
+                teacher_hidden = None
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        (
+                            teacher_text_logits,
+                            teacher_text_mask,
+                            teacher_hidden,
+                        ) = teacher_model.forward_teacher(
+                            codes_in,
+                            voice_prompt_embs=voice_prompt_embs,
+                        )
+
                 output = model(codes_in, step=state.step, voice_prompt_embs=voice_prompt_embs,
                                audio_feat=audio_feat, gt_face_motion=gt_face_motion,
                                mimi=mimi_for_model, bc_audio_feats=bc_audio_feats)
@@ -610,6 +821,41 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 )
 
                 mb_loss = text_loss + audio_loss
+
+                # ── Frozen PersonaPlex online-teacher distillation ────────────────
+                if teacher_model is not None:
+                    if output.transformer_out is None:
+                        raise RuntimeError(
+                            "Student LMOutput is missing transformer_out required "
+                            "for continual-learning hidden distillation."
+                        )
+                    kd_mask = text_mask[:, 0].clone()
+                    kd_mask &= teacher_text_mask[:, 0, T_p:]
+                    if batch.valid_mask is not None:
+                        kd_mask &= batch.valid_mask.to(kd_mask.device)
+                    kd_losses = _online_teacher_losses(
+                        student_logits=output.text_logits[:, :, T_p:],
+                        teacher_logits=teacher_text_logits[:, :, T_p:],
+                        student_hidden=output.transformer_out[:, T_p:],
+                        teacher_hidden=teacher_hidden[:, T_p:],
+                        targets=codes[:, 0],
+                        valid_mask=kd_mask,
+                        pad_id=model.text_padding_token_id,
+                        epad_id=model.end_of_text_padding_id,
+                        temperature=args.continual_learning.temperature,
+                    )
+                    cl = args.continual_learning
+                    mb_loss = (
+                        mb_loss
+                        + cl.text_kd_weight * kd_losses["text"]
+                        + cl.speech_activity_kd_weight
+                        * kd_losses["speech_activity"]
+                        + cl.turn_boundary_kd_weight
+                        * kd_losses["turn_boundary"]
+                        + cl.hidden_kd_weight * kd_losses["hidden"]
+                    )
+                    for name, value in kd_losses.items():
+                        kd_vals[name] += value.detach()
 
                 # ── VAP 보조 손실 ─────────────────────────────────────────
                 vap_loss = None
@@ -826,6 +1072,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 face_loss_val /= args.num_microbatches
                 for name in face_component_vals:
                     face_component_vals[name] /= args.num_microbatches
+            if teacher_model is not None:
+                for name in kd_vals:
+                    kd_vals[name] /= args.num_microbatches
             for p in model.parameters():
                 if p.requires_grad and p.grad is not None:
                     p.grad.div_(args.num_microbatches)
@@ -977,6 +1226,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 train_logs["face/warmup_active"] = int(face_warmup_active)
                 train_logs["lr/face_core"] = current_lrs[1]
                 train_logs["lr/face_llm_proj"] = current_lrs[2]
+            if teacher_model is not None:
+                for name, value in kd_vals.items():
+                    train_logs[f"continual/{name}_kd"] = avg_aggregate(
+                        value.item()
+                    )
             metrics_logger.log(train_logs, step=state.step)
 
         # 주기적 CUDA 캐시 비우기 (메모리 단편화 방지)
@@ -1025,5 +1279,5 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
 if __name__ == "__main__":
     """사용법: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml"""
-    """ torchrun --nproc_per_node=1 --master_port=29512 train2.py config/dualtalk_backbone_only.yaml """
+    """ torchrun --nproc_per_node=1 --master_port=29512 train2.py config/hyades_ami_endtoend_from_vap.yaml """
     fire.Fire(train)

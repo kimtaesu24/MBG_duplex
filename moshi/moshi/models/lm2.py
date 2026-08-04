@@ -75,6 +75,7 @@ class LMOutput:
     bc_stats: Optional[dict] = None                    # scalar tensors: y_bc_mean, s_pad_mean, g_soft_mean, g_final_rate
     bc_logits: Optional[torch.Tensor] = None  # [B, T, 3] — future text-slot class logits (0=PAD, 1=EPAD, 2=WORD)
     vad_logits: Optional[torch.Tensor] = None  # [B, T, 2] — CURRENT-frame VA logits (0=user, 1=agent), BCE-supervised
+    transformer_out: Optional[torch.Tensor] = None  # [B, T, D], for online-teacher KD
 
 
 def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -302,6 +303,7 @@ class LMModel(StreamingContainer):
         face_module_ss_ramp_steps: int = 0,
         face_module_ss_start_step: int = 0,
         face_module_ss_keep_head_frames: int = 0,
+        face_module_detach_llm_features: bool = False,
         # ── Mimi Model for internal audio decoding (server) ──────────────────
         # Used by the face module to decode agent audio from predicted logits.
         mimi_enabled: bool = False,
@@ -319,6 +321,9 @@ class LMModel(StreamingContainer):
         self.face_module_ss_ramp_steps = int(face_module_ss_ramp_steps)
         self.face_module_ss_start_step = int(face_module_ss_start_step)
         self.face_module_ss_keep_head_frames = int(face_module_ss_keep_head_frames)
+        self.face_module_detach_llm_features = bool(
+            face_module_detach_llm_features
+        )
         assert len(delays) == self.num_codebooks, "unexpected number of delays"
         self.delays = delays
         self.dim = dim
@@ -789,6 +794,39 @@ class LMModel(StreamingContainer):
                                   audio_feat=audio_feat, gt_face_motion=gt_face_motion, mimi=mimi,
                                   bc_audio_feats=bc_audio_feats)
 
+    def forward_teacher(
+        self,
+        codes: torch.Tensor,
+        voice_prompt_embs: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Text/hidden-only forward for a frozen online teacher.
+
+        Skips Depformer, VAP, and face branches to keep online distillation
+        substantially cheaper than a second full training forward.
+        """
+        B = codes.shape[0]
+        initial = self._get_initial_token().expand(B, -1, -1)
+        delayed_codes = _delay_sequence(self.delays, codes, initial)
+        delayed_codes = torch.cat([initial, delayed_codes], dim=2)
+        if voice_prompt_embs is not None:
+            vp_embs = self.embed_codes(voice_prompt_embs)
+            main_embs = self.embed_codes(delayed_codes[:, :, :-1])
+            transformer_out, text_logits = self.forward_embeddings(
+                torch.cat([vp_embs, main_embs], dim=1)
+            )
+            prompt_len = vp_embs.shape[1]
+            transformer_out = transformer_out[:, prompt_len:]
+            text_logits = text_logits[:, :, prompt_len:]
+        else:
+            transformer_out, text_logits = self.forward_codes(
+                delayed_codes[:, :, :-1]
+            )
+        text_logits, text_mask = _undelay_sequence(
+            self.delays[:1], text_logits, fill_value=float("NaN")
+        )
+        text_mask &= codes[:, :1] != self.zero_token_id
+        return text_logits, text_mask, transformer_out
+
     def forward_train(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
                       audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None,
                       mimi=None, bc_audio_feats: Optional[tuple] = None):  # (agent_audio_feat, user_audio_feat), each [B,T,512]
@@ -917,7 +955,11 @@ class LMModel(StreamingContainer):
 
             # 2. Resolve which mimi to use and decode agent audio features.
             mimi_to_use = mimi if mimi is not None else self.mimi
-            transformer_out_run = transformer_out
+            transformer_out_run = (
+                transformer_out.detach()
+                if self.face_module_detach_llm_features
+                else transformer_out
+            )
             audio_feat_run = None
 
             if mimi_to_use is not None:
@@ -1025,7 +1067,8 @@ class LMModel(StreamingContainer):
             vap_logits, commitment_loss,
             face_pred, face_outputs, bc_stats,
             bc_logits=bc_result.bc_logits if bc_result is not None else None,
-            vad_logits=vad_logits)
+            vad_logits=vad_logits,
+            transformer_out=transformer_out)
 
 @dataclass
 class _LMGenState:
