@@ -38,18 +38,26 @@ import yaml
 from huggingface_hub import hf_hub_download
 
 import moshi.models.loaders as loaders
-from moshi.models import LMGen
 from moshi.offline import warmup
 
-# Shared helpers and the canonical per-sample inference function live in test_inference.
-from test_inference import log, _strip_peft_prefixes, load_checkpoint, infer_one
+# Keep benchmark inference on exactly the same model/generation implementation as
+# test_inference2.py. Importing it also installs lm2.LMModel into the loader.
+from test_inference2 import (
+    LMGen,
+    _repair_config_paths,
+    _wrap_with_system_tags,
+    infer_one,
+    load_checkpoint,
+    log,
+)
 
 
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
 
@@ -87,27 +95,60 @@ def run(args):
     set_seed(args.seed)
     data_dir = Path(args.data_dir)
     device = args.device
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        log("warning", "CUDA requested but not available — falling back to CPU.")
+        device = "cpu"
+    if args.dtype == "auto":
+        lm_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    else:
+        lm_dtype = getattr(torch, args.dtype)
+    log("info", f"device={device}, lm dtype={lm_dtype}")
 
     # ── Load config ───────────────────────────────────────────────────────────
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    if not args.no_auto_fix_config_paths:
+        _repair_config_paths(config)
+    face_cfg = config.get("face_gen", {})
+    face_enabled = bool(face_cfg.get("enable", False))
 
-    hf_repo = config.get("moshi_paths", {}).get("hf_repo_id", loaders.DEFAULT_REPO)
+    if args.ckpt_dir:
+        checkpoint_files = (
+            Path(args.ckpt_dir) / "consolidated" / "consolidated.safetensors",
+            Path(args.ckpt_dir) / "consolidated" / "lora.safetensors",
+        )
+        if not any(path.is_file() for path in checkpoint_files):
+            raise FileNotFoundError(
+                f"No checkpoint weights found under --ckpt-dir: {args.ckpt_dir}"
+            )
+
+    path_cfg = config.get("moshi_paths", {})
+    hf_repo = path_cfg.get("hf_repo_id") or loaders.DEFAULT_REPO
+
+    def resolve_weight(config_key: str, hub_name: str) -> str:
+        local_path = path_cfg.get(config_key)
+        if local_path:
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(
+                    f"moshi_paths.{config_key} does not exist: {local_path}"
+                )
+            log("info", f"Using local {config_key}: {local_path}")
+            return local_path
+        log("info", f"moshi_paths.{config_key} is unset; downloading {hub_name} from {hf_repo}.")
+        return hf_hub_download(hf_repo, hub_name)
 
     # ── Load models ───────────────────────────────────────────────────────────
     log("info", "Loading Mimi...")
-    mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)
+    mimi_weight = resolve_weight("mimi_path", loaders.MIMI_NAME)
     mimi = loaders.get_mimi(mimi_weight, device)
     other_mimi = loaders.get_mimi(mimi_weight, device)
-    # Dedicated instance for face latent decoding — must not have streaming_forever called on it
-    vap_mimi = loaders.get_mimi(mimi_weight, device)
 
     log("info", "Loading text tokenizer...")
-    tokenizer_path = hf_hub_download(hf_repo, loaders.TEXT_TOKENIZER_NAME)
+    tokenizer_path = resolve_weight("tokenizer_path", loaders.TEXT_TOKENIZER_NAME)
     text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
 
     log("info", "Loading Moshi LM...")
-    moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)
+    moshi_weight = resolve_weight("moshi_path", loaders.MOSHI_NAME)
 
     for k in list(loaders._lm_kwargs.keys()):
         if k.startswith("backchannel_"):
@@ -122,6 +163,8 @@ def run(args):
         loaders._lm_kwargs["backchannel_gumbel_temp_init"] = bc_cfg.get("gumbel_temp_init", 1.0)
         loaders._lm_kwargs["backchannel_gumbel_temp_min"] = bc_cfg.get("gumbel_temp_min", 0.5)
         loaders._lm_kwargs["backchannel_gumbel_anneal_rate"] = bc_cfg.get("gumbel_anneal_rate", 0.0001)
+        loaders._lm_kwargs["backchannel_pad_token_id"] = bc_cfg.get("pad_token_id", 3)
+        loaders._lm_kwargs["backchannel_epad_token_id"] = bc_cfg.get("epad_token_id", 0)
         if bc_cfg.get("module_type", "mlp") == "vap_gpt":
             loaders._lm_kwargs["backchannel_vap_repo_path"] = bc_cfg.get("vap_gpt_repo_path", "")
             loaders._lm_kwargs["backchannel_vap_checkpoint"] = bc_cfg.get("vap_gpt_checkpoint", None)
@@ -129,44 +172,56 @@ def run(args):
             loaders._lm_kwargs["backchannel_vap_cross_layers"] = bc_cfg.get("vap_gpt_cross_layers", 3)
             loaders._lm_kwargs["backchannel_vap_num_heads"] = bc_cfg.get("vap_gpt_num_heads", 4)
             loaders._lm_kwargs["backchannel_vap_dropout"] = bc_cfg.get("vap_gpt_dropout", 0.1)
+            loaders._lm_kwargs["backchannel_vap_use_silence_ctx_proj"] = bc_cfg.get(
+                "use_silence_ctx_proj", True
+            )
         log("info", f"Backchannel module enabled (type={bc_cfg.get('module_type', 'mlp')}).")
     else:
         loaders._lm_kwargs["backchannel_enabled"] = False
         log("info", "Backchannel VAP module disabled.")
 
-    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=args.cpu_offload)
+    if face_enabled and face_cfg.get("ckpt_path"):
+        face_dir = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "../moshi/moshi/models/face",
+        ))
+        loaders._lm_kwargs["face_module_enabled"] = True
+        loaders._lm_kwargs["face_module_version"] = int(face_cfg.get("model_version", 1))
+        loaders._lm_kwargs["face_module_dir"] = face_dir
+        loaders._lm_kwargs["face_module_checkpoint"] = face_cfg.get("ckpt_path")
+        loaders._lm_kwargs["face_module_hidden_dim"] = int(face_cfg.get("hidden_dim", 512))
+        loaders._lm_kwargs["face_module_layers"] = int(face_cfg.get("layers", 6))
+        loaders._lm_kwargs["face_module_heads"] = int(face_cfg.get("heads", 8))
+        loaders._lm_kwargs["face_module_code_dim"] = int(face_cfg.get("code_dim", 32))
+        loaders._lm_kwargs["face_module_prior_warmup_frames"] = int(
+            face_cfg.get("prior_warmup_frames", 10)
+        )
+    else:
+        loaders._lm_kwargs["face_module_enabled"] = False
+
+    lm = loaders.get_moshi_lm(
+        moshi_weight,
+        device=device,
+        dtype=lm_dtype,
+        cpu_offload=args.cpu_offload,
+    )
 
     if args.ckpt_dir:
-        lm = load_checkpoint(lm, args.ckpt_dir)
+        lm = load_checkpoint(
+            lm,
+            args.ckpt_dir,
+            config.get("lora", {}),
+            use_pretrained_depformer=args.use_pretrained_depformer,
+        )
 
     lm.eval()
 
-    # ── Face generation module ────────────────────────────────────────────────
+    # Full-Duplex-Bench consumes output.wav only. Keep lm.face_module loaded when
+    # required by the checkpoint, but skip the FaceGenerator wrapper, its token
+    # accumulation, the third Mimi model, and motion decoding.
     face_gen = None
-    face_cfg = config.get("face_gen", {})
-    if face_cfg.get("enable", False):
-        ckpt_path = face_cfg.get("ckpt_path")
-        if ckpt_path is None:
-            log("warning", "face_gen.enable=true but face_gen.ckpt_path is null — skipping face generation.")
-        else:
-            from face_generation import FaceGenerator  # noqa: PLC0415
-            face_dir = os.path.normpath(os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "../moshi/moshi/models/face",
-            ))
-            log("info", f"Loading face generation model from {ckpt_path}")
-            face_gen = FaceGenerator.from_checkpoint(
-                face_dir=face_dir,
-                ckpt_path=ckpt_path,
-                device=device,
-                max_context_frames=int(face_cfg.get("max_context_frames", 25)),
-                hidden_dim=int(face_cfg.get("hidden_dim", 512)),
-                layers=int(face_cfg.get("layers", 6)),
-                heads=int(face_cfg.get("heads", 8)),
-                code_dim=int(face_cfg.get("code_dim", 32)),
-                prior_warmup_frames=int(face_cfg.get("prior_warmup_frames", 10)),
-            )
-            log("info", "Face generation model loaded.")
+    if face_enabled:
+        log("info", "Face motion generation disabled for audio-only benchmark evaluation.")
 
     # ── Build LMGen ───────────────────────────────────────────────────────────
     frame_size = int(mimi.sample_rate / mimi.frame_rate)
@@ -177,11 +232,20 @@ def run(args):
         device=device,
         frame_rate=mimi.frame_rate,
         use_sampling=True,
-        temp=0.8,
-        temp_text=args.temp,
-        top_k=250,
-        top_k_text=25,
+        temp=args.temp_audio,
+        temp_text=args.temp_text,
+        top_k=args.top_k_audio,
+        top_k_text=args.top_k_text,
         mimi=mimi,
+        suppress_epad=args.suppress_epad,
+        bc_context_frames=max(
+            1, int(round(float(config.get("duration_sec", 10.0)) * mimi.frame_rate))
+        ),
+        epad_control=args.epad_control,
+        fusion_bc_weight=args.fusion_bc_weight,
+        fusion_vap_weight=args.fusion_vap_weight,
+        fusion_vad_weight=args.fusion_vad_weight,
+        fusion_threshold=args.fusion_threshold,
     )
 
     mimi.streaming_forever(1)
@@ -192,15 +256,18 @@ def run(args):
     warmup(mimi, other_mimi, lm_gen, device, frame_size)
 
     # ── Voice / text prompt ───────────────────────────────────────────────────
-    voice_prompt_path = "voices/NATM1.pt"
-    if not os.path.exists(voice_prompt_path):
+    voice_prompt_path = "" if args.no_voice_prompt else "voices/NATM1.pt"
+    if voice_prompt_path and not os.path.exists(voice_prompt_path):
         voices_tgz = hf_hub_download(hf_repo, "voices.tgz")
         with tarfile.open(voices_tgz, "r:gz") as tar:
             tar.extractall(path=os.path.dirname(voices_tgz))
         voice_prompt_path = os.path.join(os.path.dirname(voices_tgz), "voices/NATM1.pt")
 
-    text_prompt = config.get("text_prompt", "")
-    lm_gen.text_prompt_tokens = text_tokenizer.encode(text_prompt)
+    text_prompt = args.text_prompt if args.text_prompt is not None else config.get("text_prompt", "")
+    lm_gen.text_prompt_tokens = (
+        text_tokenizer.encode(_wrap_with_system_tags(text_prompt))
+        if text_prompt else None
+    )
 
     log("info", "Model ready.")
 
@@ -226,20 +293,13 @@ def run(args):
                     frame_size,
                     voice_prompt_path=voice_prompt_path,
                     face_gen=face_gen,
-                    suppress_epad=args.suppress_epad,
+                    # The benchmark only consumes output.wav. Passing no
+                    # tokenizer avoids per-frame text-piece conversion and
+                    # accumulation while preserving tokenizer use for prompts.
+                    text_tokenizer=None,
                     collect_bc_log=False,
                 )
                 sphn.write_wav(str(out), pcm, sr)
-
-                if face_gen is not None and getattr(face_gen, "_agent_tokens", None):
-                    try:
-                        motion = face_gen.generate_numpy(vap_mimi)
-                        face_out = inp.parent / "face_motion.npy"
-                        np.save(str(face_out), motion)
-                    except Exception as _e:
-                        import traceback as _tb
-                        log("warning", f"Face generation failed for {inp.name}: {_e}")
-                        _tb.print_exc()
 
             except Exception as e:
                 import traceback
@@ -248,6 +308,7 @@ def run(args):
                 failed += 1
 
     log("info", f"Done: {len(input_files)-failed}/{len(input_files)} samples ({failed} failed)")
+    return failed
 
 
 if __name__ == "__main__":
@@ -261,15 +322,44 @@ if __name__ == "__main__":
         help="Task sub-folder names to process (default: all v1.0 tasks)",
     )
     parser.add_argument("--ckpt-dir", default=None, help="Finetuned checkpoint directory")
+    parser.add_argument(
+        "--no-auto-fix-config-paths",
+        action="store_true",
+        help="Disable automatic rebasing of missing paths copied from another server.",
+    )
+    parser.add_argument(
+        "--use-pretrained-depformer",
+        action="store_true",
+        help="Keep the pretrained PersonaPlex Depformer instead of loading it from the checkpoint.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Re-generate even if output.wav exists")
+    parser.add_argument("--no-voice-prompt", action="store_true")
+    parser.add_argument("--text-prompt", default=None)
     parser.add_argument("--suppress-epad", action="store_true",
                         help="Force [EPAD] → [PAD] whenever g_final=0 (VAP says don't speak). "
                              "Word tokens in progress are never replaced.")
+    parser.add_argument(
+        "--epad-control",
+        choices=("none", "legacy", "fusion"),
+        default="none",
+    )
+    parser.add_argument("--fusion-bc-weight", type=float, default=1.0)
+    parser.add_argument("--fusion-vap-weight", type=float, default=0.0)
+    parser.add_argument("--fusion-vad-weight", type=float, default=0.0)
+    parser.add_argument("--fusion-threshold", type=float, default=0.5)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "float32", "bfloat16", "float16"),
+        default="auto",
+    )
     parser.add_argument("--cpu-offload", action="store_true")
-    parser.add_argument("--temp", type=float, default=0.7)
+    parser.add_argument("--temp-audio", type=float, default=0.8)
+    parser.add_argument("--top-k-audio", type=int, default=250)
+    parser.add_argument("--temp-text", type=float, default=0.7)
+    parser.add_argument("--top-k-text", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     args = parser.parse_args()
     torch.set_grad_enabled(False)
-    run(args)
+    sys.exit(1 if run(args) else 0)

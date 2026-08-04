@@ -1279,5 +1279,5 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
 if __name__ == "__main__":
     """사용법: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml"""
-    """ torchrun --nproc_per_node=1 --master_port=29512 train2.py config/hyades_ami_endtoend_from_vap.yaml """
+    """ torchrun --nproc_per_node=1 --master_port=29512 train2.py config/dualtalk_backbone_only.yaml """
     fire.Fire(train)

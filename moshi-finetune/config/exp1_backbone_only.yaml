@@ -6,18 +6,18 @@
 #   (torchrun --nproc_per_node=1 train.py config/exp1_backbone_only.yaml)
 # ─────────────────────────────────────────────────────────────────────────
 
-run_dir: ./output/exp1_backbone_only
+run_dir: ./output/ami_pureft_no_vap
 overwrite_run_dir: true
 
 wandb:
   project: "personaplex_finetune_AAAI_ami"
-  run_name: "exp1_backbone_only"
+  run_name: "ami_pureft_no_vap"
 
 # ── 데이터 ────────────────────────────────────────────────────────────────
 data:
-  train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
+  train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample_amplified.jsonl
   shuffle: true
-  eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
+  eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample_amplified.jsonl
   vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
 
 # ── Personaplex 모델 경로 ────────────────────────────────────────────────
@@ -26,7 +26,7 @@ moshi_paths:
 
 # ── 학습 설정 (single GPU) ───────────────────────────────────────────────
 max_steps: 2000
-batch_size: 64
+batch_size: 96
 num_microbatches: 2
 duration_sec: 10
 
@@ -35,7 +35,7 @@ lora:
   rank: 64
   scaling: 2.0
 full_finetuning: false
-freeze_depformer: false
+freeze_depformer: true
 
 param_dtype: bfloat16
 gradient_checkpointing: true
@@ -50,7 +50,7 @@ do_eval: true
 eval_freq: 100
 # exp1: best checkpoint 는 eval text_loss (lower = better) 기준으로 선별.
 ckpt_keep_best_metric: text_loss
-ckpt_keep_best_n: 3
+ckpt_keep_best_n: 10
 
 # ── 옵티마이저 ────────────────────────────────────────────────────────────
 optim:
@@ -60,7 +60,7 @@ optim:
 
 # ── 손실 가중치 ───────────────────────────────────────────────────────────
 text_padding_weight: 0.5
-epad_weight: 1.0
+epad_weight: 2.0
 first_codebook_weight_multiplier: 1.0
 
 # ── 텍스트 프롬프트 ───────────────────────────────────────────────────────

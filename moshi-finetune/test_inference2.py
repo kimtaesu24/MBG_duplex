@@ -775,7 +775,7 @@ def run_test_inference(args):
             flame_root=face_cfg.get("flame_root", "") if face_cfg.get("enable", False) else "",
             flame_speaker=face_cfg.get("flame_speaker", "bc"),
         )
-    
+
     for i, sample in enumerate(samples):
         input_wav = sample["path"]
         # Resolve relative paths against the jsonl directory
@@ -924,15 +924,15 @@ def run_test_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test Dataset Inference")
-    parser.add_argument("--config", type=str, default="./output/hyades/output/ami_pureft_no_vap/args.yaml", help="Path to args.yaml or training config yaml")
+    parser.add_argument("--config", type=str, default="./output/exp1_backbone_only/args.yaml", help="Path to args.yaml or training config yaml")
     parser.add_argument(
         "--no-auto-fix-config-paths",
         action="store_true",
         help="Disable automatic rebasing of missing paths copied from another server.",
     )
     parser.add_argument("--test-jsonl", type=str, default='./experiments_ami/ami_test_10.jsonl', help="Path to data.jsonl for the test dataset")
-    parser.add_argument("--output-dir", type=str, default="./result/ami_pureft_no_vap/100", help="Directory to save generated outputs")
-    parser.add_argument("--ckpt-dir", type=str, default="./output/hyades/output/ami_pureft_no_vap/checkpoints/checkpoint_000010", help="Directory containing consolidated/lora.safetensors")
+    parser.add_argument("--output-dir", type=str, default="./result/exp1_backbone_only/400", help="Directory to save generated outputs")
+    parser.add_argument("--ckpt-dir", type=str, default="./output/exp1_backbone_only/checkpoints/checkpoint_000400", help="Directory containing consolidated/lora.safetensors")
     parser.add_argument(
         "--base-model-only",
         action="store_true",
