@@ -12,6 +12,8 @@ from finetune.args import TrainArgs
 from .data.data_loader import Batch
 from .distributed import get_rank, get_world_size
 from .loss import (
+    bc_head_confusion_counts,
+    build_bc_targets,
     compute_loss_with_mask,
     compute_face_loss,
     epad_confusion_counts,
@@ -48,7 +50,11 @@ def evaluate(
     commitment_loss_accum = torch.tensor(0.0, device="cuda")
     face_loss_accum       = torch.tensor(0.0, device="cuda")
     bc_event_loss_accum   = torch.tensor(0.0, device="cuda")
+    vad_loss_accum        = torch.tensor(0.0, device="cuda")
+    # LA prior counts, local to this eval run (mirrors train2's running counts).
+    bc_class_counts       = torch.ones(3, device="cuda", dtype=torch.float64)
     epad_counts           = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for [EPAD]
+    bc_head_counts        = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for bc_logits class 1
 
     max_eval_batches = max(40 // get_world_size(), 1)
     model.eval()
@@ -195,31 +201,61 @@ def evaluate(
                         and not torch.isnan(output.commitment_loss)):
                     commitment_loss_accum += output.commitment_loss
 
+                # 3-class BC CE — mirrors train.py exactly, including the
+                # backchannel.bc_target_mode ("epad" | "vap") switch.
                 if (args.backchannel.bc_event_loss_weight > 0
-                        and output.bc_logits is not None
-                        and batch.bc_timing_targets is not None):
-                    bc_targets    = batch.bc_timing_targets.to(codes.device)
-                    bc_logit_pos  = output.bc_logits[:, T_p:, 1]
-                    valid_bc      = bc_targets != -100
-                    if valid_bc.any():
-                        bce = F.binary_cross_entropy_with_logits(
-                            bc_logit_pos[valid_bc],
-                            bc_targets[valid_bc],
-                            pos_weight=torch.tensor(
-                                args.backchannel.bc_focal_pos_weight,
-                                device=codes.device, dtype=bc_logit_pos.dtype,
-                            ),
-                            reduction='none',
+                        and output.bc_logits is not None):
+                    cls_tgt = build_bc_targets(
+                        mode=args.backchannel.bc_target_mode,
+                        text_tokens=codes[:, 0],
+                        pad_id=model.text_padding_token_id,
+                        epad_id=model.end_of_text_padding_id,
+                        onset_ignore_frames=args.backchannel.bc_onset_ignore_frames,
+                        valid_mask=batch.valid_mask,
+                        vap_targets=batch.vap_targets,
+                        vad_targets=batch.vad_targets,
+                        vap_horizon_bins=args.backchannel.bc_vap_horizon_bins,
+                        vap_require_user_silent=args.backchannel.bc_vap_require_user_silent,
+                    )
+                    bc_logits_c = output.bc_logits[:, T_p:]  # [B, T, 3]
+                    if (cls_tgt != -100).any():
+                        # Logit-Adjustment loss — mirrors train.py.
+                        valid_t = cls_tgt[cls_tgt != -100]
+                        bc_class_counts += torch.bincount(valid_t, minlength=3).to(bc_class_counts)
+                        log_prior = torch.log(bc_class_counts / bc_class_counts.sum()).to(
+                            device=codes.device, dtype=torch.float32,
                         )
-                        p_t = torch.exp(-bce.detach())
-                        bc_event_loss = ((1.0 - p_t) ** args.backchannel.bc_focal_gamma * bce).mean()
+                        bc_logits_adj = bc_logits_c.float() + args.backchannel.bc_la_tau * log_prior
+                        bc_event_loss = F.cross_entropy(
+                            bc_logits_adj.reshape(-1, 3),
+                            cls_tgt.reshape(-1),
+                            ignore_index=-100,
+                        )
                         bc_event_loss_accum += bc_event_loss
+                        bc_head_counts += bc_head_confusion_counts(bc_logits_c, cls_tgt)
+
+                # v2: current-frame VAD BCE (both streams), mirrors train.py.
+                if (args.backchannel.vad_loss_weight > 0
+                        and getattr(output, "vad_logits", None) is not None
+                        and batch.vad_targets is not None):
+                    vad_t = batch.vad_targets.to(codes.device)          # [B, 2, T]
+                    vad_l = output.vad_logits[:, T_p:].transpose(1, 2)  # [B, 2, T]
+                    vmask = vad_t >= 0  # drop frames with no manifest VAD entry
+                    if batch.valid_mask is not None:
+                        vmask = vmask & batch.valid_mask.to(codes.device).unsqueeze(1).expand_as(vad_t)
+                    if vmask.any():
+                        vad_loss_accum += F.binary_cross_entropy_with_logits(
+                            vad_l[vmask].float(), vad_t[vmask].float(),
+                        )
 
             # ── Face loss ─────────────────────────────────────────────────
-            if (args.face_gen.enable
-                    and output.face_outputs is not None
-                    and gt_face_motion is not None
-                    and face_codec is not None):
+            if args.face_gen.enable:
+                if output.face_outputs is None:
+                    raise RuntimeError("Face evaluation received face_outputs=None")
+                if gt_face_motion is None:
+                    raise RuntimeError("Face evaluation requires gt_face_motion for every batch")
+                if face_codec is None:
+                    raise RuntimeError("Face evaluation requires the frozen face codec")
                 T_face_p = T_p * 2
                 valid_face_mask = None
                 if T_p or batch.valid_face_frames is not None:
@@ -273,6 +309,22 @@ def evaluate(
         f"recall={state.this_eval_epad_metrics['epad_recall']:.4f} "
         f"f1={state.this_eval_epad_metrics['epad_f1']:.4f}"
     )
+
+    # BC-head metric against the active bc_target_mode target. Merged into the
+    # same dict so ckpt_keep_best_metric can select on "bc_head_f1" — the right
+    # criterion when experimenting with bc_target_mode, since epad_f1 scores the
+    # TEXT head and is blind to the BC head's target.
+    if args.backchannel.enable and args.backchannel.bc_event_loss_weight > 0:
+        dist.all_reduce(bc_head_counts, op=dist.ReduceOp.SUM)
+        bc_head_metrics = epad_metrics_from_counts(bc_head_counts, prefix="bc_head")
+        state.this_eval_epad_metrics.update(bc_head_metrics)
+        main_logger_info(
+            f"[BC head / target={args.backchannel.bc_target_mode}] eval "
+            f"acc={bc_head_metrics['bc_head_acc']:.4f} "
+            f"precision={bc_head_metrics['bc_head_precision']:.4f} "
+            f"recall={bc_head_metrics['bc_head_recall']:.4f} "
+            f"f1={bc_head_metrics['bc_head_f1']:.4f}"
+        )
 
     if args.backchannel.enable:
         for t in (vap_loss_accum, commitment_loss_accum):

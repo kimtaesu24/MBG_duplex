@@ -481,7 +481,35 @@ class Combinator(nn.Module):
 
 ######## code for backchannel #########
 import sys
-from .backchannel_vap import BackchannelOutput, gumbel_softmax_st, compute_temperature
+from dataclasses import dataclass
+
+
+@dataclass
+class BackchannelOutput2:
+    """Output of VapGPTBackchannelModule (v2 — head-only design, no gates/embeddings).
+
+    vap_logits: [B, T, 256] — future VAP window classification (CE, external).
+    vad_logits: [B, T, 2]   — CURRENT-frame voice activity logits per stream:
+                              [..., 0] = user (out["x1"]), [..., 1] = agent (out["x2"]).
+                              Trained with BCE against per-frame VAD targets.
+    bc_logits:  [B, T, 3]   — future text-slot class: 0=PAD, 1=EPAD (backchannel
+                              onset), 2=WORD (model already speaking). CE-trained.
+    """
+    vap_logits: torch.Tensor
+    vad_logits: torch.Tensor
+    bc_logits: torch.Tensor
+    # Inference only (set by LMGen): the actual gate decision for the exposed frame,
+    # [B, 1] bool. May differ from bc_logits argmax when a threshold rule is active —
+    # loggers should read THIS, not recompute from logits.
+    gate: Optional[torch.Tensor] = None
+    # Inference-only fusion diagnostics (all [B, 1] when populated by LMGen).
+    implicit_log_odds: Optional[torch.Tensor] = None
+    # START-vs-rest log-odds from bc_logits:
+    # log(P(class 1) / (P(class 0) + P(class 2))).
+    explicit_log_odds: Optional[torch.Tensor] = None
+    vap_agent_near: Optional[torch.Tensor] = None
+    fusion_score: Optional[torch.Tensor] = None
+    fusion_prob: Optional[torch.Tensor] = None
 
 
 def _load_vap_state_dict(path: str) -> dict:
@@ -532,7 +560,8 @@ class VapGPTBackchannelModule(nn.Module):
         bc_hidden: Hidden size of the BC gate MLP.
         pad_token_id / epad_token_id: Silence / backchannel token IDs.
         gumbel_temp_init / gumbel_temp_min / gumbel_anneal_rate:
-            Gumbel-Softmax temperature schedule (same as BackchannelModule).
+            DEPRECATED, ignored. The gate is now a deterministic straight-through
+            argmax (no Gumbel, no temperature). Kept only for config/API compat.
     """
 
     def __init__(
@@ -566,21 +595,33 @@ class VapGPTBackchannelModule(nn.Module):
         assert self.pad_token_id < card
         assert self.epad_token_id < card
 
-        self.gumbel_temp_init = gumbel_temp_init
-        self.gumbel_temp_min = gumbel_temp_min
-        self.gumbel_anneal_rate = gumbel_anneal_rate
+        # gumbel_temp_* are deprecated no-ops (gate is deterministic straight-through now).
         self.use_silence_ctx_proj = use_silence_ctx_proj
 
         # ── Pseudo-speaker projections (LM-dim fallbacks) ────────────────
         # z_s carries fused context for both speakers.  Two independent linear
         # projections let the model learn to extract user-side vs. agent-side
         # features from the same hidden state.
-        self.proj_user = nn.Linear(lm_dim, vap_dim, bias=False)   # User stream
-        self.proj_agent = nn.Linear(lm_dim, vap_dim, bias=False)  # Agent stream
+        # self.proj_user = nn.Linear(lm_dim, vap_dim, bias=False)   # User stream
+        # self.proj_agent = nn.Linear(lm_dim, vap_dim, bias=False)  # Agent stream
 
         # ── Audio projections for real per-speaker Mimi latents (512-dim) ─
-        self.proj_user_audio  = nn.Linear(512, vap_dim, bias=False)
-        self.proj_agent_audio = nn.Linear(512, vap_dim, bias=False)
+        # self.proj_user_audio  = nn.Linear(512, vap_dim, bias=False)
+        # self.proj_agent_audio = nn.Linear(512, vap_dim, bias=False)
+        self.proj_audio = nn.Linear(512, vap_dim, bias=False)
+
+        # ── LM-context projection (z_s stream restoration, head-level late fusion) ─
+        # z_s (lm_dim=4096) is projected down to vap_dim and LayerNorm'd. It is added
+        # to the VAP and BC heads as ZERO-INIT additive residuals (adapter pattern):
+        #   • pretrained VapGPT layers (ar_channel/ar/vap_head) keep their original
+        #     shapes and inputs → checkpoint loading is untouched, and at init the
+        #     module behaves exactly like the pretrained audio-only model;
+        #   • vap_loss and bc_loss now backprop through z_ctx_proj into the LM
+        #     backbone → multi-task shaping of the backbone representation.
+        # VAD stays purely acoustic by design (current-frame VA is solvable from
+        # audio alone; z_s residual excluded there).
+        self.z_ctx_proj = nn.Linear(lm_dim, vap_dim, bias=False)
+        self.z_ctx_norm = nn.LayerNorm(vap_dim)
 
         # ── VapGPT GPT layers ─────────────────────────────────────────────
         if vap_repo_path not in sys.path:
@@ -604,29 +645,20 @@ class VapGPTBackchannelModule(nn.Module):
         )
 
         # ── VAP head ──────────────────────────────────────────────────────
-        # 256 = 2^(2 * n_bins) with n_bins=4 (VapGPT default)
+        # 256 = 2^(2 * n_bins) with n_bins=4 (VapGPT default).
+        # NOTE: input stays vap_dim (NOT concat) so the pretrained vap_head weights
+        # load cleanly; the z_s contribution enters via the zero-init residual below.
         self.vap_head = nn.Linear(vap_dim, 256)
+        self.vap_z_head = nn.Linear(vap_dim, 256, bias=False)
+        nn.init.zeros_(self.vap_z_head.weight)
 
-        # ── BC gate MLP (agent-stream context → binary BC decision) ───────
-        # Uses out["x2"] (agent-side output from GPTStereo) so the gate is
-        # conditioned on what the agent "knows" about the conversation so far.
-        self.bc_mlp = nn.Sequential(
-            nn.Linear(vap_dim, bc_hidden),
-            nn.ReLU(),
-            nn.Linear(bc_hidden, 2),
-        )
+        self.va_classifier = nn.Linear(vap_dim, 1)  # purely acoustic (no z_s)
 
-        # ── Alt 1: Silence gate MLP ───────────────────────────────────────
-        # Operates on x_user (per-speaker user audio features or projected lm hidden state).
-        # Trained to detect Inter-Pausal Units where backchannels are appropriate.
-        self.silence_gate_mlp = nn.Sequential(
-            nn.Linear(vap_dim, bc_hidden // 2),
-            nn.ReLU(),
-            nn.Linear(bc_hidden // 2, 2),
-        )
-
-        # ── Silence context projection for the BC gate ────────────────────
-        self.silence_ctx_proj = nn.Linear(vap_dim, vap_dim, bias=False) if use_silence_ctx_proj else None
+        # BC head: audio/turn-taking pathway + zero-init z_s residual (additive,
+        # symmetric with vap_head; replaces the earlier concat design).
+        self.bc_head = nn.Linear(vap_dim, 3)  # BC logits (PAD/EPAD/WORD)
+        self.bc_z_head = nn.Linear(vap_dim, 3, bias=False)
+        nn.init.zeros_(self.bc_z_head.weight)
 
         # ── Load pretrained VapGPT weights (GPT layers + vap_head) ───────
         if checkpoint_path is not None:
@@ -653,9 +685,6 @@ class VapGPTBackchannelModule(nn.Module):
         own_sd.update(to_load)
         self.load_state_dict(own_sd)
 
-    def get_temperature(self, step: int) -> float:
-        return compute_temperature(step, self.gumbel_temp_init, self.gumbel_temp_min, self.gumbel_anneal_rate)
-
     def forward(
         self,
         z_s: torch.Tensor,
@@ -663,81 +692,56 @@ class VapGPTBackchannelModule(nn.Module):
         step: int = 0,
         agent_audio_feat: Optional[torch.Tensor] = None,
         user_audio_feat: Optional[torch.Tensor] = None,
-    ) -> BackchannelOutput:
-        """Backchannel prediction from LM hidden states.
+    ) -> BackchannelOutput2:
+        """Backchannel prediction from LM hidden states (v2 — pure prediction heads).
 
         Args:
             z_s:              [B, T, lm_dim] LM backbone hidden states.
-            emb_cb0:          PAD/EPAD를 조회할 임베딩 테이블. PAD/EPAD가 텍스트 어휘에
-                              속하므로 호출 측에서 depformer_text_emb를 전달해야 함.
-                              bc_embeddings는 cb_index=0 입력 교체에 사용됨 (Alt 2).
-            step:             training step for temperature annealing.
+            emb_cb0:          unused (kept for API compat with the v1 module).
+            step:             unused (kept for API compat; temperature/gumbel removed).
             agent_audio_feat: [B, T, 512] real per-speaker Mimi latents for agent (optional).
             user_audio_feat:  [B, T, 512] real per-speaker Mimi latents for user (optional).
 
         Returns:
-            BackchannelOutput — bc_embeddings, vap_logits, bc_gate,
-                                bc_logits, silence_gate_logits.
+            BackchannelOutput2 — vap_logits [B,T,256], vad_logits [B,T,2] (current VA:
+            user, agent), bc_logits [B,T,3] (PAD/EPAD/WORD).
         """
         B, T, _ = z_s.shape
-        temp = self.get_temperature(step)
         device = z_s.device
 
-        # ── Step 1: Project → two pseudo-speaker streams ──────────────────
-        x_user  = self.proj_user_audio(user_audio_feat)  # [B, T, vap_dim]
-        x_agent = self.proj_agent(z_s)                   # [B, T, vap_dim]
+        # v2: both pseudo-speaker streams come from REAL per-speaker Mimi latents
+        # (512-dim) through a single shared projection — symmetric VapGPT-style
+        # input. z_s is no longer projected into the streams (proj_agent removed).
+        assert user_audio_feat is not None and agent_audio_feat is not None, (
+            "VapGPTBackchannelModule(v2) requires per-speaker audio latents: "
+            "pass mimi to LMModel.forward_train / LMGen so agent/user feats are auto-extracted."
+        )
+        x_user  = self.proj_audio(user_audio_feat)   # [B, T, vap_dim]
+        x_agent = self.proj_audio(agent_audio_feat)  # [B, T, vap_dim]
 
-        # ── Step 2: Per-stream GPT (shared weights) ───────────────────────
         h_user = self.ar_channel(x_user)["x"]   # [B, T, vap_dim]
         h_agent = self.ar_channel(x_agent)["x"] # [B, T, vap_dim]
 
-        # ── Step 3: Cross-stream GPTStereo ────────────────────────────────
-        # out["x"]  = combined turn-taking representation (for VAP head)
-        # out["x2"] = agent-side context after cross-attention (for BC gate)
         out = self.ar(h_user, h_agent)  # {"x", "x1", "x2"}
 
-        # ── Step 4: VAP logits ────────────────────────────────────────────
-        vap_logits = self.vap_head(out["x"])  # [B, T, 256]
+        # VAD: purely acoustic per-stream heads (z_s intentionally excluded —
+        # current-frame VA is solvable from audio; keeps this head untangled).
+        v1 = self.va_classifier(out["x1"])
+        v2 = self.va_classifier(out["x2"])
+        vad_logits = torch.cat((v1, v2), dim=-1)
 
-        # ── Alt 1: Silence gate on user audio features (IPU boundary detection) ──
-        # x_user encodes per-frame user speech activity; silence gate learns to detect
-        # Inter-Pausal Units (pauses) where backchannels are appropriate.
-        s_pad_logits = self.silence_gate_mlp(x_user)  # [B, T, 2]
-        s_pad_onehot = gumbel_softmax_st(s_pad_logits, temperature=temp, hard=True)
-        s_pad = s_pad_onehot[..., 1]  # [B, T]
+        # z_s stream (head-level late fusion): shared projected LM context, added
+        # as zero-init residuals so training starts at the pretrained audio-only
+        # behaviour and vap/bc losses backprop into the LM backbone through z_s.
+        z_ctx = self.z_ctx_norm(self.z_ctx_proj(z_s))               # [B, T, vap_dim]
 
-        # ── Step 5: BC gate — agent context modulated by user silence ─────
-        # User silence probability gates the silence context into agent representation:
-        # when user is silent, silence_ctx_proj(x_user) contributes to bc_mlp input,
-        # steering bc_mlp toward firing precisely at IPU boundaries.
-        s_pad_soft_exp = F.softmax(s_pad_logits, dim=-1)[..., 1:2]  # [B, T, 1] soft silence prob
-        if self.silence_ctx_proj is not None:
-            z_bc_input = out["x2"] + self.silence_ctx_proj(x_user) * s_pad_soft_exp
-        else:
-            z_bc_input = out["x2"]
-        z_bc = self.bc_mlp(z_bc_input)   # [B, T, 2]
-        y_bc_onehot = gumbel_softmax_st(z_bc, temperature=temp, hard=True)
-        y_bc = y_bc_onehot[..., 1]       # [B, T]
+        vap_logits = self.vap_head(out["x"]) + self.vap_z_head(z_ctx)  # [B, T, 256]
+        bc_logits = self.bc_head(out["x"]) + self.bc_z_head(z_ctx)     # [B, T, 3]
 
-        # Hard gate used at inference for discrete token replacement.
-        g_final = s_pad * y_bc  # [B, T]
 
-        # Soft gate for training embedding — product of raw softmax probs (no Gumbel, no ST).
-        # Both gates contribute gradient at every timestep; no blocking from the other being 0.
-        y_bc_soft = F.softmax(z_bc, dim=-1)[..., 1]          # [B, T]
-        s_pad_soft = F.softmax(s_pad_logits, dim=-1)[..., 1]  # [B, T]
-        g_soft = y_bc_soft * s_pad_soft                        # [B, T], always in (0,1)
 
-        pad_ids = torch.full((1,), self.pad_token_id, device=device, dtype=torch.long)
-        epad_ids = torch.full((1,), self.epad_token_id, device=device, dtype=torch.long)
-        pad_emb = emb_cb0(pad_ids)    # [1, depformer_dim]
-        epad_emb = emb_cb0(epad_ids)  # [1, depformer_dim]
-        g_soft_exp = g_soft.unsqueeze(-1)
-        bc_token_emb = g_soft_exp * epad_emb + (1.0 - g_soft_exp) * pad_emb  # [B, T, depformer_dim]
-        return BackchannelOutput(
-            bc_embeddings=bc_token_emb,
+        return BackchannelOutput2(
             vap_logits=vap_logits,
-            bc_gate=g_final,
-            bc_logits=z_bc,
-            silence_gate_logits=s_pad_logits,
+            vad_logits=vad_logits,
+            bc_logits=bc_logits,
         )

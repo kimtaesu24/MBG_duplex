@@ -183,3 +183,17 @@ mlx-trace.json
 # Include everything in assets
 !assets/
 !assets/**
+
+moshi-finetune/config
+
+moshi-finetune/daily-talk-contiguous
+moshi-finetune/data/dualtalk
+moshi-finetune/data/_stereo_json_backup
+moshi-finetune/data/stereo_ami_balanced
+moshi-finetune/data/stereo_ami_balanced_*
+
+moshi-finetune/output
+moshi-finetune/result
+
+moshi-finetune/mimi_codec_50000.pt
+moshi-finetune/mimi_stats.json

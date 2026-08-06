@@ -32,7 +32,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from os.path import splitext
+from os.path import isfile, splitext
 import logging
 import numpy as np
 import sys
@@ -50,7 +50,7 @@ from ..modules.transformer import (
     create_norm_fn,
 )
 from .backchannel_vap import BackchannelModule
-from .vap_gpt_module import VapGPTBackchannelModule
+from .vap_gpt_module import VapGPTBackchannelModule, BackchannelOutput2
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,10 @@ class LMOutput:
     face_pred: Optional[torch.Tensor] = None           # [B, T_face, 54] teacher-forced face motion
     face_outputs: Optional[dict] = None                # full CausalSoftVQContinuousTransformer output dict
     bc_stats: Optional[dict] = None                    # scalar tensors: y_bc_mean, s_pad_mean, g_soft_mean, g_final_rate
-    bc_logits: Optional[torch.Tensor] = None  # [B, T, 2] — raw bc_mlp logits for focal loss
+    bc_logits: Optional[torch.Tensor] = None  # [B, T, 3] — future text-slot class logits (0=PAD, 1=EPAD, 2=WORD)
+    vad_logits: Optional[torch.Tensor] = None  # [B, T, 2] — CURRENT-frame VA logits (0=user, 1=agent), BCE-supervised
+    transformer_out: Optional[torch.Tensor] = None  # [B, T, D], for online-teacher KD
+    fusion_residual: Optional[torch.Tensor] = None  # [B, T], learned EPAD residual
 
 
 def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -279,6 +282,11 @@ class LMModel(StreamingContainer):
         backchannel_gumbel_temp_init: float = 1.0,
         backchannel_gumbel_temp_min: float = 0.5,
         backchannel_gumbel_anneal_rate: float = 0.0001,
+        backchannel_fusion_trainable: bool = False,
+        backchannel_fusion_bc_init: float = 0.0,
+        backchannel_fusion_vap_init: float = 0.0,
+        backchannel_fusion_vad_init: float = 0.0,
+        backchannel_fusion_bias_init: float = 0.0,
         # VapGPT-specific params (used when backchannel_module_type == "vap_gpt")
         backchannel_vap_repo_path: str = "",
         backchannel_vap_checkpoint: Optional[str] = None,
@@ -296,6 +304,12 @@ class LMModel(StreamingContainer):
         face_module_heads: int = 8,
         face_module_code_dim: int = 32,
         face_module_prior_warmup_frames: int = 10,
+        face_module_version: int = 1,
+        face_module_ss_prob: float = 0.0,
+        face_module_ss_ramp_steps: int = 0,
+        face_module_ss_start_step: int = 0,
+        face_module_ss_keep_head_frames: int = 0,
+        face_module_detach_llm_features: bool = False,
         # ── Mimi Model for internal audio decoding (server) ──────────────────
         # Used by the face module to decode agent audio from predicted logits.
         mimi_enabled: bool = False,
@@ -309,6 +323,30 @@ class LMModel(StreamingContainer):
         self.dep_q = dep_q
         self.card = card
         self.text_card = text_card
+        self.face_module_ss_prob = float(face_module_ss_prob)
+        self.face_module_ss_ramp_steps = int(face_module_ss_ramp_steps)
+        self.face_module_ss_start_step = int(face_module_ss_start_step)
+        self.face_module_ss_keep_head_frames = int(face_module_ss_keep_head_frames)
+        self.face_module_detach_llm_features = bool(
+            face_module_detach_llm_features
+        )
+        self.backchannel_fusion_trainable = bool(backchannel_fusion_trainable)
+        self.backchannel_fusion_bc_weight = nn.Parameter(
+            torch.tensor(float(backchannel_fusion_bc_init)),
+            requires_grad=self.backchannel_fusion_trainable,
+        )
+        self.backchannel_fusion_vap_weight = nn.Parameter(
+            torch.tensor(float(backchannel_fusion_vap_init)),
+            requires_grad=self.backchannel_fusion_trainable,
+        )
+        self.backchannel_fusion_vad_weight = nn.Parameter(
+            torch.tensor(float(backchannel_fusion_vad_init)),
+            requires_grad=self.backchannel_fusion_trainable,
+        )
+        self.backchannel_fusion_bias = nn.Parameter(
+            torch.tensor(float(backchannel_fusion_bias_init)),
+            requires_grad=self.backchannel_fusion_trainable,
+        )
         assert len(delays) == self.num_codebooks, "unexpected number of delays"
         self.delays = delays
         self.dim = dim
@@ -440,32 +478,92 @@ class LMModel(StreamingContainer):
 
         # ── Face Generation Module ────────────────────────────────────────────
         self.face_module = None
+        if face_module_enabled and not face_module_dir:
+            raise ValueError(
+                "face_module_enabled=True requires a non-empty face_module_dir"
+            )
         if face_module_enabled and face_module_dir:
             if face_module_dir not in sys.path:
                 sys.path.insert(0, face_module_dir)
+            if face_module_checkpoint is None:
+                raise ValueError(
+                    "face_module_enabled=True requires face_module_checkpoint; "
+                    "refusing to train an uninitialised face module."
+                )
+            if not isfile(face_module_checkpoint):
+                raise FileNotFoundError(
+                    f"Required face checkpoint does not exist: {face_module_checkpoint}"
+                )
             try:
-                from softvq_continuous_online_train import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                # Version switch: v2 (softvq_continuous_online_train_v2) adds blink
+                # modelling, block-causal audio chunks and MTP look-ahead over v1.
+                # v6 additionally adds partner-context cross-attention (partner_layers,
+                # use_vap). v7 drops that v6-only feature and otherwise refines the
+                # v2-era architecture — its constructor matches v2's, not v6's.
+                # Checkpoints from different versions are NOT interchangeable —
+                # face_module_version must match the checkpoint's training script exactly.
+                if int(face_module_version) >= 7:
+                    from softvq_continuous_online_train_v7 import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                elif int(face_module_version) == 6:
+                    from softvq_continuous_online_train_v6 import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                elif int(face_module_version) >= 2:
+                    from softvq_continuous_online_train_v2 import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
+                else:
+                    from softvq_continuous_online_train import CausalSoftVQContinuousTransformer as _FaceModel  # noqa: PLC0415
                 # Read architecture hyperparams from checkpoint when available,
                 # falling back to explicit constructor arguments.
                 ckpt_args: dict = {}
                 if face_module_checkpoint is not None:
                     _raw = torch.load(face_module_checkpoint, map_location="cpu", weights_only=False)
                     ckpt_args = _raw.get("args", {})
-                face_net = _FaceModel(
+                _face_kwargs = dict(
                     hidden_dim=int(ckpt_args.get("hidden_dim", face_module_hidden_dim)),
                     layers=int(ckpt_args.get("layers", face_module_layers)),
                     heads=int(ckpt_args.get("heads", face_module_heads)),
                     code_dim=int(ckpt_args.get("code_dim", face_module_code_dim)),
                     prior_warmup_frames=int(ckpt_args.get("prior_warmup_frames", face_module_prior_warmup_frames)),
                 )
-                if face_module_checkpoint is not None:
-                    face_net.load_state_dict(_raw["model"])
-                    logger.info(f"[LMModel] Face module loaded from: {face_module_checkpoint}")
+                if int(face_module_version) >= 2:
+                    # v2+ arch args — MUST mirror the checkpoint: the MTP/look-ahead
+                    # modules are only instantiated when lookahead_frames > 0, so a
+                    # mismatch breaks the (strict) state-dict load below.
+                    _face_kwargs.update(
+                        lookahead_frames=int(ckpt_args.get("lookahead_frames", 0)),
+                        chunk_frames=int(ckpt_args.get("chunk_frames", 1)),
+                        token_vocab=int(ckpt_args.get("token_vocab", 2048)),
+                        la_temp=float(ckpt_args.get("la_temp", 0.5)),
+                    )
+                if int(face_module_version) == 6:
+                    # v6-only arch args (partner-context cross-attention). Not present
+                    # in v7 — its constructor reverted to the v2 parameter set.
+                    _face_kwargs.update(
+                        partner_layers=int(ckpt_args.get("partner_layers", 2)),
+                        use_vap=bool(ckpt_args.get("use_vap", True)),
+                    )
+                face_net = _FaceModel(**_face_kwargs)
+                if "model" not in _raw:
+                    raise KeyError(
+                        f"Face checkpoint has no 'model' state dict: {face_module_checkpoint}"
+                    )
+                face_net.load_state_dict(_raw["model"], strict=True)
+                # Reset only the newly connected v7 LLM-feature residual after
+                # loading the standalone face checkpoint. This guarantees that
+                # end-to-end step 0 reproduces the pretrained audio-only model.
+                if int(face_module_version) >= 7:
+                    if not hasattr(face_net, "llm_proj"):
+                        raise AttributeError("v7 face model is missing required llm_proj")
+                    torch.nn.init.zeros_(face_net.llm_proj.weight)
+                    if face_net.llm_proj.bias is not None:
+                        torch.nn.init.zeros_(face_net.llm_proj.bias)
+                    logger.info("[LMModel] v7 llm_proj zero-initialized after checkpoint load.")
+                logger.info(f"[LMModel] Face module loaded from: {face_module_checkpoint}")
                 self.face_module = face_net
                 logger.info("[LMModel] Face generation module initialized as submodule.")
             except Exception as _e:
-                logger.warning(f"[LMModel] Face module initialization failed: {_e}. Proceeding without face module.")
-                self.face_module = None
+                raise RuntimeError(
+                    f"Face module initialization failed for {face_module_checkpoint}; "
+                    "training cannot continue without the requested face branch."
+                ) from _e
 
         # ── Internal Mimi for face audio decoding (server) ──────────────────
         # Each rank holds a frozen full copy (small model — no FSDP needed).
@@ -719,6 +817,39 @@ class LMModel(StreamingContainer):
                                   audio_feat=audio_feat, gt_face_motion=gt_face_motion, mimi=mimi,
                                   bc_audio_feats=bc_audio_feats)
 
+    def forward_teacher(
+        self,
+        codes: torch.Tensor,
+        voice_prompt_embs: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Text/hidden-only forward for a frozen online teacher.
+
+        Skips Depformer, VAP, and face branches to keep online distillation
+        substantially cheaper than a second full training forward.
+        """
+        B = codes.shape[0]
+        initial = self._get_initial_token().expand(B, -1, -1)
+        delayed_codes = _delay_sequence(self.delays, codes, initial)
+        delayed_codes = torch.cat([initial, delayed_codes], dim=2)
+        if voice_prompt_embs is not None:
+            vp_embs = self.embed_codes(voice_prompt_embs)
+            main_embs = self.embed_codes(delayed_codes[:, :, :-1])
+            transformer_out, text_logits = self.forward_embeddings(
+                torch.cat([vp_embs, main_embs], dim=1)
+            )
+            prompt_len = vp_embs.shape[1]
+            transformer_out = transformer_out[:, prompt_len:]
+            text_logits = text_logits[:, :, prompt_len:]
+        else:
+            transformer_out, text_logits = self.forward_codes(
+                delayed_codes[:, :, :-1]
+            )
+        text_logits, text_mask = _undelay_sequence(
+            self.delays[:1], text_logits, fill_value=float("NaN")
+        )
+        text_mask &= codes[:, :1] != self.zero_token_id
+        return text_logits, text_mask, transformer_out
+
     def forward_train(self, codes: torch.Tensor, step: int = 0, voice_prompt_embs: Optional[torch.Tensor] = None,
                       audio_feat: Optional[torch.Tensor] = None, gt_face_motion: Optional[torch.Tensor] = None,
                       mimi=None, bc_audio_feats: Optional[tuple] = None):  # (agent_audio_feat, user_audio_feat), each [B,T,512]
@@ -743,8 +874,9 @@ class LMModel(StreamingContainer):
         else:
             transformer_out, text_logits = self.forward_codes(delayed_codes[:, :, :-1])
 
-        # ── Backchannel Module ────────────────────────────────────────────
+        # ── Backchannel Module (v2 — pure auxiliary prediction heads) ─────
         vap_logits = None
+        vad_logits = None
         commitment_loss = None
         bc_stats = None
         bc_result = None
@@ -771,50 +903,26 @@ class LMModel(StreamingContainer):
                 agent_audio_feat=_agent_af,
                 user_audio_feat=_user_af,
             )
-            vap_logits = bc_result.vap_logits  # [B, T, vap_dim]
+            vap_logits = bc_result.vap_logits  # [B, T, 256]
+            vad_logits = bc_result.vad_logits  # [B, T, 2] — current VA (user, agent)
 
-            # Build a differentiable conditioned embedding for the depformer's text slot:
-            #   - PAD positions : bc_result.bc_embeddings
-            #                     = g_soft * epad_emb + (1-g_soft) * pad_emb
-            #                     g_soft = y_bc_soft * s_pad_soft (raw softmax, no ST)
-            #                     → gradient flows to both bc_mlp and silence_gate_mlp
-            #                       at every PAD timestep without blocking.
-            #   - non-PAD positions : GT token embedding (word tokens / EPAD already in data)
-            # The text_loss target (codes[:, :1]) is left unchanged.
-            gt_text_emb = self.depformer_text_emb(target_codes[:, 0])   # [B, T, depformer_dim]
-            is_pad = (target_codes[:, 0] == self.text_padding_token_id).unsqueeze(-1)  # [B, T, 1]
-            conditioned_emb = torch.where(is_pad, bc_result.bc_embeddings, gt_text_emb)
-            logits = self.forward_depformer_training(target_codes, transformer_out,
-                                                     text_token_emb=conditioned_emb)
+            # v2 design: NO depformer input conditioning (no bc_embeddings, no gates,
+            # no commitment loss). The depformer trains exactly like original Moshi;
+            # the backchannel module is a pure auxiliary predictor whose bc/vad/vap
+            # heads are CE/BCE-supervised externally (train.py).
+            # logits = self.forward_depformer_training(target_codes, transformer_out)
 
-            # Commitment loss — align bc_mlp & silence_gate with text_linear's
-            # PAD/EPAD distribution (stop-gradient so the LM backbone is not affected).
-            tl = text_logits[:, 0]  # [B, T, text_card]
-            pad_epad_tl = torch.stack([
-                tl[:, :, self.backchannel.pad_token_id],   # PAD prob  (index 0)
-                tl[:, :, self.backchannel.epad_token_id],  # EPAD prob (index 1)
-            ], dim=-1).detach()
-            epad_prob = F.softmax(pad_epad_tl, dim=-1)[..., 1]  # [B, T]
-            # bc_mlp[...,1] should fire when EPAD is likely
-            bc_commit = F.binary_cross_entropy_with_logits(
-                bc_result.bc_logits[..., 1], epad_prob,
-            )
-            # silence_gate[...,1] should fire when PAD (silence) is likely
-            silence_commit = F.binary_cross_entropy_with_logits(
-                bc_result.silence_gate_logits[..., 1], 1.0 - epad_prob,
-            )
-            commitment_loss = bc_commit + silence_commit
-
-            y_bc_soft = F.softmax(bc_result.bc_logits, dim=-1)[..., 1]
-            s_pad_soft = F.softmax(bc_result.silence_gate_logits, dim=-1)[..., 1]
+            probs = F.softmax(bc_result.bc_logits, dim=-1)  # [B, T, 3]
             bc_stats = {
-                "bc/y_bc_mean":    y_bc_soft.detach().mean(),
-                "bc/s_pad_mean":   s_pad_soft.detach().mean(),
-                "bc/g_soft_mean":  (y_bc_soft * s_pad_soft).detach().mean(),
-                "bc/g_final_rate": bc_result.bc_gate.detach().mean(),
+                "bc/p_pad_mean":     probs[..., 0].detach().mean(),
+                "bc/p_epad_mean":    probs[..., 1].detach().mean(),
+                "bc/p_word_mean":    probs[..., 2].detach().mean(),
+                "bc/pred_epad_rate": (bc_result.bc_logits.detach().argmax(-1) == 1).float().mean(),
+                "bc/vad_user_mean":  torch.sigmoid(bc_result.vad_logits[..., 0]).detach().mean(),
+                "bc/vad_agent_mean": torch.sigmoid(bc_result.vad_logits[..., 1]).detach().mean(),
             }
-        else:
-            logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
+            
+        logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
 
         # map back the logits on pattern sequence to logits on original codes: [B, K, S, card] -> [B, K, T, card]
         # and provide the corresponding mask over invalid positions of tokens. We will with NaN values invalid positions
@@ -825,6 +933,45 @@ class LMModel(StreamingContainer):
         logits_mask &= (codes[:, self.audio_offset: self.audio_offset + self.dep_q] != self.zero_token_id)
         text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float('NaN'))
         text_logits_mask &= (codes[:, :1] != self.zero_token_id)
+
+        # Jointly trained soft state-to-token fusion.  START is compared with
+        # both non-onset states (remain silent and already speaking), then the
+        # resulting evidence is added only to EPAD.  There is no hard state
+        # decision: the regular text CE and sampler retain the final decision.
+        fusion_residual = None
+        if self.backchannel_fusion_trainable and bc_result is not None:
+            bc = bc_result.bc_logits.float()
+            start_log_odds = bc[..., 1] - torch.logsumexp(bc[..., [0, 2]], dim=-1)
+
+            vap_log_odds = torch.zeros_like(start_log_odds)
+            if bc_result.vap_logits is not None:
+                vap = bc_result.vap_logits.float()
+                class_ids = torch.arange(vap.shape[-1], device=vap.device)
+                near = (class_ids & 0x08) != 0
+                vap_log_odds = (
+                    torch.logsumexp(vap[..., near], dim=-1)
+                    - torch.logsumexp(vap[..., ~near], dim=-1)
+                )
+
+            # vad_logits[..., 0] is user-active log-odds.
+            user_quiet_log_odds = -bc_result.vad_logits[..., 0].float()
+            fusion_residual = (
+                self.backchannel_fusion_bc_weight.float() * start_log_odds
+                + self.backchannel_fusion_vap_weight.float() * vap_log_odds
+                + self.backchannel_fusion_vad_weight.float() * user_quiet_log_odds
+                + self.backchannel_fusion_bias.float()
+            )
+            text_logits = text_logits.float().clone()
+            text_logits[:, 0, :, self.end_of_text_padding_id] += fusion_residual
+
+            if bc_stats is not None:
+                bc_stats.update({
+                    "fusion/residual_mean": fusion_residual.detach().mean(),
+                    "fusion/bc_weight": self.backchannel_fusion_bc_weight.detach().float(),
+                    "fusion/vap_weight": self.backchannel_fusion_vap_weight.detach().float(),
+                    "fusion/vad_weight": self.backchannel_fusion_vad_weight.detach().float(),
+                    "fusion/bias": self.backchannel_fusion_bias.detach().float(),
+                })
 
         # ── Face Generation Module (server logic) ────────────────────────────
         #
@@ -840,12 +987,22 @@ class LMModel(StreamingContainer):
         face_pred = None
         face_outputs = None
 
+        if self.training and self.face_module is None and gt_face_motion is not None:
+            raise RuntimeError(
+                "Face ground truth was provided but face_module is unavailable."
+            )
+
         if self.face_module is not None:
             # 1. Determine expected motion dim and whether this batch has valid data.
             valid_face_batch = True
             dummy_B = max(B, 1)
 
             if gt_face_motion is None:
+                if self.training:
+                    raise RuntimeError(
+                        "Face training requires gt_face_motion for every batch; "
+                        "refusing to run a dummy zero-motion pass."
+                    )
                 valid_face_batch = False
                 expected_dim = getattr(
                     getattr(self.face_module, "module", self.face_module),
@@ -860,7 +1017,11 @@ class LMModel(StreamingContainer):
 
             # 2. Resolve which mimi to use and decode agent audio features.
             mimi_to_use = mimi if mimi is not None else self.mimi
-            transformer_out_run = transformer_out
+            transformer_out_run = (
+                transformer_out.detach()
+                if self.face_module_detach_llm_features
+                else transformer_out
+            )
             audio_feat_run = None
 
             if mimi_to_use is not None:
@@ -884,6 +1045,12 @@ class LMModel(StreamingContainer):
                 # Fallback: use externally provided audio_feat (teacher-forced).
                 audio_feat_run = audio_feat
 
+            if self.training and audio_feat_run is None:
+                raise RuntimeError(
+                    "Face training requires either mimi for generated audio features "
+                    "or a teacher-forced audio_feat tensor; neither was provided."
+                )
+
             # 3. Build prev_motion for teacher forcing, or create dummy tensors.
             if valid_face_batch:
                 start = torch.zeros(
@@ -905,9 +1072,43 @@ class LMModel(StreamingContainer):
 
             # 4. Forward the face module (always, for FSDP sync).
             if audio_feat_run is not None:
+                # Exposure-bias mitigation: use a no-grad teacher-forced pass to
+                # replace a scheduled fraction of GT history with self history.
+                ss_prob = 0.0
+                if self.training and valid_face_batch and self.face_module_ss_prob > 0.0:
+                    if step > self.face_module_ss_start_step:
+                        if self.face_module_ss_ramp_steps > 0:
+                            progress = min(
+                                1.0,
+                                (step - self.face_module_ss_start_step)
+                                / self.face_module_ss_ramp_steps,
+                            )
+                        else:
+                            progress = 1.0
+                        ss_prob = self.face_module_ss_prob * progress
+                if ss_prob > 0.0:
+                    with torch.no_grad():
+                        ss_out = self.face_module(
+                            audio_feat_run, prev_motion, llm_feat=transformer_out_run
+                        )
+                        self_prev_motion = torch.cat(
+                            [prev_motion[:, :1], ss_out["pred_motion"][:, :-1]], dim=1
+                        )
+                        ss_mask = (
+                            torch.rand(B, prev_motion.shape[1], 1, device=prev_motion.device)
+                            < ss_prob
+                        )
+                        if self.face_module_ss_keep_head_frames > 0:
+                            ss_mask[:, :self.face_module_ss_keep_head_frames] = False
+                        prev_motion = torch.where(ss_mask, self_prev_motion, prev_motion)
                 face_outputs = self.face_module(
                     audio_feat_run, prev_motion, llm_feat=transformer_out_run
                 )
+                if self.training and face_outputs is None:
+                    raise RuntimeError("v7 face module returned None during training")
+                if self.training and "pred_motion" not in face_outputs:
+                    raise KeyError("v7 face output is missing required 'pred_motion'")
+                face_outputs["scheduled_sampling_prob"] = face_outputs["pred_motion"].new_tensor(ss_prob)
                 if valid_face_batch:
                     face_pred = face_outputs["pred_motion"]
                 else:
@@ -927,7 +1128,10 @@ class LMModel(StreamingContainer):
             text_logits, text_logits_mask, 
             vap_logits, commitment_loss,
             face_pred, face_outputs, bc_stats,
-            bc_logits=bc_result.bc_logits if bc_result is not None else None)
+            bc_logits=bc_result.bc_logits if bc_result is not None else None,
+            vad_logits=vad_logits,
+            transformer_out=transformer_out,
+            fusion_residual=fusion_residual)
 
 @dataclass
 class _LMGenState:
@@ -1040,6 +1244,12 @@ class LMGen(StreamingModule[_LMGenState]):
         frame_rate: int = FRAME_RATE_HZ,
         mimi=None,
         suppress_epad: bool = False,
+        bc_context_frames: int = 250,
+        epad_control: str = "fusion",
+        fusion_bc_weight: float = 1.0,
+        fusion_vap_weight: float = 0.0,
+        fusion_vad_weight: float = 0.0,
+        fusion_threshold: float = 0.5,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -1083,6 +1293,39 @@ class LMGen(StreamingModule[_LMGenState]):
         # written to state.cache, so the model's autoregressive history sees [PAD] and is
         # therefore prevented from starting a word in the next step.
         self.suppress_epad = suppress_epad
+        if epad_control not in ("none", "legacy", "fusion"):
+            raise ValueError(
+                f"epad_control must be one of none/legacy/fusion, got {epad_control!r}"
+            )
+        if not 0.0 < fusion_threshold < 1.0:
+            raise ValueError("fusion_threshold must be strictly between 0 and 1")
+        self.epad_control = epad_control
+        self.fusion_bc_weight = float(fusion_bc_weight)
+        self.fusion_vap_weight = float(fusion_vap_weight)
+        self.fusion_vad_weight = float(fusion_vad_weight)
+        self.fusion_threshold = float(fusion_threshold)
+        # Rolling-window history for the VapGPT backchannel module: its GPT layers have no
+        # KV cache, so at inference we replay the same causal context seen during training
+        # by buffering past frames (transformer_out + per-speaker audio feats) up to
+        # bc_context_frames, running the module over the whole window, and taking the last
+        # (current) frame's decision. Set bc_context_frames to the training sequence length
+        # (duration_sec * frame_rate) for exact train/inference parity.
+        self.bc_context_frames = bc_context_frames
+        self._bc_hist_tout: Optional[torch.Tensor] = None
+        self._bc_hist_agent: Optional[torch.Tensor] = None
+        self._bc_hist_user: Optional[torch.Tensor] = None
+
+    def _reset_bc_history(self) -> None:
+        self._bc_hist_tout = None
+        self._bc_hist_agent = None
+        self._bc_hist_user = None
+
+    def reset_streaming(self):
+        # reset_streaming() only calls state.reset() (not _init_streaming_state), so the
+        # rolling backchannel history — stored on self — must be cleared here too, otherwise
+        # it leaks across clips (callers reset_streaming per utterance).
+        super().reset_streaming()
+        self._reset_bc_history()
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -1106,6 +1349,7 @@ class LMGen(StreamingModule[_LMGenState]):
         graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
+        self._reset_bc_history()
         return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
     
     @torch.no_grad()
@@ -1271,26 +1515,20 @@ class LMGen(StreamingModule[_LMGenState]):
         state = self._streaming_state
         lm_model = self.lm_model
 
-        # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
-        sampled_text_token = sample_token(
-            text_logits.float(),
-            self.use_sampling,
-            self.temp_text,
-            self.top_k_text,
-        )
-        assert sampled_text_token.dim() == 3, sampled_text_token.shape
-        assert sampled_text_token.shape[2] == 1
-        assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
-        sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
+        # Fusion may add an explicit turn-taking residual to the backbone's EPAD
+        # logit below. Sampling is deliberately deferred until after that residual
+        # is available, and is performed exactly once so bc_weight=0 reproduces the
+        # original backbone sampling path (including RNG consumption).
+        text_logits_for_sampling = text_logits.float()
+        gate_fires = None
 
-        # Backchannel inference replacement: if bc_gate fires and the sampled token is
-        # PAD, replace it with EPAD so the model signals "about to talk".
-        # transformer_out is [B, 1, dim] in streaming mode; bc_gate is [B, 1].
+        # Compute explicit turn-taking evidence before text sampling. Fusion mode
+        # applies it as an EPAD-logit residual; legacy mode retains hard replacement.
         if lm_model.backchannel is not None:
+            is_vapgpt = isinstance(lm_model.backchannel, VapGPTBackchannelModule)
             agent_af = None
             user_af = None
-            if (self.mimi is not None and input_codes is not None
-                    and isinstance(lm_model.backchannel, VapGPTBackchannelModule)):
+            if is_vapgpt and self.mimi is not None and input_codes is not None:
                 # input_codes: [B, K, 1] — decode a single frame of per-speaker latents.
                 # Sentinel values: initial_token_id = card (out-of-range high),
                 # ungenerated = -2, zero = -1 (out-of-range low).
@@ -1302,29 +1540,176 @@ class LMGen(StreamingModule[_LMGenState]):
                 user_af = self.mimi.decode_latent(
                     input_codes[:, 9:17, :].clamp(0, max_code)
                 ).transpose(1, 2).to(dtype=transformer_out.dtype)  # [B, 1, 512]
+
+            if is_vapgpt:
+                # Rolling-window history: the VapGPT layers have no KV cache, so replay the
+                # same causal context seen during training by buffering past frames and
+                # running the module over the whole window (clone/cat copies out of the
+                # CUDA-graph static buffer that transformer_out may alias).
+                W = self.bc_context_frames
+                self._bc_hist_tout = (
+                    transformer_out.clone() if self._bc_hist_tout is None
+                    else torch.cat([self._bc_hist_tout, transformer_out], dim=1)
+                )[:, -W:]
+                tout_in = self._bc_hist_tout
+                if agent_af is not None:
+                    self._bc_hist_agent = (
+                        agent_af if self._bc_hist_agent is None
+                        else torch.cat([self._bc_hist_agent, agent_af], dim=1)
+                    )[:, -W:]
+                    self._bc_hist_user = (
+                        user_af if self._bc_hist_user is None
+                        else torch.cat([self._bc_hist_user, user_af], dim=1)
+                    )[:, -W:]
+                    agent_in, user_in = self._bc_hist_agent, self._bc_hist_user
+                else:
+                    agent_in, user_in = None, None
+            else:
+                # Non-VapGPT (MLP) module is per-frame; no history needed.
+                tout_in, agent_in, user_in = transformer_out, agent_af, user_af
+
             bc_result = lm_model.backchannel(
-                transformer_out, emb_cb0=lm_model.depformer_text_emb, step=999_999,
-                agent_audio_feat=agent_af, user_audio_feat=user_af,
+                tout_in, emb_cb0=lm_model.depformer_text_emb, step=999_999,
+                agent_audio_feat=agent_in, user_audio_feat=user_in,
             )
-            lm_model._last_bc_result = bc_result  # expose for external logging
-            is_pad = (sampled_text_token == lm_model.text_padding_token_id)
-            gate_fires = bc_result.bc_gate[:, 0].bool()  # [B]
-            sampled_text_token = torch.where(
-                is_pad & gate_fires,
-                sampled_text_token.new_full(sampled_text_token.shape, lm_model.end_of_text_padding_id),
-                sampled_text_token,
+            # Current step's explicit decision = last frame of the windowed output.
+            # 3-class head: 0=PAD, 1=EPAD (onset), 2=WORD (already speaking).
+            bc_now = bc_result.bc_logits[:, -1]  # [B, 3]
+            pred_cls = bc_now.argmax(dim=-1)
+
+            implicit_log_odds = (
+                text_logits[:, 0, 0, lm_model.end_of_text_padding_id]
+                - text_logits[:, 0, 0, lm_model.text_padding_token_id]
+            ).float()
+            # The BC head predicts three mutually exclusive states:
+            #   0 = remain silent (PAD), 1 = start speaking (EPAD/BC slot),
+            #   2 = already speaking (WORD).
+            #
+            # Fusion needs evidence for a *new onset*, so compare START against
+            # both ways in which a new onset is inappropriate.  The previous
+            # START-vs-PAD difference ignored a high WORD score and could boost
+            # EPAD even while the agent was already speaking.
+            #
+            # For softmax probabilities this is exactly
+            #   log(P(START) / (P(PAD) + P(WORD))).
+            # Computing it from logits via logsumexp is numerically stable and
+            # avoids materialising probabilities.
+            bc_now_float = bc_now.float()
+            explicit_log_odds = (
+                bc_now_float[:, 1]
+                - torch.logsumexp(bc_now_float[:, [0, 2]], dim=-1)
             )
-            # Suppression (inverse of the injection above): when the gate says "don't speak"
-            # (g_final == 0) but the model sampled [EPAD] (premature speech onset), force it
-            # back to [PAD]. This runs before the cache write below, so the model's history
-            # sees [PAD] and is prevented from emitting a word on the following step.
-            if self.suppress_epad:
-                is_epad = (sampled_text_token == lm_model.end_of_text_padding_id)
+
+            # Marginalise the 256 VAP classes instead of taking their argmax.
+            # Normalised training labels use spk0=user in bits [7:4] and
+            # spk1=agent in bits [3:0]. Bit 3 is the agent's nearest future bin.
+            vap_agent_near = implicit_log_odds.new_full(implicit_log_odds.shape, 0.5)
+            vap_log_odds = implicit_log_odds.new_zeros(implicit_log_odds.shape)
+            if bc_result.vap_logits is not None:
+                vap_probs = bc_result.vap_logits[:, -1].float().softmax(dim=-1)
+                class_ids = torch.arange(256, device=vap_probs.device)
+                agent_near_mask = (class_ids & 0x08) != 0
+                vap_agent_near = vap_probs[:, agent_near_mask].sum(dim=-1)
+                vap_agent_near = vap_agent_near.clamp(1e-6, 1.0 - 1e-6)
+                vap_log_odds = torch.logit(vap_agent_near)
+
+            # vad_logits[..., 0] is the user-active log-odds, therefore its
+            # negative is exactly the user-quiet log-odds.
+            user_quiet_log_odds = -bc_result.vad_logits[:, -1, 0].float()
+            # A jointly trained model owns the fusion calibration.  Otherwise
+            # retain the inference-only scalar controls for ablations.
+            if lm_model.backchannel_fusion_trainable:
+                bc_weight = lm_model.backchannel_fusion_bc_weight.float()
+                vap_weight = lm_model.backchannel_fusion_vap_weight.float()
+                vad_weight = lm_model.backchannel_fusion_vad_weight.float()
+                fusion_bias = lm_model.backchannel_fusion_bias.float()
+            else:
+                bc_weight = self.fusion_bc_weight
+                vap_weight = self.fusion_vap_weight
+                vad_weight = self.fusion_vad_weight
+                fusion_bias = 0.0
+
+            explicit_residual = (
+                bc_weight * explicit_log_odds
+                + vap_weight * vap_log_odds
+                + vad_weight * user_quiet_log_odds
+                + fusion_bias
+            )
+            fusion_score = implicit_log_odds + explicit_residual
+            fusion_prob = torch.sigmoid(fusion_score)
+
+            if self.epad_control == "fusion":
+                # Residual shallow fusion: preserve every backbone text logit and
+                # add explicit evidence only to EPAD. Unlike the former hard 0.5
+                # decision, this retains the backbone's stochastic implicit onset
+                # prior and lets the normal temperature/top-k sampler decide.
+                text_logits_for_sampling = text_logits.float().clone()
+                text_logits_for_sampling[:, 0, 0, lm_model.end_of_text_padding_id] += (
+                    explicit_residual
+                )
+                # Filled with the actual sampled EPAD decision after sampling.
+                gate_fires = torch.zeros_like(pred_cls, dtype=torch.bool)
+            elif self.epad_control == "legacy":
+                gate_fires = pred_cls == 1
+            else:
+                gate_fires = torch.zeros_like(pred_cls, dtype=torch.bool)
+
+            # Expose only the current frame so external logging stays per-step.
+            # gate is the ACTUAL decision — loggers read it directly.
+            lm_model._last_bc_result = BackchannelOutput2(
+                vap_logits=(bc_result.vap_logits[:, -1:] if bc_result.vap_logits is not None else None),
+                vad_logits=bc_result.vad_logits[:, -1:],
+                bc_logits=bc_result.bc_logits[:, -1:],  # [B, 1, 3] raw
+                gate=gate_fires.unsqueeze(1),           # [B, 1] bool
+                implicit_log_odds=implicit_log_odds.unsqueeze(1),
+                explicit_log_odds=explicit_log_odds.unsqueeze(1),
+                vap_agent_near=vap_agent_near.unsqueeze(1),
+                fusion_score=fusion_score.unsqueeze(1),
+                fusion_prob=fusion_prob.unsqueeze(1),
+            )
+
+        # Shape: [B, K_text=1, T=1, Card_text]. This is the only text sampling
+        # call in the step, for both backbone-only and fusion modes.
+        sampled_text_token = sample_token(
+            text_logits_for_sampling,
+            self.use_sampling,
+            self.temp_text,
+            self.top_k_text,
+        )
+        assert sampled_text_token.dim() == 3, sampled_text_token.shape
+        assert sampled_text_token.shape[2] == 1
+        assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
+        sampled_text_token = sampled_text_token[:, 0, 0]  # [B]
+
+        if lm_model.backchannel is not None:
+            if self.epad_control == "fusion":
+                # Diagnostic gate = the actual fused sampler decision. No token is
+                # overwritten in fusion mode.
+                lm_model._last_bc_result.gate = (
+                    sampled_text_token == lm_model.end_of_text_padding_id
+                ).unsqueeze(1)
+            elif self.epad_control == "legacy":
+                is_pad = sampled_text_token == lm_model.text_padding_token_id
                 sampled_text_token = torch.where(
-                    is_epad & ~gate_fires,
-                    sampled_text_token.new_full(sampled_text_token.shape, lm_model.text_padding_token_id),
+                    is_pad & gate_fires,
+                    sampled_text_token.new_full(
+                        sampled_text_token.shape, lm_model.end_of_text_padding_id
+                    ),
                     sampled_text_token,
                 )
+                # Preserve the old optional explicit veto for legacy ablations.
+                if self.suppress_epad:
+                    is_epad = sampled_text_token == lm_model.end_of_text_padding_id
+                    sampled_text_token = torch.where(
+                        is_epad & ~gate_fires,
+                        sampled_text_token.new_full(
+                            sampled_text_token.shape, lm_model.text_padding_token_id
+                        ),
+                        sampled_text_token,
+                    )
+            elif self.suppress_epad:
+                # suppress_epad has no controller to consult in `none` mode.
+                pass
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
@@ -1413,7 +1798,9 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def load_voice_prompt_embeddings(self, path: str):
         self.voice_prompt = path
-        state = torch.load(path)
+        # Cached embeddings may have been saved from a CUDA session; load to CPU
+        # first (works everywhere), then move to the model's device below.
+        state = torch.load(path, map_location="cpu")
 
         self.voice_prompt_audio = None
         self.voice_prompt_embeddings = state["embeddings"].to(self.lm_model.device)
@@ -1612,4 +1999,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_logits
         else:
             return tokens
-

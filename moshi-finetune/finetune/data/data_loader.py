@@ -110,8 +110,7 @@ def build_data_loader(
                     if n_flame_skipped % 1000 == 1:
                         logger.warning(
                             f"[data_loader] Skipped {n_flame_skipped} sample(s) so far "
-                            f"with no FLAME file (last: {path}). "
-                            f"Check flame_root and file naming."
+                            f"with no matching FLAME pair (last: {path})."
                         )
                     continue
 
@@ -164,16 +163,17 @@ def build_data_loader(
             ]
 
             # ── Post-tokenization safety check ────────────────────────────
-            # Pre-filter handles missing files; this catches the rarer case where
-            # the file exists but the audio segment starts beyond the FLAME array.
+            # Pre-filter handles ordinary missing pairs. This catches files that
+            # become unavailable plus malformed/out-of-range targets rejected by
+            # _load_face_motion; that method logs the precise rejection reason.
             if _flame_filter:
                 valid_samples = [s for s in samples if s.face_motion_gt is not None]
                 n_oob = len(samples) - len(valid_samples)
                 if n_oob > 0:
                     logger.warning(
-                        f"[data_loader] {n_oob}/{len(samples)} sample(s) had face_motion_gt=None "
-                        f"after tokenization (segment out-of-range in FLAME file). "
-                        f"Dropping these samples from this batch."
+                        f"[data_loader] Dropping {n_oob}/{len(samples)} sample(s) "
+                        "because FLAME targets were unavailable or invalid; see "
+                        "the preceding [FLAME] warning for details."
                     )
                     samples = valid_samples
                 if not samples:

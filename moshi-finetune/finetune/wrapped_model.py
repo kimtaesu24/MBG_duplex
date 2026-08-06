@@ -122,7 +122,27 @@ def get_fsdp_model(
 
     freeze_non_embed = False
 
-    if args.lora.enable:
+    if args.freeze_backbone:
+        if not args.backchannel.enable:
+            raise ValueError(
+                "freeze_backbone=True requires backchannel.enable=True; "
+                "otherwise there are no VAP parameters to train."
+            )
+        for param in model.parameters():
+            param.requires_grad = False
+        for name, param in model.named_parameters():
+            if "backchannel" in name:
+                param.requires_grad = True
+        trainable_backchannel = sum(
+            p.numel() for name, p in model.named_parameters()
+            if "backchannel" in name and p.requires_grad
+        )
+        main_logger_info(
+            "Backbone frozen: training only backchannel/VAP parameters "
+            f"({trainable_backchannel:,} parameters)"
+        )
+
+    elif args.lora.enable:
         from peft import get_peft_model, LoraConfig, TaskType
         
         main_logger_info(f"LoRA 모드 활성화 (Rank={args.lora.rank}, Scaling={args.lora.scaling})")
