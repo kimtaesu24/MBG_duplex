@@ -12,21 +12,21 @@
 
 
 # check
-run_dir: ./output/example_0715_ACF
+run_dir: ./output/example_0804
 overwrite_run_dir: true
 
 wandb:
   project: "personaplex_finetune_AAAI"
-  run_name: "test_run_0715_ACF"
+  run_name: "test_run_0804_ACF"
 
 # ── 데이터 설정 ─────────────────────────────────────────────────────────────
 data:
-  # train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample.jsonl
-  train_data: ./data/dualtalk/train/data.jsonl
+  train_data: ./data/stereo_ami_balanced_train_noswitch/data_with_voice_sample_amplified.jsonl
+  # train_data: ./data/dualtalk/train/data.jsonl
   shuffle: true
-  # eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample.jsonl
-  eval_data: ./data/dualtalk/test/data.jsonl
-  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest_dualtalk.json
+  eval_data: ./data/stereo_ami_balanced_valid_noswitch/data_with_voice_sample_amplified.jsonl
+  # eval_data: ./data/dualtalk/test/data.jsonl
+  vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
 
 # ── Personaplex 모델 경로 ────────────────────────────────────────────────
 moshi_paths:
@@ -34,8 +34,8 @@ moshi_paths:
 
 # ── 학습 설정 ─────────────────────────────────────────────────────────────
 max_steps: 2000
-batch_size: 32
-num_microbatches: 4
+batch_size: 4
+num_microbatches: 32
 duration_sec: 10
 
 # Full finetuning (LM + VapGPT + FaceModule 전체 학습)
@@ -44,32 +44,32 @@ lora:
   rank: 64
   scaling: 2.0
 full_finetuning: false
-freeze_depformer: false
+freeze_depformer: true
 
 param_dtype: bfloat16
 gradient_checkpointing: true
 
 # ── 로깅 / 체크포인트 / 평가 ─────────────────────────────────────────────
-log_freq: 10
+log_freq: 5
 do_ckpt: true
-ckpt_freq: 100
+ckpt_freq: 50
 num_ckpt_keep: 3
 save_adapters: true
 do_eval: true
-eval_freq: 100
+eval_freq: 50
 ckpt_keep_best_metric: epad_f1   # epad_recall / epad_precision / epad_acc 도 가능
 ckpt_keep_best_n: 3
 
 
 # ── 옵티마이저 ────────────────────────────────────────────────────────────
 optim:
-  lr: 1.0e-5
+  lr: 2.0e-5
   weight_decay: 0.1
   pct_start: 0.05
 
 # ── 손실 가중치 ───────────────────────────────────────────────────────────
 text_padding_weight: 0.5   # PAD 토큰 손실 가중치 (낮을수록 PAD에 집중 감소)
-epad_weight: 1.0            # EPAD 토큰 손실 가중치 (PAD run 끝 전환 지점 강조)
+epad_weight: 2.0            # EPAD 토큰 손실 가중치 (PAD run 끝 전환 지점 강조)
 first_codebook_weight_multiplier: 1.0
 
 # ── 텍스트 프롬프트 (에이전트 지시문) ────────────────────────────────────
@@ -80,22 +80,30 @@ text_prompt: "<system> [Casual Mode] You are a warm and reactive partner. You ta
 
 # ── Backchannel VAP (VapGPT, LM 내부) ────────────────────────────────────
 backchannel:
-  enable: false
+  enable: true
   module_type: vap_gpt
   pad_token_id: 3
   epad_token_id: 0
 
-  vap_dim: 256
-  bc_hidden: 512
-  gumbel_temp_init: 1.0
-  gumbel_temp_min: 0.3
-  gumbel_anneal_rate: 0.001
-  vap_loss_weight: 0.5         # was 0.1
-  commitment_loss_weight: 0.0  # replaced by bc_event_loss
-  bc_event_loss_weight: 0.3
+  vap_loss_weight: 0.5
+  bc_event_loss_weight: 1.0
+  vad_loss_weight: 0.3
+  commitment_loss_weight: 0.0
+  silence_loss_weight: 0.0
   bc_focal_gamma: 2.0
   bc_focal_pos_weight: 15.0
   bc_warmup_steps: 200
+  bc_la_tau: 0.75
+
+  # ── BC head가 무엇을 "backchannel"로 학습할지 ──────────────────────────
+  #   epad : GT 텍스트의 [EPAD] 토큰 = 데이터셋 에이전트가 실제로 낸 반응
+  #   vap  : VAP manifest turn-taking = 반응해도 되는 자리 (텍스트 라벨 불필요)
+  # 두 모드 모두 같은 3-class head를 쓰므로 그대로 바꿔가며 비교 가능.
+  # 모드 비교는 wandb의 bc_head_f1 (BC head 자체 성능) 으로 보세요.
+  # epad_f1은 텍스트 head 지표라 모드와 무관하게 계산됩니다.
+  bc_target_mode: vap          # epad | vap
+  bc_vap_horizon_bins: 1        # vap 모드: 미래 몇 bin까지 "곧 발화"로 볼지 (1=200ms, 2=600ms, 3=1.2s, 4=2.0s)
+  bc_vap_require_user_silent: false   # vap 모드: 같은 구간에 유저가 침묵일 때만 positive
 
   vap_gpt_repo_path: /home2/s20235100/Conversational-AI/VoiceActivityProjection
   vap_gpt_checkpoint: /home2/s20235100/Conversational-AI/VoiceActivityProjection/example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt
@@ -111,7 +119,7 @@ backchannel:
 # Training: teacher-forced (gt 3DMM shifted by 1 frame as prev_motion input).
 # Inference: autoregressive streaming via model.generate().
 face_gen:
-  enable: true
+  enable: false
   model_version: 2 
   use_generated_audio_feat: true
 
@@ -162,3 +170,12 @@ face_gen:
   gate_loss_expr_weight: 4.0
   gate_loss_jaw_weight: 4.0
   gate_loss_neck_weight: 1.0
+
+continual_learning:
+  enable: true
+  hf_repo_id: nvidia/personaplex-7b-v1
+  temperature: 2.0
+  text_kd_weight: 0.35
+  speech_activity_kd_weight: 1.0
+  turn_boundary_kd_weight: 0.25
+  hidden_kd_weight: 0.05

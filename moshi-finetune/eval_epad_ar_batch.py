@@ -22,8 +22,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../m
 
 import moshi.models.loaders as loaders
 from finetune.data.interleaver import InterleavedTokenizer, Interleaver
-from moshi.models.lm2 import load_audio as lm_load_audio
-from test_inference2 import (
+from moshi.models.lm import load_audio as lm_load_audio
+from test_inference import (
     LMGen,
     _repair_config_paths,
     _wrap_with_system_tags,
@@ -314,7 +314,6 @@ def evaluate_batch(samples, jsonl_dir, mimi, tokenizer_mimi, lm_gen, tokenizer, 
             0.0,
             str(paths[index]),
             actual_wav_samples=stereo_wavs[index].shape[-1],
-            wav=stereo_tensor[index],
         )
         for index in range(batch_size)
     ]

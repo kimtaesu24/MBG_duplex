@@ -41,8 +41,8 @@ import moshi.models.loaders as loaders
 from moshi.offline import warmup
 
 # Keep benchmark inference on exactly the same model/generation implementation as
-# test_inference2.py. Importing it also installs lm2.LMModel into the loader.
-from test_inference2 import (
+# test_inference.py. Importing it also installs lm2.LMModel into the loader.
+from test_inference import (
     LMGen,
     _repair_config_paths,
     _wrap_with_system_tags,

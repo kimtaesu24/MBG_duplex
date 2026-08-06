@@ -44,7 +44,7 @@ class Sample:
     valid_mask: torch.Tensor | None = None        # [T_mimi] bool: True = real audio, False = silence-padded
     valid_face_frames: int | None = None          # number of valid face frames (25 fps)
     bc_timing_targets: torch.Tensor | None = None  # [1, T] float32: 1=good BC, 0=not, -100=unknown
-    vad_targets: torch.Tensor | None = None        # [1, 2, T] float32 current-frame VA (row0=user, row1=agent)
+    vad_targets: torch.Tensor | None = None        # [1, 2, T] float32 current-frame VA (row0=user, row1=agent), -100=unknown
 
 
 @dataclass
@@ -57,7 +57,7 @@ class Batch:
     valid_mask: torch.Tensor | None = None        # [B, T_mimi] bool
     valid_face_frames: torch.Tensor | None = None # [B] int: valid face frame count per sample
     bc_timing_targets: torch.Tensor | None = None  # [B, T] float32
-    vad_targets: torch.Tensor | None = None        # [B, 2, T] float32 current-frame VA (user, agent)
+    vad_targets: torch.Tensor | None = None        # [B, 2, T] float32 current-frame VA (user, agent), -100=unknown
 
     @classmethod
     def collate(cls, batch: list[Sample]) -> "Batch":
@@ -356,7 +356,6 @@ class InterleavedTokenizer:
         vap_manifest_path: str = "",
         flame_root: str = "",
         flame_speaker: str = "bc",
-        vad_energy_threshold: float = 0.01,
     ):
         """
         Args:
@@ -374,11 +373,10 @@ class InterleavedTokenizer:
         self.duration_sec = duration_sec
         self.num_audio_frames = math.ceil(duration_sec * mimi.frame_rate)
         self.mimi_sample_rate = mimi.sample_rate  # typically 24000
-        # Energy threshold for current-frame VAD target extraction (v2 backchannel).
-        self.vad_energy_threshold = vad_energy_threshold
 
-        # VAP manifest lookup table
-        self.vap_lookup = {}  # (file_id, vap_step_index) -> label_int
+        # VAP manifest lookup tables
+        self.vap_lookup = {}  # (file_id, vap_step_index) -> label_int (0-255, future window)
+        self.vad_lookup = {}  # (file_id, vap_step_index) -> cur_va_int (0-3, current frame)
         self.vap_hop_s = 0.08  # default
         if vap_manifest_path and os.path.exists(vap_manifest_path):
             print(f"Loading VAP manifest from {vap_manifest_path}...")
@@ -390,7 +388,19 @@ class InterleavedTokenizer:
                     # Store by (file_id, vap_step_index); step = offset_seconds / hop_s
                     idx = int(round(s["offset_seconds"] / self.vap_hop_s))
                     self.vap_lookup[(f_id, idx)] = s["label_int"]
+                    # Current-frame VAD, written by vap_window.py alongside the VAP
+                    # label. Older manifests predate this field — the VAD target is
+                    # then left unknown (-100) and its loss term is skipped.
+                    cur_va = s.get("cur_va_int")
+                    if cur_va is not None:
+                        self.vad_lookup[(f_id, idx)] = cur_va
             print(f"Loaded {len(self.vap_lookup)} VAP targets (hop={self.vap_hop_s}s).")
+            if self.vad_lookup:
+                print(f"Loaded {len(self.vad_lookup)} current-frame VAD targets.")
+            else:
+                print("[WARNING] Manifest has no 'cur_va_int' field — VAD targets "
+                      "unavailable. Regenerate the manifest with vap_window.py to "
+                      "enable vad_loss.")
 
         # FLAME / 3DMM face motion configuration
         self.flame_root = flame_root
@@ -404,7 +414,6 @@ class InterleavedTokenizer:
         path: str,
         voice_prompt_emb: torch.Tensor | None = None,
         actual_wav_samples: int | None = None,
-        wav: torch.Tensor | None = None,
     ) -> Sample:
         """Finish tokenization given pre-encoded mimi tokens.
 
@@ -452,8 +461,9 @@ class InterleavedTokenizer:
 
         codes = torch.cat([text_tokens, audio_tokens], dim=1)
 
-        # --- VAP Target Processing ---
+        # --- VAP / VAD Target Processing ---
         vap_targets = None
+        vad_targets = None
         if self.vap_lookup:
             vap_targets = torch.full((1, self.num_audio_frames), -100, dtype=torch.long, device=codes.device)
             raw_file_id = os.path.splitext(os.path.basename(path))[0]
@@ -488,6 +498,15 @@ class InterleavedTokenizer:
                 base = raw_file_id.replace("_stereo", "")
                 file_id_candidates = [raw_file_id, base + "_ut", base]
 
+            # Whether manifest spk0/spk1 must be swapped to match the training
+            # convention (spk0=user, spk1=agent). Drives BOTH the VAP nibble swap
+            # and the VAD row order below, so the two labels stay consistent.
+            #   dt_reverse                        : DualTalk "_speaker" — agent=speaker1 ≠ manifest spk1
+            #   is_ami_stereo & not is_ami_switched: AMI manifest spk0=backchannel agent, spk1=user
+            # Switched AMI needs no swap: after its physical channel swap,
+            # utterance=agent and backchannel=user, already matching the manifest.
+            do_swap = dt_reverse or (is_ami_stereo and not is_ami_switched)
+
             moshi_frame_duration = 1.0 / self.mimi.frame_rate
             t_arr = np.arange(self.num_audio_frames, dtype=np.float64)
             vap_steps = np.rint(
@@ -502,20 +521,11 @@ class InterleavedTokenizer:
                 )
                 valid = labels != -100
                 if valid.any():
-                    if dt_reverse:
+                    if do_swap:
                         # Swap spk0 (label bits 7-4) and spk1 (bits 3-0), preserving the
                         # within-speaker bin order (bin0 = nearest 200ms stays the MSB of its nibble).
                         rev = _swap_vap_speaker_nibbles(labels)
                         labels = np.where(valid, rev, labels)
-                    elif is_ami_stereo and not is_ami_switched:
-                        # AMI manifest: spk0=backchannel agent, spk1=utterance
-                        # user. The downstream VAP convention is the reverse:
-                        # spk0=user, spk1=agent.
-                        rev = _swap_vap_speaker_nibbles(labels)
-                        labels = np.where(valid, rev, labels)
-                    # Switched AMI needs no nibble swap: after its physical
-                    # channel swap, utterance=agent and backchannel=user,
-                    # already matching manifest spk1=agent / spk0=user.
                     vap_targets[0, valid] = torch.from_numpy(labels[valid]).to(codes.device)
                     matched_fid = fid
                     break
@@ -523,6 +533,32 @@ class InterleavedTokenizer:
             # if matched_fid is None:
             #     print(f"[WARNING] No VAP target found for '{raw_file_id}' "
             #           f"All targets set to -100.")
+
+            # ── Current-frame VAD targets (v2: vad_logits supervision) ────────
+            # Read straight from the manifest (cur_va_int, written by vap_window.py)
+            # instead of re-running an energy VAD on the waveform here. The manifest
+            # VAD is computed after per-channel RMS normalisation, so quiet speakers
+            # are handled consistently, and it shares the exact frame grid used for
+            # the VAP labels (hop 0.08s == one mimi frame @ 12.5 Hz).
+            #
+            # cur_va_int = (spk0 << 1) | spk1. Output row order is (user, agent) to
+            # match vad_logits ([..., 0] = user from out["x1"], [..., 1] = agent from
+            # out["x2"]); do_swap decides which manifest speaker is which.
+            # Unknown frames are -100 and are dropped from the BCE at loss time.
+            if self.vad_lookup and matched_fid is not None:
+                cur = np.array(
+                    [self.vad_lookup.get((matched_fid, int(s)), -1) for s in vap_steps],
+                    dtype=np.int64,
+                )
+                known = cur >= 0
+                if known.any():
+                    spk0 = (cur >> 1) & 1
+                    spk1 = cur & 1
+                    user, agent = (spk1, spk0) if do_swap else (spk0, spk1)
+                    va_full = np.full((2, self.num_audio_frames), -100.0, dtype=np.float32)
+                    va_full[0, known] = user[known]
+                    va_full[1, known] = agent[known]
+                    vad_targets = torch.from_numpy(va_full).unsqueeze(0)  # [1, 2, T]
 
         # ── Binary BC timing target (vectorized) ─────────────────────────────
         # Agent (spk1) speaks in next 200ms AND user (spk0) is silent.
@@ -540,28 +576,6 @@ class InterleavedTokenizer:
                 spk1_bin0 = (lbl_valid >> 3) & 1   # agent speaking in next 200ms
                 bc[valid] = ((spk1_bin0 == 1) & (spk0_bin0 == 0)).float()
             bc_timing_targets = bc.unsqueeze(0)  # [1, T]
-
-        # ── Current-frame VAD targets (v2 backchannel: vad_logits supervision) ──
-        # Per-channel per-mimi-frame RMS energy VAD on the raw stereo waveform,
-        # mirroring the manifest's vad_threshold-style extraction but aligned exactly
-        # with mimi frames (80 ms @ 12.5 Hz). wav: [C>=2, T_wav] at mimi sample rate;
-        # ch0 = agent, ch1 = user (same convention as codes rows 1:9 = agent, 9:17 =
-        # user in lm.py). Output row order = (user, agent) to match vad_logits
-        # ([..., 0] = user from out["x1"], [..., 1] = agent from out["x2"]).
-        vad_targets = None
-        if wav is not None and wav.dim() == 2 and wav.shape[0] >= 2:
-            frame_size = int(round(self.mimi_sample_rate / self.mimi.frame_rate))
-            n_va = min(self.num_audio_frames, wav.shape[-1] // frame_size)
-            if actual_wav_samples is not None:
-                # Zero-padded tail is silence by construction; restrict to real audio.
-                n_va = min(n_va, actual_wav_samples // frame_size)
-            if n_va > 0:
-                w = wav[:2, : n_va * frame_size].reshape(2, n_va, frame_size).float()
-                rms = w.pow(2).mean(dim=-1).sqrt()                     # [2, n_va]
-                va = (rms > self.vad_energy_threshold).float().cpu()
-                va_full = torch.zeros(2, self.num_audio_frames, dtype=torch.float32)
-                va_full[:, :n_va] = va
-                vad_targets = va_full[[1, 0]].unsqueeze(0)  # (agent,user)→(user,agent), [1, 2, T]
 
         # ── FLAME / 3DMM face motion ─────────────────────────────────────────
         face_motion_gt = None

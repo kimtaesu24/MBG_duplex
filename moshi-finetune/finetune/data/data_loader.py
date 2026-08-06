@@ -158,7 +158,6 @@ def build_data_loader(
                 instruct_tokenizer.tokenize_with_encoded_audio(
                     all_tokens[i], start_sec, path, vp_emb,
                     actual_wav_samples=actual_wav_lens[i],
-                    wav=wav_tensors[i],  # [C, T] — current-frame VAD target extraction (v2)
                 )
                 for i, (_, start_sec, path, vp_emb) in enumerate(raw_buf)
             ]

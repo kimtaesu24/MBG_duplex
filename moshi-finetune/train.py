@@ -23,6 +23,7 @@ import fire
 import torch
 import torch.cuda
 import torch.distributed as dist
+import safetensors.torch
 from torch.optim import AdamW, lr_scheduler
 
 from torch.nn import functional as F
@@ -41,6 +42,8 @@ from finetune.distributed import (
 )
 from finetune.eval import evaluate
 from finetune.loss import (
+    bc_head_confusion_counts,
+    build_bc_targets,
     compute_loss_with_mask,
     compute_face_loss,
     epad_confusion_counts,
@@ -76,6 +79,238 @@ def main_logger_info(message: str) -> None:
         logger.info(message)
 
 
+def _looks_like_hf_repo_id(value: str) -> bool:
+    """'org/name' 형태의 HuggingFace repo id 인지 판별."""
+    return (
+        not os.path.isabs(value)
+        and not value.startswith((".", "~"))
+        and value.count("/") == 1
+        and not value.endswith((".safetensors", ".pt", ".ckpt", ".bin"))
+    )
+
+
+def _download_moshi_weights(repo_id: str) -> str:
+    """HF 레포에서 model.safetensors 다운로드 후 로컬 캐시 경로 반환."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError(
+            "HF repo id를 사용하려면 huggingface_hub가 필요합니다 "
+            "(pip install huggingface_hub)."
+        ) from e
+    try:
+        return hf_hub_download(repo_id, MOSHI_NAME)
+    except Exception as e:
+        raise RuntimeError(
+            f"{repo_id} 에서 {MOSHI_NAME} 다운로드 실패: {e}"
+        ) from e
+
+
+def _resolve_teacher_checkpoint(cl_args, moshi_path: str | None) -> str:
+    """continual_learning teacher 가중치 경로를 해석한다.
+
+    우선순위: continual_learning.hf_repo_id > continual_learning.teacher_checkpoint
+    > moshi_paths 로 이미 해석된 moshi_path.
+    teacher_checkpoint 에는 로컬 파일, 체크포인트 디렉터리, 또는
+    "nvidia/personaplex-7b-v1" 같은 HF repo id 를 모두 넣을 수 있다.
+    """
+    if cl_args.hf_repo_id:
+        main_logger_info(
+            f"continual_learning teacher를 HF 레포에서 받는 중: {cl_args.hf_repo_id}"
+        )
+        return _download_moshi_weights(cl_args.hf_repo_id)
+
+    candidate = cl_args.teacher_checkpoint
+    if not candidate:
+        # 기본값: 학생 모델과 동일한 원본 PersonaPlex 가중치.
+        if not moshi_path or not os.path.isfile(moshi_path):
+            raise FileNotFoundError(
+                "continual_learning teacher checkpoint을 찾을 수 없습니다 "
+                f"(moshi_paths.moshi_path={moshi_path!r}). "
+                "config의 continual_learning에 hf_repo_id 또는 "
+                "teacher_checkpoint를 설정하세요."
+            )
+        return moshi_path
+
+    if os.path.isfile(candidate):
+        return candidate
+    if os.path.isdir(candidate):
+        local_weights = os.path.join(candidate, MOSHI_NAME)
+        if os.path.isfile(local_weights):
+            return local_weights
+        raise FileNotFoundError(
+            f"continual_learning teacher 디렉터리에 {MOSHI_NAME}가 없습니다: "
+            f"{candidate!r}"
+        )
+    if _looks_like_hf_repo_id(candidate):
+        main_logger_info(
+            f"continual_learning teacher를 HF 레포에서 받는 중: {candidate}"
+        )
+        return _download_moshi_weights(candidate)
+
+    raise FileNotFoundError(
+        f"continual_learning teacher checkpoint is missing: {candidate!r}. "
+        "로컬 경로 대신 HF repo id (예: continual_learning.hf_repo_id: "
+        "nvidia/personaplex-7b-v1) 를 지정할 수도 있습니다."
+    )
+
+
+def _load_stage2_init_weights(model, checkpoint_dir: str) -> None:
+    """Load a hybrid/full checkpoint as model-only stage-2 initialization.
+
+    The source checkpoint supplies LoRA, VAP/backchannel, and any other
+    non-face model tensors. Face tensors are always excluded so the standalone
+    face checkpoint configured by face_gen.ckpt_path remains authoritative.
+    Optimizer/scheduler/step state is intentionally not restored.
+    """
+    root = Path(checkpoint_dir)
+    candidates = (
+        root / "consolidated" / "lora.safetensors",
+        root / "consolidated" / "consolidated.safetensors",
+        root / "lora.safetensors",
+        root / "consolidated.safetensors",
+    )
+    checkpoint_path = next((p for p in candidates if p.is_file()), None)
+    if checkpoint_path is None:
+        raise FileNotFoundError(
+            f"No lora.safetensors or consolidated.safetensors found under "
+            f"init_checkpoint_dir={checkpoint_dir!r}"
+        )
+
+    state_dict = safetensors.torch.load_file(str(checkpoint_path), device="cpu")
+    source_count = len(state_dict)
+    state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if "face_module" not in key.split(".")
+    }
+    if not state_dict:
+        raise RuntimeError(f"No non-face tensors found in init checkpoint: {checkpoint_path}")
+    if not any("lora_" in key for key in state_dict):
+        raise RuntimeError(
+            f"Stage-2 checkpoint has no LoRA tensors: {checkpoint_path}. "
+            "It is not compatible with this LoRA training configuration."
+        )
+    if not any("backchannel" in key.split(".") for key in state_dict):
+        raise RuntimeError(
+            f"Stage-2 checkpoint has no backchannel/VAP tensors: {checkpoint_path}"
+        )
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Stage-2 checkpoint contains tensors that did not match the training "
+            f"model ({len(incompatible.unexpected_keys)} unexpected): "
+            f"{incompatible.unexpected_keys[:8]}"
+        )
+    main_logger_info(
+        f"Stage-2 initialization loaded from {checkpoint_path}: "
+        f"{len(state_dict)}/{source_count} non-face tensors; "
+        f"{len(incompatible.missing_keys)} target tensors kept from their original "
+        "initialization (base/frozen/face tensors expected)."
+    )
+    del state_dict
+
+
+def _bernoulli_kl(student_prob: torch.Tensor, teacher_prob: torch.Tensor) -> torch.Tensor:
+    eps = 1.0e-6
+    student_prob = student_prob.float().clamp(eps, 1.0 - eps)
+    teacher_prob = teacher_prob.float().clamp(eps, 1.0 - eps)
+    return (
+        teacher_prob * (teacher_prob.log() - student_prob.log())
+        + (1.0 - teacher_prob)
+        * ((1.0 - teacher_prob).log() - (1.0 - student_prob).log())
+    )
+
+
+def _selected_token_probs(
+    logits: torch.Tensor,
+    token_ids: tuple[int, ...],
+    chunk_size: int = 256,
+) -> torch.Tensor:
+    """Compute a few vocabulary probabilities without materializing full fp32 softmax."""
+    chunks = []
+    for start in range(0, logits.shape[0], chunk_size):
+        chunk = logits[start : start + chunk_size].float()
+        log_z = torch.logsumexp(chunk, dim=-1, keepdim=True)
+        selected = chunk[:, list(token_ids)]
+        chunks.append(torch.exp(selected - log_z))
+    return torch.cat(chunks, dim=0)
+
+
+def _online_teacher_losses(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+    pad_id: int,
+    epad_id: int,
+    temperature: float,
+) -> dict[str, torch.Tensor]:
+    """Selective language, activity, boundary, and representation KD."""
+    student_logits = student_logits[:, 0]
+    teacher_logits = teacher_logits[:, 0]
+    valid_mask = valid_mask.bool()
+    finite = torch.isfinite(student_logits[..., 0]) & torch.isfinite(
+        teacher_logits[..., 0]
+    )
+    valid_mask = valid_mask & finite
+    zero = student_logits.new_zeros((), dtype=torch.float32)
+    if not valid_mask.any():
+        return {
+            "text": zero,
+            "speech_activity": zero,
+            "turn_boundary": zero,
+            "hidden": zero,
+        }
+
+    # Preserve lexical distributions only on actual word frames. Turn/silence
+    # behavior is controlled separately below so AMI can still adapt it.
+    word_mask = valid_mask & (targets != pad_id) & (targets != epad_id)
+    word_mask &= targets >= 0
+    if word_mask.any():
+        student_word = student_logits[word_mask].float() / temperature
+        teacher_word = teacher_logits[word_mask].float() / temperature
+        teacher_prob = F.softmax(teacher_word, dim=-1)
+        text_kd = F.kl_div(
+            F.log_softmax(student_word, dim=-1),
+            teacher_prob,
+            reduction="batchmean",
+        ) * (temperature * temperature)
+    else:
+        text_kd = zero
+
+    # Behavioral retention: preserve the base model's frame-level decision to
+    # remain PAD versus emit any non-PAD token.
+    student_prob = _selected_token_probs(
+        student_logits[valid_mask], (pad_id, epad_id)
+    )
+    teacher_prob = _selected_token_probs(
+        teacher_logits[valid_mask], (pad_id, epad_id)
+    )
+    activity_kd = _bernoulli_kl(
+        1.0 - student_prob[:, 0],
+        1.0 - teacher_prob[:, 0],
+    ).mean()
+    boundary_kd = _bernoulli_kl(
+        student_prob[:, 1],
+        teacher_prob[:, 1],
+    ).mean()
+
+    hidden_mask = valid_mask
+    student_h = student_hidden[hidden_mask].float()
+    teacher_h = teacher_hidden[hidden_mask].float()
+    hidden_kd = (1.0 - F.cosine_similarity(student_h, teacher_h, dim=-1)).mean()
+    return {
+        "text": text_kd,
+        "speech_activity": activity_kd,
+        "turn_boundary": boundary_kd,
+        "hidden": hidden_kd,
+    }
+
+
 def train(config: str):
     """진입점: YAML 설정 파일 경로를 인수로 받습니다.
 
@@ -104,6 +339,28 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         logger.error(
             "PyTorch 분산 환경이 초기화되지 않았습니다. "
             "torchrun으로 실행하세요."
+        )
+
+    # End-to-end face training must never silently degrade to LM/VAP-only
+    # training. Validate every global face dependency before touching run_dir.
+    if args.face_gen.enable:
+        required_files = {
+            "face_gen.ckpt_path": args.face_gen.ckpt_path,
+            "face_gen.codec_ckpt_path": args.face_gen.codec_ckpt_path,
+            "face_gen.codec_stats_path": args.face_gen.codec_stats_path,
+        }
+        for label, path in required_files.items():
+            if not path or not os.path.isfile(path):
+                raise FileNotFoundError(f"Required {label} is missing or unreadable: {path!r}")
+        if not args.face_gen.flame_root or not os.path.isdir(args.face_gen.flame_root):
+            raise NotADirectoryError(
+                "Required face_gen.flame_root is missing or unreadable: "
+                f"{args.face_gen.flame_root!r}"
+            )
+    if args.init_checkpoint_dir and not os.path.isdir(args.init_checkpoint_dir):
+        raise NotADirectoryError(
+            "init_checkpoint_dir is missing or unreadable: "
+            f"{args.init_checkpoint_dir!r}"
         )
 
     # ── 2. run_dir 초기화 ─────────────────────────────────────────────────
@@ -209,6 +466,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         lm_config["backchannel_gumbel_temp_init"] = args.backchannel.gumbel_temp_init
         lm_config["backchannel_gumbel_temp_min"] = args.backchannel.gumbel_temp_min
         lm_config["backchannel_gumbel_anneal_rate"] = args.backchannel.gumbel_anneal_rate
+        lm_config["backchannel_fusion_trainable"] = args.backchannel.fusion_trainable
+        lm_config["backchannel_fusion_bc_init"] = args.backchannel.fusion_bc_init
+        lm_config["backchannel_fusion_vap_init"] = args.backchannel.fusion_vap_init
+        lm_config["backchannel_fusion_vad_init"] = args.backchannel.fusion_vad_init
+        lm_config["backchannel_fusion_bias_init"] = args.backchannel.fusion_bias_init
         if args.backchannel.pad_token_id is not None:
             lm_config["backchannel_pad_token_id"] = args.backchannel.pad_token_id
         if args.backchannel.epad_token_id is not None:
@@ -252,6 +514,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         lm_config["face_module_heads"] = args.face_gen.heads
         lm_config["face_module_code_dim"] = args.face_gen.code_dim
         lm_config["face_module_prior_warmup_frames"] = args.face_gen.prior_warmup_frames
+        lm_config["face_module_ss_prob"] = args.face_gen.scheduled_sampling_prob
+        lm_config["face_module_ss_ramp_steps"] = args.face_gen.scheduled_sampling_ramp_steps
+        lm_config["face_module_ss_start_step"] = args.face_gen.warmup_steps
+        lm_config["face_module_ss_keep_head_frames"] = args.face_gen.scheduled_sampling_keep_head_frames
+        lm_config["face_module_detach_llm_features"] = args.face_gen.detach_llm_features
         main_logger_info(
             f"Face generation module 활성화 "
             f"(checkpoint={args.face_gen.ckpt_path})"
@@ -260,6 +527,31 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     # ── 6. LM 모델 로드 및 FSDP 샤딩 ─────────────────────────────────────
     main_logger_info("Personaplex LM 모델 로드 중...")
     model = get_fsdp_model(args, moshi_path, lm_config)
+    if args.init_checkpoint_dir:
+        _load_stage2_init_weights(model, args.init_checkpoint_dir)
+
+    # Frozen original PersonaPlex reference. Its special forward skips audio
+    # Depformer, VAP, and face computation; only text logits and backbone hidden
+    # states needed for continual-learning losses are retained.
+    teacher_model = None
+    if args.continual_learning.enable:
+        teacher_checkpoint = _resolve_teacher_checkpoint(
+            args.continual_learning, moshi_path
+        )
+        main_logger_info(
+            f"Frozen online PersonaPlex teacher loading: {teacher_checkpoint}"
+        )
+        teacher_model = get_moshi_lm(
+            teacher_checkpoint,
+            device="cuda",
+            dtype=getattr(torch, args.param_dtype),
+        )
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad = False
+        main_logger_info(
+            "Online teacher ready (text/hidden-only forward; all parameters frozen)."
+        )
 
     # ── 6-1. ARTalkCodec (VAE) 로드 (face_gen 활성 시) ────────────────────
     # The codec is frozen and used only to compute z_target = quant_to_sum_feat(gt_face_motion).
@@ -307,6 +599,19 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             f"(inference step_system_prompts 정렬)\n  프롬프트: {args.text_prompt!r}"
         )
 
+    if args.backchannel.enable and args.backchannel.bc_event_loss_weight > 0:
+        _bc = args.backchannel
+        if _bc.bc_target_mode == "vap":
+            _horizon_ms = sum([200, 400, 600, 800][: _bc.bc_vap_horizon_bins])
+            main_logger_info(
+                f"BC head target: 'vap' — agent가 향후 {_horizon_ms}ms "
+                f"({_bc.bc_vap_horizon_bins} bin) 내 발화 시작 "
+                f"{'+ 같은 구간 유저 침묵 ' if _bc.bc_vap_require_user_silent else ''}"
+                f"→ class 1. VAP manifest 필요."
+            )
+        else:
+            main_logger_info("BC head target: 'epad' — GT 텍스트의 [EPAD] 토큰 위치 → class 1.")
+
     interleaver = Interleaver(
         spm,
         mimi.frame_rate,
@@ -341,10 +646,63 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     param_dtype = getattr(torch, args.param_dtype)
 
     # ── 10. 옵티마이저 & 스케줄러 ─────────────────────────────────────────
-    trainable_params = list(model.parameters())
+    base_params = []
+    fusion_params = []
+    face_core_params = []
+    face_llm_proj_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "backchannel_fusion_" in name:
+            fusion_params.append(param)
+        elif "face_module" not in name:
+            base_params.append(param)
+        elif "llm_proj" in name:
+            face_llm_proj_params.append(param)
+        else:
+            face_core_params.append(param)
+
+    param_groups = [{"params": base_params, "lr": args.optim.lr, "group_name": "base"}]
+    max_lrs = [args.optim.lr]
+    if args.backchannel.enable and args.backchannel.fusion_trainable:
+        if not fusion_params:
+            raise RuntimeError(
+                "fusion_trainable=True but no trainable backchannel fusion parameters were found"
+            )
+        param_groups.append({
+            "params": fusion_params,
+            "lr": args.backchannel.fusion_lr,
+            "weight_decay": 0.0,
+            "group_name": "fusion",
+        })
+        max_lrs.append(args.backchannel.fusion_lr)
+        main_logger_info(
+            "Trainable START-vs-rest fusion: "
+            f"lr={args.backchannel.fusion_lr:.2e}, "
+            f"bc={args.backchannel.fusion_bc_init:.3f}, "
+            f"vap={args.backchannel.fusion_vap_init:.3f}, "
+            f"vad={args.backchannel.fusion_vad_init:.3f}, "
+            f"bias={args.backchannel.fusion_bias_init:.3f}"
+        )
+    if args.face_gen.enable:
+        face_core_lr = args.face_gen.core_lr or args.optim.lr
+        face_llm_proj_lr = args.face_gen.llm_proj_lr or args.optim.lr
+        if not face_core_params:
+            raise RuntimeError("face_gen is enabled but no trainable face core parameters were found")
+        if not face_llm_proj_params:
+            raise RuntimeError("face_gen is enabled but no trainable face llm_proj parameters were found")
+        param_groups.extend([
+            {"params": face_core_params, "lr": face_core_lr, "group_name": "face_core"},
+            {"params": face_llm_proj_params, "lr": face_llm_proj_lr, "group_name": "face_llm_proj"},
+        ])
+        max_lrs.extend([face_core_lr, face_llm_proj_lr])
+        main_logger_info(
+            "Optimizer learning rates: "
+            f"base={args.optim.lr:.2e}, face_core={face_core_lr:.2e}, "
+            f"face_llm_proj={face_llm_proj_lr:.2e}"
+        )
     optimizer = AdamW(
-        trainable_params,
-        lr=args.optim.lr,
+        param_groups,
         betas=(0.9, 0.95),
         eps=1e-08,
         weight_decay=args.optim.weight_decay,
@@ -352,7 +710,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
     scheduler = lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=args.optim.lr,
+        max_lr=max_lrs,
         total_steps=args.max_steps,
         pct_start=args.optim.pct_start,
     )
@@ -383,6 +741,13 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     torch.cuda.empty_cache()
     main_logger_info("학습 시작!")
 
+    # ── Logit-Adjustment prior for the 3-class BC head (Menon et al., ICLR 2021) ──
+    # Running class counts over valid BC targets (PAD/EPAD/WORD), Laplace-smoothed
+    # (init=1 per class). log π is ADDED to the logits inside the training CE, so
+    # the network's raw logits approximate prior-free scores and plain argmax at
+    # inference is the intended (τ-tempered balanced) rule — no post-hoc correction.
+    bc_class_counts = torch.ones(3, device="cuda", dtype=torch.float64)
+
     while state.step < args.max_steps:
         state.start_step()
         is_last_step = state.step == args.max_steps
@@ -391,14 +756,35 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         vap_loss_val = torch.tensor([0.0], device="cuda")
         # commitment_loss_val = torch.tensor([0.0], device="cuda")
         face_loss_val = torch.tensor([0.0], device="cuda")
+        face_component_vals = {
+            name: torch.tensor([0.0], device="cuda")
+            for name in (
+                "motion_loss", "prior_loss", "z_mse_loss", "z_bce_loss",
+                "jaw_loss", "velocity_loss", "regularization_loss", "gate_loss",
+                "pred_jaw_abs", "gt_jaw_abs", "jaw_amplitude_ratio",
+                "pred_jaw_velocity_abs", "gt_jaw_velocity_abs",
+                "prior_jaw_abs", "delta_jaw_abs", "residual_jaw_abs", "gate_jaw",
+                "scheduled_sampling_prob",
+            )
+        }
         bc_event_loss_val = torch.tensor([0.0], device="cuda")
         silence_loss_val = torch.tensor([0.0], device="cuda")
+        kd_vals = {
+            name: torch.tensor([0.0], device="cuda")
+            for name in ("text", "speech_activity", "turn_boundary", "hidden")
+        }
         bc_stats_accum: dict | None = None
         epad_counts = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for [EPAD] prediction
+        bc_head_counts = torch.zeros(4, device="cuda")  # [tp, fp, fn, tn] for bc_logits class 1
         n_batch_tokens: int = 0
         n_real_tokens: int = 0
         face_loss_skipped_no_data: int = 0   # batches where face_motion_gt was None (missing FLAME files)
         face_loss_skipped_nonfinite: int = 0 # batches where face_loss was NaN/Inf
+        face_warmup_active = (
+            args.face_gen.enable
+            and args.face_gen.warmup_steps > 0
+            and state.step <= args.face_gen.warmup_steps
+        )
 
         for i in range(args.num_microbatches):
             batch = next(data_loader)
@@ -491,18 +877,37 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                             _user  = torch.cat([_zero, _user],  dim=1)
                     bc_audio_feats = (_agent, _user)
 
+                teacher_text_logits = None
+                teacher_text_mask = None
+                teacher_hidden = None
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        (
+                            teacher_text_logits,
+                            teacher_text_mask,
+                            teacher_hidden,
+                        ) = teacher_model.forward_teacher(
+                            codes_in,
+                            voice_prompt_embs=voice_prompt_embs,
+                        )
+
                 output = model(codes_in, step=state.step, voice_prompt_embs=voice_prompt_embs,
                                audio_feat=audio_feat, gt_face_motion=gt_face_motion,
                                mimi=mimi_for_model, bc_audio_feats=bc_audio_feats)
 
-                # Silence-padded frames (mimi tokens from zero-padded waveform) are kept
-                # in audio/text loss intentionally: they provide backbone regularization,
-                # teaching the model to suppress output after real content ends.
                 # Text at padded positions is already zero_token_id (-1) → text_mask=False
-                # regardless; the audio silence tokens are the meaningful signal here.
+                # regardless, so no extra masking is needed there.
                 # Slice off the T_p prompt-prefix frames — loss is on the conversation only.
                 text_mask = output.text_mask[:, :, T_p:]
                 audio_mask = output.mask[:, :, T_p:]
+
+                # Exclude the zero-padded tail of short clips/windows (batch.valid_mask
+                # is False past the real audio length) from the audio loss. Without this,
+                # every batch's last window contributes an artificial "predict silence"
+                # signal proportional to how much of it is padding, on top of any real
+                # silence in the content — biasing the model toward under-talking.
+                if batch.valid_mask is not None:
+                    audio_mask = audio_mask & batch.valid_mask.to(audio_mask.device).unsqueeze(1)
 
                 text_loss = compute_loss_with_mask(
                     output.text_logits[:, :, T_p:],
@@ -531,6 +936,41 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 )
 
                 mb_loss = text_loss + audio_loss
+
+                # ── Frozen PersonaPlex online-teacher distillation ────────────────
+                if teacher_model is not None:
+                    if output.transformer_out is None:
+                        raise RuntimeError(
+                            "Student LMOutput is missing transformer_out required "
+                            "for continual-learning hidden distillation."
+                        )
+                    kd_mask = text_mask[:, 0].clone()
+                    kd_mask &= teacher_text_mask[:, 0, T_p:]
+                    if batch.valid_mask is not None:
+                        kd_mask &= batch.valid_mask.to(kd_mask.device)
+                    kd_losses = _online_teacher_losses(
+                        student_logits=output.text_logits[:, :, T_p:],
+                        teacher_logits=teacher_text_logits[:, :, T_p:],
+                        student_hidden=output.transformer_out[:, T_p:],
+                        teacher_hidden=teacher_hidden[:, T_p:],
+                        targets=codes[:, 0],
+                        valid_mask=kd_mask,
+                        pad_id=model.text_padding_token_id,
+                        epad_id=model.end_of_text_padding_id,
+                        temperature=args.continual_learning.temperature,
+                    )
+                    cl = args.continual_learning
+                    mb_loss = (
+                        mb_loss
+                        + cl.text_kd_weight * kd_losses["text"]
+                        + cl.speech_activity_kd_weight
+                        * kd_losses["speech_activity"]
+                        + cl.turn_boundary_kd_weight
+                        * kd_losses["turn_boundary"]
+                        + cl.hidden_kd_weight * kd_losses["hidden"]
+                    )
+                    for name, value in kd_losses.items():
+                        kd_vals[name] += value.detach()
 
                 # ── VAP 보조 손실 ─────────────────────────────────────────
                 vap_loss = None
@@ -573,68 +1013,84 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     #     mb_loss = mb_loss + args.backchannel.commitment_loss_weight * output.commitment_loss
                     #     commitment_loss_val += output.commitment_loss.detach()
 
-                # ── Direct BC event supervision (focal BCE) ───────────────────────────
+                # ── Direct BC supervision (3-class CE) ────────────────────────────────
+                # bc_logits [B, T, 3] predicts 0=PAD / 1=EPAD (backchannel slot) / 2=WORD.
+                # backchannel.bc_target_mode selects what counts as a backchannel:
+                #   "epad" — GT text tokens: responses the dataset agent actually made
+                #   "vap"  — VAP manifest turn-taking: slots where a response would fit
+                # Both share this head, the ±K boundary-ignore band, and the
+                # Logit-Adjustment CE below. See build_bc_targets() for label details.
                 if (args.backchannel.enable
                         and args.backchannel.bc_event_loss_weight > 0
-                        and output.bc_logits is not None
-                        and batch.bc_timing_targets is not None):
-                    bc_targets = batch.bc_timing_targets.to(codes.device)  # [B, T_content] — no T_p prefix
-                    bc_logit_pos = output.bc_logits[:, T_p:, 1]  # [B, T_content] — strip prompt prefix
-                    valid_bc = bc_targets != -100
-                    if valid_bc.any():
-                        bce = F.binary_cross_entropy_with_logits(
-                            bc_logit_pos[valid_bc],
-                            bc_targets[valid_bc],
-                            pos_weight=torch.tensor(
-                                args.backchannel.bc_focal_pos_weight,
-                                device=codes.device, dtype=bc_logit_pos.dtype,
-                            ),
-                            reduction='none',
+                        and output.bc_logits is not None):
+                    cls_tgt = build_bc_targets(
+                        mode=args.backchannel.bc_target_mode,
+                        text_tokens=codes[:, 0],  # [B, T] GT text (undelayed, content only)
+                        pad_id=model.text_padding_token_id,
+                        epad_id=model.end_of_text_padding_id,
+                        onset_ignore_frames=args.backchannel.bc_onset_ignore_frames,
+                        valid_mask=batch.valid_mask,
+                        vap_targets=batch.vap_targets,
+                        vad_targets=batch.vad_targets,
+                        vap_horizon_bins=args.backchannel.bc_vap_horizon_bins,
+                        vap_require_user_silent=args.backchannel.bc_vap_require_user_silent,
+                    )
+                    bc_logits_c = output.bc_logits[:, T_p:]  # [B, T, 3] — strip prompt prefix
+                    if (cls_tgt != -100).any():
+                        # Logit-Adjustment loss (Menon et al., ICLR 2021): CE on
+                        # (logits + τ·log π) instead of class-weighted CE. Unlike
+                        # pos_weight (which multiplies rare-class gradients and
+                        # destabilises training), LA shifts the decision margin
+                        # additively while keeping gradient scales balanced.
+                        valid_t = cls_tgt[cls_tgt != -100]
+                        bc_class_counts += torch.bincount(valid_t, minlength=3).to(bc_class_counts)
+                        log_prior = torch.log(bc_class_counts / bc_class_counts.sum()).to(
+                            device=codes.device, dtype=torch.float32,
                         )
-                        p_t = torch.exp(-bce.detach())
-                        bc_event_loss = ((1.0 - p_t) ** args.backchannel.bc_focal_gamma * bce).mean()
+                        bc_logits_adj = bc_logits_c.float() + args.backchannel.bc_la_tau * log_prior
+                        bc_event_loss = F.cross_entropy(
+                            bc_logits_adj.reshape(-1, 3),
+                            cls_tgt.reshape(-1),
+                            ignore_index=-100,
+                        )
                         mb_loss = mb_loss + args.backchannel.bc_event_loss_weight * bc_event_loss
                         bc_event_loss_val += bc_event_loss.detach()
-
-                # ── Direct silence-gate supervision (BCE against "user is silent") ────
-                # Target = user NOT speaking, from VAP label bit 7 (spk0_bin0).
-                # NOTE: this is NOT 1 - bc_target. At backchannel frames (user silent AND
-                # agent speaking) the user is still silent, so the silence target must
-                # stay 1 there — a naive flip of bc_target would wrongly teach 0.
-                if (args.backchannel.enable
-                        and args.backchannel.silence_loss_weight > 0
-                        and output.silence_gate_logits is not None
-                        and batch.vap_targets is not None):
-                    vap_t = batch.vap_targets.to(codes.device)  # [B, T] long, -100 = unknown
-                    valid_sil = vap_t != -100
-                    if batch.valid_mask is not None:
-                        valid_sil = valid_sil & batch.valid_mask.to(codes.device)
-                    if valid_sil.any():
-                        # bit 7 = user speaking in next 200ms; clamp so masked -100 doesn't
-                        # corrupt the shift (those positions are excluded by valid_sil anyway).
-                        user_speaking = (vap_t.clamp(min=0) >> 7) & 1  # [B, T]
-                        sil_target = (user_speaking == 0).float()      # [B, T], 1 = user silent
-                        sil_logit_pos = output.silence_gate_logits[:, T_p:, 1]  # [B, T] strip prefix
-                        silence_loss = F.binary_cross_entropy_with_logits(
-                            sil_logit_pos[valid_sil],
-                            sil_target[valid_sil],
+                        # BC-head quality against its own target — the only metric
+                        # that reflects bc_target_mode (epad_f1 scores the text head).
+                        bc_head_counts += bc_head_confusion_counts(
+                            bc_logits_c.detach(), cls_tgt
                         )
-                        mb_loss = mb_loss + args.backchannel.silence_loss_weight * silence_loss
-                        silence_loss_val += silence_loss.detach()
+
+                # ── Current-frame VAD supervision (v2: BCE, both streams) ─────────────
+                # vad_logits [B, T, 2] predicts CURRENT-frame voice activity
+                # ([...,0]=user, [...,1]=agent); targets come straight from the VAP
+                # manifest's cur_va_int (row0=user, row1=agent, -100 where the manifest
+                # has no entry for that frame).
+                if (args.backchannel.enable
+                        and args.backchannel.vad_loss_weight > 0
+                        and output.vad_logits is not None
+                        and batch.vad_targets is not None):
+                    vad_t = batch.vad_targets.to(codes.device)         # [B, 2, T]
+                    vad_l = output.vad_logits[:, T_p:].transpose(1, 2)  # [B, 2, T] — strip prefix
+                    vmask = vad_t >= 0  # drop frames with no manifest VAD entry
+                    if batch.valid_mask is not None:
+                        vmask = vmask & batch.valid_mask.to(codes.device).unsqueeze(1).expand_as(vad_t)
+                    if vmask.any():
+                        vad_loss = F.binary_cross_entropy_with_logits(
+                            vad_l[vmask].float(), vad_t[vmask].float(),
+                        )
+                        mb_loss = mb_loss + args.backchannel.vad_loss_weight * vad_loss
+                        silence_loss_val += vad_loss.detach()  # reuse tracker; logged as vad_loss
 
                 # ── Face motion reconstruction loss (full reference loss) ──
                 face_loss = None
                 if args.face_gen.enable:
                     if output.face_outputs is None:
-                        # Covered above by face_loss_skipped_no_data when batch.face_motion_gt
-                        # was None.  This branch fires when gt_face_motion is None for a
-                        # different reason (face_codec missing, audio_feat None in model, etc.).
-                        if gt_face_motion is not None and get_rank() == 0:
-                            logger.warning(
-                                f"[step {state.step}] face_outputs is None but gt_face_motion "
-                                f"is not None — face_codec={'ok' if face_codec is not None else 'MISSING'}. "
-                                f"Check audio_feat passed to the model."
-                            )
+                        raise RuntimeError(
+                            f"[step {state.step}] face_gen is enabled but face_outputs is None "
+                            f"(gt_face_motion={'ok' if gt_face_motion is not None else 'MISSING'}, "
+                            f"face_codec={'ok' if face_codec is not None else 'MISSING'})."
+                        )
                     elif gt_face_motion is not None and face_codec is not None:
                         # Build [B, T_face] bool mask.
                         # When T_p > 0, gt_face_motion was prepended with 2*T_p zero frames
@@ -657,10 +1113,14 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                                 f"T_face_p={T_face_p}, T_face={gt_face_motion.shape[1]}. "
                                 f"Face loss will be 0."
                             )
-                        face_loss = compute_face_loss(
+                        face_loss, face_components = compute_face_loss(
                             output.face_outputs, gt_face_motion, face_codec, args.face_gen,
                             valid_face_mask=valid_face_mask,
+                            return_components=True,
                         )
+                        face_components["scheduled_sampling_prob"] = output.face_outputs[
+                            "scheduled_sampling_prob"
+                        ]
                         if torch.isfinite(face_loss):
                             if face_loss.item() == 0.0 and get_rank() == 0:
                                 logger.warning(
@@ -668,8 +1128,14 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                                     f"(mask valid={valid_face_mask.sum().item() if valid_face_mask is not None else 'N/A'} frames). "
                                     f"Check FLAME data quality."
                                 )
-                            mb_loss = mb_loss + args.face_gen.face_loss_weight * face_loss
+                            # During face warm-up, keep forward/loss monitoring active but
+                            # exclude face loss from the objective. This blocks its gradient
+                            # from both the face module and the upstream LM features.
+                            if not face_warmup_active:
+                                mb_loss = mb_loss + args.face_gen.face_loss_weight * face_loss
                             face_loss_val += face_loss.detach()
+                            for name, component in face_components.items():
+                                face_component_vals[name] += component.detach()
                         else:
                             face_loss_skipped_nonfinite += 1
                             logger.warning(f"[step {state.step}] Non-finite face_loss={face_loss.item():.4f}, skipping.")
@@ -708,12 +1174,29 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                         bc_stats_accum[k] = bc_stats_accum[k] / args.num_microbatches
             if args.face_gen.enable:
                 face_loss_val /= args.num_microbatches
+                for name in face_component_vals:
+                    face_component_vals[name] /= args.num_microbatches
+            if teacher_model is not None:
+                for name in kd_vals:
+                    kd_vals[name] /= args.num_microbatches
             for p in model.parameters():
                 if p.requires_grad and p.grad is not None:
                     p.grad.div_(args.num_microbatches)
 
         # 그래디언트 클리핑
         torch.nn.utils.clip_grad_norm_(list(model.parameters()), args.max_norm)
+
+        if args.face_gen.enable and args.face_gen.warmup_steps > 0:
+            if state.step == 1 and get_rank() == 0:
+                logger.info(
+                    f"Face loss warm-up active for steps 1-{args.face_gen.warmup_steps}: "
+                    "face loss is monitored but excluded from backpropagation."
+                )
+            if state.step == args.face_gen.warmup_steps and get_rank() == 0:
+                logger.info(
+                    f"[step {state.step}] Face loss warm-up complete; "
+                    f"face gradients will be enabled from step {state.step + 1}."
+                )
 
         # VapGPT warm-up: protect pretrained GPT/vap_head weights during early steps
         if (args.backchannel.enable
@@ -733,7 +1216,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)  # 메모리 즉시 해제
 
-        last_lr = scheduler.get_last_lr()[0]
+        current_lrs = scheduler.get_last_lr()
+        last_lr = current_lrs[0]
         scheduler.step()
 
         loss_item = loss.item()
@@ -807,6 +1291,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 torch.cuda.memory_allocated(),
                 args,
                 vap_loss=state.this_vap_loss,   # → wandb "vap_loss" (None when backchannel disabled)
+                face_loss=state.this_face_loss, # → wandb "face_loss" (None when face generation disabled)
             )
             # [EPAD] 예측 metric: rank별 confusion counts를 합산한 뒤 acc/recall/f1 계산
             epad_counts_global = epad_counts.clone()
@@ -826,8 +1311,36 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             if args.backchannel.enable:
                 if args.backchannel.bc_event_loss_weight > 0:
                     train_logs["bc_event_loss"] = avg_aggregate(bc_event_loss_val.item())
-                if args.backchannel.silence_loss_weight > 0:
-                    train_logs["silence_loss"] = avg_aggregate(silence_loss_val.item())
+                    # Running LA prior estimate (rank-local; converges across ranks).
+                    _pri = (bc_class_counts / bc_class_counts.sum())
+                    train_logs["bc_prior_epad"] = float(_pri[1])
+                    train_logs["bc_prior_word"] = float(_pri[2])
+                    # BC-head confusion against the active bc_target_mode target.
+                    bc_head_global = bc_head_counts.clone()
+                    dist.all_reduce(bc_head_global, op=dist.ReduceOp.SUM)
+                    train_logs.update(
+                        epad_metrics_from_counts(bc_head_global, prefix="bc_head")
+                    )
+                if args.backchannel.vad_loss_weight > 0:
+                    train_logs["vad_loss"] = avg_aggregate(silence_loss_val.item())
+            if args.face_gen.enable:
+                # Raw face-loss components make imbalance/collapse visible in W&B.
+                # avg_aggregate performs a distributed collective, so every rank
+                # must execute this block before only rank 0 writes the metrics.
+                for name, value in face_component_vals.items():
+                    train_logs[f"face/{name}"] = avg_aggregate(value.item())
+                train_logs["face/weighted_loss"] = (
+                    0.0 if face_warmup_active else
+                    args.face_gen.face_loss_weight * state.this_face_loss
+                )
+                train_logs["face/warmup_active"] = int(face_warmup_active)
+                train_logs["lr/face_core"] = current_lrs[1]
+                train_logs["lr/face_llm_proj"] = current_lrs[2]
+            if teacher_model is not None:
+                for name, value in kd_vals.items():
+                    train_logs[f"continual/{name}_kd"] = avg_aggregate(
+                        value.item()
+                    )
             metrics_logger.log(train_logs, step=state.step)
 
         # 주기적 CUDA 캐시 비우기 (메모리 단편화 방지)
@@ -876,5 +1389,5 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
 if __name__ == "__main__":
     """사용법: torchrun --nproc_per_node=<N_GPUS> train.py config/example.yaml"""
-    """ torchrun --nproc_per_node=1 --master_port=29510 train.py config/example.yaml """
+    # torchrun --nproc_per_node=1 --master_port=29512 train.py config/example.yaml
     fire.Fire(train)

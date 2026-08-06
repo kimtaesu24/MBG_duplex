@@ -1,8 +1,8 @@
-"""Run test_inference2.py on one shard of the DualTalk OOD test jsonl.
+"""Run test_inference.py on one shard of the DualTalk OOD test jsonl.
 
 You launch one process per GPU yourself; this script just takes the total
 process count and this process's id, writes its own shard jsonl, and runs
-test_inference2.py on it.
+test_inference.py on it.
 
 Example (4 GPUs, one process each):
     CUDA_VISIBLE_DEVICES=3 python run_dualtalk_ood_infer.py -n 4 -i 0
@@ -67,7 +67,7 @@ def main():
     p.add_argument("--epad-control", type=str, default="fusion",
                    choices=("none", "legacy", "fusion"))
     p.add_argument("extra", nargs=argparse.REMAINDER,
-                   help="Extra args forwarded to test_inference2.py (after --).")
+                   help="Extra args forwarded to test_inference.py (after --).")
     args = p.parse_args()
 
     if args.num_procs < 1:
@@ -100,7 +100,7 @@ def main():
     if args.limit > 0:
         entries = entries[:args.limit]
 
-    # Resolve voice prompts. test_inference2.py looks for the .pt cache next to
+    # Resolve voice prompts. test_inference.py looks for the .pt cache next to
     # each entry's voice_sample wav; warn early if it is missing.
     if args.no_voice_prompt:
         for e in entries:
@@ -158,7 +158,7 @@ def main():
         return
 
     cmd = [
-        sys.executable, "test_inference2.py",
+        sys.executable, "test_inference.py",
         "--config", str(args.config),
         "--test-jsonl", str(shard_jsonl),
         "--ckpt-dir", str(ckpt_dir),

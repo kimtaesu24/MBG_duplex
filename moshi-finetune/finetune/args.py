@@ -41,10 +41,20 @@ class BackchannelArgs(Serializable):
     # so plain BCE (no focal / pos_weight) is used. 0 disables. (v1 module only)
     silence_loss_weight: float = 0.3
 
-    # v2 module (vap_gpt_module2 / lm2 / train2): current-frame VAD supervision.
+    # v2 module (vap_gpt_module / lm2 / train2): current-frame VAD supervision.
     # BCE(vad_logits, per-frame energy-VAD targets from the stereo waveform),
     # both streams (user, agent). 0 disables.
     vad_loss_weight: float = 0.3
+
+    # Learn START-vs-rest fusion jointly with the text model.  During training,
+    # BC/VAP/VAD evidence is added as a differentiable residual to the EPAD
+    # text logit; the normal text CE therefore calibrates the fusion weights.
+    fusion_trainable: bool = True
+    fusion_bc_init: float = 0.0
+    fusion_vap_init: float = 0.0
+    fusion_vad_init: float = 0.0
+    fusion_bias_init: float = 0.0
+    fusion_lr: float = 1e-3
 
     # v2.1 BC target: boundary-ignore radius (frames). PAD frames within ±K of a
     # true [EPAD] token are set to ignore (-100) in the 3-class CE — onset labels
@@ -60,6 +70,34 @@ class BackchannelArgs(Serializable):
     # selecting by eval epad_f1. Replaces bc_focal_pos_weight in the v2.1 path
     # (that field remains for the v1 trainer only).
     bc_la_tau: float = 0.75
+
+    # ── BC head supervision target (v2.1+) ────────────────────────────────
+    # bc_logits [B, T, 3]가 무엇을 예측하도록 학습할지 선택합니다. 두 모드 모두
+    # 같은 3-class head / Logit-Adjustment CE를 쓰므로 아키텍처 변경 없이 교체
+    # 가능하고, 체크포인트 선택 지표인 epad_f1(텍스트 head 기준)은 모드와 무관
+    # 하게 계산되므로 두 실험을 그대로 비교할 수 있습니다.
+    #
+    #   "epad" – GT 텍스트 토큰 기준 (기존 동작).
+    #            0=PAD, 1=EPAD(실제 backchannel onset), 2=WORD(실제 단어).
+    #            데이터셋 에이전트가 실제로 낸 반응을 그대로 모사합니다.
+    #
+    #   "vap"  – VAP manifest 기준 (turn-taking 동역학).
+    #            2=WORD : 에이전트가 지금 발화 중 (현재 프레임 VAD, agent 채널)
+    #            1=BC   : 지금은 침묵 + 향후 bc_vap_horizon_bins 구간 내 발화 시작
+    #                     (+ bc_vap_require_user_silent면 같은 구간에 유저 침묵)
+    #            0=PAD  : 그 외
+    #            텍스트 라벨이 없는 데이터에도 적용되고, 실제 반응 여부와 무관하게
+    #            "반응해도 되는 자리"를 학습합니다 (positive가 더 조밀함).
+    bc_target_mode: str = "epad"  # "epad" | "vap"
+
+    # "vap" 모드 전용: 미래 몇 개의 VAP bin까지를 "곧 발화"로 볼지 (1–4).
+    # bin 경계는 누적 기준 0-200 / 200-600 / 600-1200 / 1200-2000ms 입니다.
+    #   1 → 다음 200ms,  2 → 다음 600ms,  3 → 1.2s,  4 → 2.0s
+    bc_vap_horizon_bins: int = 1
+    # "vap" 모드 전용: 같은 horizon 구간에 유저가 침묵일 때만 BC(class 1)로 셀지.
+    # True면 유저 발화와 겹치는 구간이 제외되어 positive가 희소해집니다.
+    bc_vap_require_user_silent: bool = True
+
     # VapGPT warm-up: freeze GPT layers for this many steps so projections stabilise first
     bc_warmup_steps: int = 200
 
@@ -93,6 +131,18 @@ class BackchannelArgs(Serializable):
     # 대안 체크포인트: Lightning .ckpt 포맷도 지원
     # "/home2/s20235100/Conversational-AI/VoiceActivityProjection/example/50hz_48_10s-epoch20-val_1.85.ckpt"
 
+    def __post_init__(self) -> None:
+        if self.bc_target_mode not in ("epad", "vap"):
+            raise ValueError(
+                f"backchannel.bc_target_mode must be 'epad' or 'vap', "
+                f"got {self.bc_target_mode!r}"
+            )
+        if not 1 <= self.bc_vap_horizon_bins <= 4:
+            raise ValueError(
+                f"backchannel.bc_vap_horizon_bins must be in [1, 4], "
+                f"got {self.bc_vap_horizon_bins}"
+            )
+
 
 @dataclass
 class LoraArgs(Serializable):
@@ -122,7 +172,11 @@ class ContinualLearningArgs(Serializable):
     """Frozen PersonaPlex online-teacher distillation settings."""
     enable: bool = False
     # None uses moshi_paths.moshi_path, i.e. the original PersonaPlex weights.
+    # 로컬 파일 경로, 체크포인트 디렉터리, 또는 HF repo id("org/name") 모두 허용.
     teacher_checkpoint: str | None = None
+    # HF repo id를 직접 지정할 때 사용 (예: "nvidia/personaplex-7b-v1").
+    # 설정 시 teacher_checkpoint보다 우선하며 model.safetensors를 자동 다운로드.
+    hf_repo_id: str | None = None
     temperature: float = 2.0
     text_kd_weight: float = 0.35
     speech_activity_kd_weight: float = 1.0
