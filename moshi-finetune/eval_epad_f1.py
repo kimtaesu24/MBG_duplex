@@ -30,6 +30,7 @@ from eval_bc_event import (
 )
 from finetune.data.data_loader import build_data_loader
 from finetune.loss import epad_confusion_counts, epad_metrics_from_counts
+from inference import fusion_state, log_fusion_state
 
 
 logger = logging.getLogger("eval_epad_f1")
@@ -151,6 +152,11 @@ def make_lm_config(args: TrainArgs) -> dict:
             backchannel_gumbel_temp_min=bc.gumbel_temp_min,
             backchannel_gumbel_anneal_rate=bc.gumbel_anneal_rate,
             backchannel_module_type=bc.module_type,
+            backchannel_fusion_trainable=bc.fusion_trainable,
+            backchannel_fusion_bc_init=bc.fusion_bc_init,
+            backchannel_fusion_vap_init=bc.fusion_vap_init,
+            backchannel_fusion_vad_init=bc.fusion_vad_init,
+            backchannel_fusion_bias_init=bc.fusion_bias_init,
         )
         if bc.pad_token_id is not None:
             config["backchannel_pad_token_id"] = bc.pad_token_id
@@ -305,6 +311,7 @@ def main() -> None:
         param_dtype,
         device,
     )
+    log_fusion_state(model)
     patch_depformer_noop(model)
 
     import sentencepiece
@@ -358,6 +365,7 @@ def main() -> None:
         "batch_size": cli.batch_size,
         "num_batches": num_batches,
         "epad_token_id": int(model.end_of_text_padding_id),
+        "fusion": fusion_state(model),
         "tp": tp,
         "fp": fp,
         "fn": fn,

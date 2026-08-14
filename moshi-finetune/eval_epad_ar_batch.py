@@ -23,13 +23,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../m
 import moshi.models.loaders as loaders
 from finetune.data.interleaver import InterleavedTokenizer, Interleaver
 from moshi.models.lm import load_audio as lm_load_audio
-from test_inference import (
+from inference import (
     LMGen,
     _repair_config_paths,
     _wrap_with_system_tags,
     list_jsonl,
     load_checkpoint,
     log,
+    fusion_state,
+    log_fusion_state,
     set_seed,
 )
 
@@ -71,13 +73,6 @@ def parse_args():
     parser.add_argument("--temp-text", type=float, default=0.7)
     parser.add_argument("--top-k-text", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--epad-control", choices=("none", "legacy", "fusion"), default="fusion"
-    )
-    parser.add_argument("--fusion-bc-weight", type=float, default=0.025)
-    parser.add_argument("--fusion-vap-weight", type=float, default=0.0)
-    parser.add_argument("--fusion-vad-weight", type=float, default=0.025)
-    parser.add_argument("--fusion-threshold", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -98,6 +93,11 @@ def configure_backchannel(config: dict) -> None:
         backchannel_gumbel_anneal_rate=bc.get("gumbel_anneal_rate", 0.0001),
         backchannel_pad_token_id=bc.get("pad_token_id", 3),
         backchannel_epad_token_id=bc.get("epad_token_id", 0),
+        backchannel_fusion_trainable=bc.get("fusion_trainable", False),
+        backchannel_fusion_bc_init=bc.get("fusion_bc_init", 0.0),
+        backchannel_fusion_vap_init=bc.get("fusion_vap_init", 0.0),
+        backchannel_fusion_vad_init=bc.get("fusion_vad_init", 0.0),
+        backchannel_fusion_bias_init=bc.get("fusion_bias_init", 0.0),
     )
     if bc.get("module_type") == "vap_gpt":
         loaders._lm_kwargs.update(
@@ -183,12 +183,13 @@ def load_runtime(args):
         bc_context_frames=max(
             1, int(round(float(config.get("duration_sec", 10.0)) * mimi.frame_rate))
         ),
-        epad_control="none" if args.base_model_only else args.epad_control,
-        fusion_bc_weight=args.fusion_bc_weight,
-        fusion_vap_weight=args.fusion_vap_weight,
-        fusion_vad_weight=args.fusion_vad_weight,
-        fusion_threshold=args.fusion_threshold,
     )
+    log_fusion_state(lm)
+    if not args.base_model_only and getattr(lm, "backchannel_fusion_trainable", False):
+        log(
+            "info",
+            "Using checkpoint-trained fusion parameters.",
+        )
     text_prompt = args.text_prompt if args.text_prompt is not None else config.get("text_prompt", "")
     lm_gen.text_prompt_tokens = (
         text_tokenizer.encode(_wrap_with_system_tags(text_prompt))
@@ -492,6 +493,7 @@ def main():
         "num_files": len(details),
         "num_skipped": len(skipped),
         "num_frames": total,
+        "fusion": fusion_state(lm_gen.lm_model),
         **dict(zip(("tp", "fp", "fn", "tn"), totals)),
         "precision": precision,
         "recall": recall,

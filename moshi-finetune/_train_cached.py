@@ -183,6 +183,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack, cached_train: str, cached_val
         lm_config["backchannel_gumbel_temp_init"] = args.backchannel.gumbel_temp_init
         lm_config["backchannel_gumbel_temp_min"] = args.backchannel.gumbel_temp_min
         lm_config["backchannel_gumbel_anneal_rate"] = args.backchannel.gumbel_anneal_rate
+        lm_config["backchannel_fusion_trainable"] = args.backchannel.fusion_trainable
+        lm_config["backchannel_fusion_bc_init"] = args.backchannel.fusion_bc_init
+        lm_config["backchannel_fusion_vap_init"] = args.backchannel.fusion_vap_init
+        lm_config["backchannel_fusion_vad_init"] = args.backchannel.fusion_vad_init
+        lm_config["backchannel_fusion_bias_init"] = args.backchannel.fusion_bias_init
         if args.backchannel.pad_token_id is not None:
             lm_config["backchannel_pad_token_id"] = args.backchannel.pad_token_id
         if args.backchannel.epad_token_id is not None:
@@ -279,16 +284,37 @@ def _train(args: TrainArgs, exit_stack: ExitStack, cached_train: str, cached_val
     # ── 8. dtype / 옵티마이저 / 스케줄러 ─────────────────────────────────
     param_dtype = getattr(torch, args.param_dtype)
 
+    fusion_params = [
+        p for name, p in model.named_parameters()
+        if p.requires_grad and "backchannel_fusion_" in name
+    ]
+    base_params = [
+        p for name, p in model.named_parameters()
+        if p.requires_grad and "backchannel_fusion_" not in name
+    ]
+    param_groups = [{"params": base_params, "lr": args.optim.lr}]
+    max_lrs = [args.optim.lr]
+    if args.backchannel.enable and args.backchannel.fusion_trainable:
+        if not fusion_params:
+            raise RuntimeError(
+                "fusion_trainable=True but no trainable backchannel fusion parameters were found"
+            )
+        param_groups.append({
+            "params": fusion_params,
+            "lr": args.backchannel.fusion_lr,
+            "weight_decay": 0.0,
+        })
+        max_lrs.append(args.backchannel.fusion_lr)
+
     optimizer = AdamW(
-        model.parameters(),
-        lr=args.optim.lr,
+        param_groups,
         betas=(0.9, 0.95),
         eps=1e-08,
         weight_decay=args.optim.weight_decay,
     )
     scheduler = lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=args.optim.lr,
+        max_lr=max_lrs,
         total_steps=args.max_steps,
         pct_start=args.optim.pct_start,
     )
