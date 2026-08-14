@@ -331,19 +331,19 @@ class LMModel(StreamingContainer):
             face_module_detach_llm_features
         )
         self.backchannel_fusion_trainable = bool(backchannel_fusion_trainable)
-        self.backchannel_fusion_bc_weight = nn.Parameter(
+        self.backchannel_fusion_bc_weight = torch.nn.Parameter(
             torch.tensor(float(backchannel_fusion_bc_init)),
             requires_grad=self.backchannel_fusion_trainable,
         )
-        self.backchannel_fusion_vap_weight = nn.Parameter(
+        self.backchannel_fusion_vap_weight = torch.nn.Parameter(
             torch.tensor(float(backchannel_fusion_vap_init)),
             requires_grad=self.backchannel_fusion_trainable,
         )
-        self.backchannel_fusion_vad_weight = nn.Parameter(
+        self.backchannel_fusion_vad_weight = torch.nn.Parameter(
             torch.tensor(float(backchannel_fusion_vad_init)),
             requires_grad=self.backchannel_fusion_trainable,
         )
-        self.backchannel_fusion_bias = nn.Parameter(
+        self.backchannel_fusion_bias = torch.nn.Parameter(
             torch.tensor(float(backchannel_fusion_bias_init)),
             requires_grad=self.backchannel_fusion_trainable,
         )
@@ -1243,13 +1243,7 @@ class LMGen(StreamingModule[_LMGenState]):
         sample_rate: int = 32000,
         frame_rate: int = FRAME_RATE_HZ,
         mimi=None,
-        suppress_epad: bool = False,
         bc_context_frames: int = 250,
-        epad_control: str = "fusion",
-        fusion_bc_weight: float = 1.0,
-        fusion_vap_weight: float = 0.0,
-        fusion_vad_weight: float = 0.0,
-        fusion_threshold: float = 0.5,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -1288,22 +1282,11 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
         self.mimi = mimi  # optional; used to auto-extract bc_audio_feats for VapGPT backchannel
-        # When True, force a sampled [EPAD] back to [PAD] whenever the backchannel gate
-        # says "don't speak" (g_final == 0). The substitution happens before the token is
-        # written to state.cache, so the model's autoregressive history sees [PAD] and is
-        # therefore prevented from starting a word in the next step.
-        self.suppress_epad = suppress_epad
-        if epad_control not in ("none", "legacy", "fusion"):
+        if lm_model.backchannel is not None and not lm_model.backchannel_fusion_trainable:
             raise ValueError(
-                f"epad_control must be one of none/legacy/fusion, got {epad_control!r}"
+                "Inference requires the train.py fusion path: enable "
+                "backchannel.fusion_trainable and load its checkpoint parameters."
             )
-        if not 0.0 < fusion_threshold < 1.0:
-            raise ValueError("fusion_threshold must be strictly between 0 and 1")
-        self.epad_control = epad_control
-        self.fusion_bc_weight = float(fusion_bc_weight)
-        self.fusion_vap_weight = float(fusion_vap_weight)
-        self.fusion_vad_weight = float(fusion_vad_weight)
-        self.fusion_threshold = float(fusion_threshold)
         # Rolling-window history for the VapGPT backchannel module: its GPT layers have no
         # KV cache, so at inference we replay the same causal context seen during training
         # by buffering past frames (transformer_out + per-speaker audio feats) up to
@@ -1515,15 +1498,12 @@ class LMGen(StreamingModule[_LMGenState]):
         state = self._streaming_state
         lm_model = self.lm_model
 
-        # Fusion may add an explicit turn-taking residual to the backbone's EPAD
-        # logit below. Sampling is deliberately deferred until after that residual
-        # is available, and is performed exactly once so bc_weight=0 reproduces the
-        # original backbone sampling path (including RNG consumption).
+        # Match LMModel.forward exactly: add the checkpoint-trained START-vs-rest
+        # residual to the EPAD logit, then perform the regular text sampling once.
         text_logits_for_sampling = text_logits.float()
         gate_fires = None
 
-        # Compute explicit turn-taking evidence before text sampling. Fusion mode
-        # applies it as an EPAD-logit residual; legacy mode retains hard replacement.
+        # Compute explicit turn-taking evidence before text sampling.
         if lm_model.backchannel is not None:
             is_vapgpt = isinstance(lm_model.backchannel, VapGPTBackchannelModule)
             agent_af = None
@@ -1616,43 +1596,20 @@ class LMGen(StreamingModule[_LMGenState]):
             # vad_logits[..., 0] is the user-active log-odds, therefore its
             # negative is exactly the user-quiet log-odds.
             user_quiet_log_odds = -bc_result.vad_logits[:, -1, 0].float()
-            # A jointly trained model owns the fusion calibration.  Otherwise
-            # retain the inference-only scalar controls for ablations.
-            if lm_model.backchannel_fusion_trainable:
-                bc_weight = lm_model.backchannel_fusion_bc_weight.float()
-                vap_weight = lm_model.backchannel_fusion_vap_weight.float()
-                vad_weight = lm_model.backchannel_fusion_vad_weight.float()
-                fusion_bias = lm_model.backchannel_fusion_bias.float()
-            else:
-                bc_weight = self.fusion_bc_weight
-                vap_weight = self.fusion_vap_weight
-                vad_weight = self.fusion_vad_weight
-                fusion_bias = 0.0
-
             explicit_residual = (
-                bc_weight * explicit_log_odds
-                + vap_weight * vap_log_odds
-                + vad_weight * user_quiet_log_odds
-                + fusion_bias
+                lm_model.backchannel_fusion_bc_weight.float() * explicit_log_odds
+                + lm_model.backchannel_fusion_vap_weight.float() * vap_log_odds
+                + lm_model.backchannel_fusion_vad_weight.float() * user_quiet_log_odds
+                + lm_model.backchannel_fusion_bias.float()
             )
             fusion_score = implicit_log_odds + explicit_residual
             fusion_prob = torch.sigmoid(fusion_score)
 
-            if self.epad_control == "fusion":
-                # Residual shallow fusion: preserve every backbone text logit and
-                # add explicit evidence only to EPAD. Unlike the former hard 0.5
-                # decision, this retains the backbone's stochastic implicit onset
-                # prior and lets the normal temperature/top-k sampler decide.
-                text_logits_for_sampling = text_logits.float().clone()
-                text_logits_for_sampling[:, 0, 0, lm_model.end_of_text_padding_id] += (
-                    explicit_residual
-                )
-                # Filled with the actual sampled EPAD decision after sampling.
-                gate_fires = torch.zeros_like(pred_cls, dtype=torch.bool)
-            elif self.epad_control == "legacy":
-                gate_fires = pred_cls == 1
-            else:
-                gate_fires = torch.zeros_like(pred_cls, dtype=torch.bool)
+            text_logits_for_sampling = text_logits.float().clone()
+            text_logits_for_sampling[:, 0, 0, lm_model.end_of_text_padding_id] += (
+                explicit_residual
+            )
+            gate_fires = torch.zeros_like(pred_cls, dtype=torch.bool)
 
             # Expose only the current frame so external logging stays per-step.
             # gate is the ACTUAL decision — loggers read it directly.
@@ -1682,34 +1639,9 @@ class LMGen(StreamingModule[_LMGenState]):
         sampled_text_token = sampled_text_token[:, 0, 0]  # [B]
 
         if lm_model.backchannel is not None:
-            if self.epad_control == "fusion":
-                # Diagnostic gate = the actual fused sampler decision. No token is
-                # overwritten in fusion mode.
-                lm_model._last_bc_result.gate = (
-                    sampled_text_token == lm_model.end_of_text_padding_id
-                ).unsqueeze(1)
-            elif self.epad_control == "legacy":
-                is_pad = sampled_text_token == lm_model.text_padding_token_id
-                sampled_text_token = torch.where(
-                    is_pad & gate_fires,
-                    sampled_text_token.new_full(
-                        sampled_text_token.shape, lm_model.end_of_text_padding_id
-                    ),
-                    sampled_text_token,
-                )
-                # Preserve the old optional explicit veto for legacy ablations.
-                if self.suppress_epad:
-                    is_epad = sampled_text_token == lm_model.end_of_text_padding_id
-                    sampled_text_token = torch.where(
-                        is_epad & ~gate_fires,
-                        sampled_text_token.new_full(
-                            sampled_text_token.shape, lm_model.text_padding_token_id
-                        ),
-                        sampled_text_token,
-                    )
-            elif self.suppress_epad:
-                # suppress_epad has no controller to consult in `none` mode.
-                pass
+            lm_model._last_bc_result.gate = (
+                sampled_text_token == lm_model.end_of_text_padding_id
+            ).unsqueeze(1)
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 

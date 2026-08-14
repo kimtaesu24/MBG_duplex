@@ -14,7 +14,6 @@ Usage:
                 synthetic_user_interruption \\
         [--ckpt-dir path/to/checkpoint] \\
         [--overwrite] \\
-        [--suppress-epad] \\
         [--device cuda]
 """
 
@@ -41,14 +40,15 @@ import moshi.models.loaders as loaders
 from moshi.offline import warmup
 
 # Keep benchmark inference on exactly the same model/generation implementation as
-# test_inference.py. Importing it also installs lm2.LMModel into the loader.
-from test_inference import (
+# inference.py. Importing it also installs lm.LMModel into the loader.
+from inference import (
     LMGen,
     _repair_config_paths,
     _wrap_with_system_tags,
     infer_one,
     load_checkpoint,
     log,
+    log_fusion_state,
 )
 
 
@@ -165,6 +165,11 @@ def run(args):
         loaders._lm_kwargs["backchannel_gumbel_anneal_rate"] = bc_cfg.get("gumbel_anneal_rate", 0.0001)
         loaders._lm_kwargs["backchannel_pad_token_id"] = bc_cfg.get("pad_token_id", 3)
         loaders._lm_kwargs["backchannel_epad_token_id"] = bc_cfg.get("epad_token_id", 0)
+        loaders._lm_kwargs["backchannel_fusion_trainable"] = bc_cfg.get("fusion_trainable", False)
+        loaders._lm_kwargs["backchannel_fusion_bc_init"] = bc_cfg.get("fusion_bc_init", 0.0)
+        loaders._lm_kwargs["backchannel_fusion_vap_init"] = bc_cfg.get("fusion_vap_init", 0.0)
+        loaders._lm_kwargs["backchannel_fusion_vad_init"] = bc_cfg.get("fusion_vad_init", 0.0)
+        loaders._lm_kwargs["backchannel_fusion_bias_init"] = bc_cfg.get("fusion_bias_init", 0.0)
         if bc_cfg.get("module_type", "mlp") == "vap_gpt":
             loaders._lm_kwargs["backchannel_vap_repo_path"] = bc_cfg.get("vap_gpt_repo_path", "")
             loaders._lm_kwargs["backchannel_vap_checkpoint"] = bc_cfg.get("vap_gpt_checkpoint", None)
@@ -237,16 +242,16 @@ def run(args):
         top_k=args.top_k_audio,
         top_k_text=args.top_k_text,
         mimi=mimi,
-        suppress_epad=args.suppress_epad,
         bc_context_frames=max(
             1, int(round(float(config.get("duration_sec", 10.0)) * mimi.frame_rate))
         ),
-        epad_control=args.epad_control,
-        fusion_bc_weight=args.fusion_bc_weight,
-        fusion_vap_weight=args.fusion_vap_weight,
-        fusion_vad_weight=args.fusion_vad_weight,
-        fusion_threshold=args.fusion_threshold,
     )
+    log_fusion_state(lm)
+    if getattr(lm, "backchannel_fusion_trainable", False):
+        log(
+            "info",
+            "Using checkpoint-trained fusion parameters.",
+        )
 
     mimi.streaming_forever(1)
     other_mimi.streaming_forever(1)
@@ -335,18 +340,6 @@ if __name__ == "__main__":
     parser.add_argument("--overwrite", action="store_true", help="Re-generate even if output.wav exists")
     parser.add_argument("--no-voice-prompt", action="store_true")
     parser.add_argument("--text-prompt", default=None)
-    parser.add_argument("--suppress-epad", action="store_true",
-                        help="Force [EPAD] → [PAD] whenever g_final=0 (VAP says don't speak). "
-                             "Word tokens in progress are never replaced.")
-    parser.add_argument(
-        "--epad-control",
-        choices=("none", "legacy", "fusion"),
-        default="none",
-    )
-    parser.add_argument("--fusion-bc-weight", type=float, default=1.0)
-    parser.add_argument("--fusion-vap-weight", type=float, default=0.0)
-    parser.add_argument("--fusion-vad-weight", type=float, default=0.0)
-    parser.add_argument("--fusion-threshold", type=float, default=0.5)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--dtype",

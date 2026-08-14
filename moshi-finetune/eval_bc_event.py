@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Evaluate bc_event prediction performance of a trained model.
 
-Loads a fine-tuned Personaplex checkpoint (LoRA or full), runs the eval data
-through the model, collects bc_logits vs bc_timing_targets, and reports:
+Loads a fine-tuned Personaplex checkpoint (LoRA or full), runs a teacher-forced
+validation pass, builds the configured ``epad`` or ``vap`` targets, and reports:
 
-  * Focal BCE loss (same formulation as training)
+  * Binary one-vs-rest proxy loss for checkpoint comparison
   * Binary classification metrics at a configurable threshold:
       accuracy, precision, recall, F1, specificity
   * Threshold-independent: AUROC, AUPRC
   * Positive-rate statistics (label base-rate vs predicted rate)
+  * Tolerance-window onset event F1, timing MAE, and interruption rate
   * Per-threshold PR/ROC curves (optional --curves flag)
 
 Usage (single GPU):
@@ -19,6 +20,7 @@ Usage (single GPU):
         [--batch_size 16]
         [--max_batches 200]
         [--threshold 0.5]
+        [--tolerance_frames 5]                     # +/-400 ms at 12.5 fps
         [--device cuda:0]
         [--curves]                                  # print PR / ROC tables
         [--output results/bc_eval_XXXXXX.json]
@@ -47,6 +49,8 @@ import safetensors
 from finetune.args import TrainArgs
 from finetune.data.data_loader import build_data_loader
 from finetune.data.interleaver import InterleavedTokenizer, Interleaver
+from finetune.loss import build_bc_targets
+from inference import fusion_state
 from moshi.models.loaders import (
     get_mimi,
     _lm_kwargs,
@@ -137,6 +141,9 @@ def compute_metrics(
     threshold: float,
     gamma: float,
     pos_weight: float,
+    sequences: list[dict] | None = None,
+    tolerance_frames: int = 5,
+    frame_rate: float = 12.5,
 ) -> dict:
     """Compute a comprehensive set of bc_event metrics from collected predictions."""
     N = len(all_logits)
@@ -174,7 +181,7 @@ def compute_metrics(
     focal_loss = _focal_bce(logits_t, targets_t, gamma=gamma, pos_weight=pos_weight)
     plain_bce  = F.binary_cross_entropy_with_logits(logits_t, targets_t).item()
 
-    return dict(
+    metrics = dict(
         n_samples=N,
         pos_rate=float(pos_rate),
         pred_pos_rate=float(pred_rate),
@@ -193,6 +200,73 @@ def compute_metrics(
         focal_bce_loss=focal_loss,
         plain_bce_loss=plain_bce,
     )
+    if sequences is not None:
+        metrics.update(compute_event_metrics(
+            sequences, threshold, tolerance_frames, frame_rate
+        ))
+    return metrics
+
+
+def _onsets(mask: np.ndarray) -> np.ndarray:
+    """Collapse every contiguous positive region to its first frame."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0:
+        return np.empty(0, dtype=np.int64)
+    return np.flatnonzero(mask & np.r_[True, ~mask[:-1]])
+
+
+def compute_event_metrics(
+    sequences: list[dict], threshold: float, tolerance_frames: int, frame_rate: float
+) -> dict:
+    """One-to-one BC onset matching without autoregressive generation."""
+    matched = predicted = target = interrupted = 0
+    errors: list[int] = []
+
+    for seq in sequences:
+        valid = seq["valid"]
+        pred_ts = _onsets((seq["probs"] >= threshold) & valid)
+        tgt_ts = _onsets(seq["targets"] & valid)
+        predicted += len(pred_ts)
+        target += len(tgt_ts)
+
+        # Ordered matching maximizes the number of pairs inside the tolerance.
+        i = j = 0
+        while i < len(pred_ts) and j < len(tgt_ts):
+            delta = int(pred_ts[i] - tgt_ts[j])
+            if delta < -tolerance_frames:
+                i += 1
+            elif delta > tolerance_frames:
+                j += 1
+            else:
+                matched += 1
+                errors.append(delta)
+                i += 1
+                j += 1
+
+        user_vad = seq.get("user_vad")
+        if user_vad is not None:
+            known = user_vad[pred_ts] >= 0
+            interrupted += int(((user_vad[pred_ts] > 0.5) & known).sum())
+
+    precision = matched / predicted if predicted else 0.0
+    recall = matched / target if target else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    abs_errors = np.abs(errors)
+    return {
+        "event_tolerance_frames": tolerance_frames,
+        "event_precision": precision,
+        "event_recall": recall,
+        "event_f1": f1,
+        "event_onset_mae_ms": (
+            float(abs_errors.mean() * 1000.0 / frame_rate) if errors else 0.0
+        ),
+        "event_early_rate": float(np.mean(np.asarray(errors) < 0)) if errors else 0.0,
+        "event_late_rate": float(np.mean(np.asarray(errors) > 0)) if errors else 0.0,
+        "interruption_rate": interrupted / predicted if predicted else 0.0,
+        "n_predicted_events": predicted,
+        "n_target_events": target,
+        "n_matched_events": matched,
+    }
 
 
 def _compute_auroc(probs: np.ndarray, labels: np.ndarray) -> float:
@@ -271,10 +345,23 @@ def _load_base_model(lm_config: dict, moshi_path: str, param_dtype: torch.dtype)
     with safetensors.safe_open(moshi_path, framework="pt", device="cpu") as f:
         base_sd = {k: f.get_tensor(k) for k in f.keys()}
     missing, unexpected = model.load_state_dict(base_sd, strict=False)
-    if missing:
-        logger.warning(f"Base weights — {len(missing)} missing keys")
+    # PersonaPlex base weights intentionally do not contain task-specific modules
+    # constructed from the finetuning config. Those are restored from the ckpt.
+    extension_roots = ("backchannel", "face_module")
+    real_missing = [k for k in missing if not k.startswith(extension_roots)]
+    if real_missing:
+        raise RuntimeError(
+            f"Base checkpoint is incompatible: {len(real_missing)} required keys missing; "
+            f"first keys: {real_missing[:5]}"
+        )
     if unexpected:
-        logger.warning(f"Base weights — {len(unexpected)} unexpected keys")
+        raise RuntimeError(
+            f"Base checkpoint has {len(unexpected)} unexpected keys; first keys: {unexpected[:5]}"
+        )
+    logger.info(
+        "Base PersonaPlex weights loaded (%d finetuning-extension tensors deferred to checkpoint).",
+        len(missing),
+    )
     del base_sd
     return model
 
@@ -287,81 +374,35 @@ def load_model(
     param_dtype: torch.dtype,
     device: str,
 ):
-    """Load the model from a consolidated checkpoint directory.
-
-    Supports both:
-      * LoRA hybrid checkpoints  (lora.safetensors  — adapters + backchannel)
-      * Full-finetune checkpoints (consolidated.safetensors)
-    """
+    """Load base weights, then restore/validate the finetuned checkpoint once."""
     lora_ckpt = checkpoint_dir / "consolidated" / "lora.safetensors"
     full_ckpt = checkpoint_dir / "consolidated" / "consolidated.safetensors"
 
     # ── Base model ──────────────────────────────────────────────────────
     model = _load_base_model(lm_config, moshi_path, param_dtype)
 
-    if lora_ckpt.exists():
-        # ── Hybrid LoRA + full-finetune (backchannel / face_module) ────
-        logger.info(f"LoRA checkpoint detected: {lora_ckpt}")
-
-        from peft import get_peft_model, LoraConfig, TaskType
-
-        target_modules = (
-            r"(?!.*(face_module|backchannel))"
-            r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj|linear_in|linear_out)"
-        )
-        peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
-            r=args.lora.rank,
-            lora_alpha=args.lora.scaling * args.lora.rank,
-            target_modules=target_modules,
-            bias="none",
-        )
-
-        class PeftCompatibleWrapper(torch.nn.Module):
-            def __init__(self, m):
-                super().__init__()
-                self.model = m
-
-            def __getattr__(self, name):
-                try:
-                    return super().__getattr__(name)
-                except AttributeError:
-                    return getattr(self.model, name)
-
-            def forward(self, input_ids=None, *a, **kw):
-                return self.model(input_ids, step=kw.get("step", 0),
-                                  voice_prompt_embs=kw.get("voice_prompt_embs"),
-                                  audio_feat=kw.get("audio_feat"),
-                                  gt_face_motion=kw.get("gt_face_motion"),
-                                  mimi=kw.get("mimi"),
-                                  bc_audio_feats=kw.get("bc_audio_feats"))
-
-        model = PeftCompatibleWrapper(model)
-        model = get_peft_model(model, peft_config)
-        model = model.to(param_dtype)
-
-        with safetensors.safe_open(str(lora_ckpt), framework="pt", device="cpu") as f:
-            adapter_sd = {k: f.get_tensor(k) for k in f.keys()}
-        missing, unexpected = model.load_state_dict(adapter_sd, strict=False)
-        n_loaded = len(adapter_sd) - len(unexpected)
-        logger.info(f"Loaded {n_loaded}/{len(adapter_sd)} tensors from LoRA checkpoint "
-                    f"({len(missing)} missing, {len(unexpected)} unexpected)")
-        del adapter_sd
-
-    elif full_ckpt.exists():
-        # ── Full-finetune checkpoint ─────────────────────────────────────
-        logger.info(f"Full checkpoint detected: {full_ckpt}")
-        with safetensors.safe_open(str(full_ckpt), framework="pt", device="cpu") as f:
-            full_sd = {k: f.get_tensor(k) for k in f.keys()}
-        missing, unexpected = model.load_state_dict(full_sd, strict=False)
-        logger.info(f"Loaded checkpoint ({len(missing)} missing, {len(unexpected)} unexpected)")
-        del full_sd
-
-    else:
+    if not lora_ckpt.exists() and not full_ckpt.exists():
         raise FileNotFoundError(
             f"No checkpoint found in {checkpoint_dir}/consolidated/  "
             f"(expected lora.safetensors or consolidated.safetensors)"
         )
+
+    # Use exactly the same loader as benchmark/test inference. It separates
+    # direct backchannel weights from LoRA weights, validates both subsets, and
+    # merges the adapter into one plain LMModel without misleading missing keys.
+    from inference import (
+        load_checkpoint as load_inference_checkpoint,
+        log_fusion_state,
+    )
+
+    model = load_inference_checkpoint(
+        model,
+        str(checkpoint_dir),
+        {"rank": args.lora.rank, "scaling": args.lora.scaling},
+        use_pretrained_depformer=False,
+    )
+    log_fusion_state(model)
+    logger.info("Finetuned checkpoint restored and validated successfully.")
 
     model = model.to(device).to(param_dtype)
     model.eval()
@@ -384,7 +425,7 @@ def collect_predictions(
     param_dtype: torch.dtype,
     device: str,
     max_batches: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Run the model over eval batches and collect bc_logits / bc_targets.
 
     Returns:
@@ -393,6 +434,7 @@ def collect_predictions(
     """
     logits_list  = []
     targets_list = []
+    sequences = []
     n_batches    = 0
 
     for batch in data_loader:
@@ -440,17 +482,41 @@ def collect_predictions(
             bc_audio_feats=bc_audio_feats,
         )
 
-        if output.bc_logits is None or batch.bc_timing_targets is None:
+        if output.bc_logits is None:
             n_batches += 1
             continue
 
-        bc_logit_pos = output.bc_logits[:, T_p:, 1]  # [B, T] — positive logit
-        bc_targets   = batch.bc_timing_targets.to(device)  # [B, T]
+        bc_logits = output.bc_logits[:, T_p:].float()  # [B,T,3]
+        bc_probs = bc_logits.softmax(dim=-1)[..., 1]
+        # Binary log-odds whose sigmoid is exactly the class-1 softmax probability.
+        bc_logit_pos = torch.logit(bc_probs.clamp(1e-6, 1 - 1e-6))
+        bc_targets = build_bc_targets(
+            mode=args.backchannel.bc_target_mode,
+            text_tokens=codes[:, 0],
+            pad_id=model.text_padding_token_id,
+            epad_id=model.end_of_text_padding_id,
+            onset_ignore_frames=args.backchannel.bc_onset_ignore_frames,
+            valid_mask=batch.valid_mask,
+            vap_targets=batch.vap_targets,
+            vad_targets=batch.vad_targets,
+            vap_horizon_bins=args.backchannel.bc_vap_horizon_bins,
+            vap_require_user_silent=args.backchannel.bc_vap_require_user_silent,
+        )
 
         valid_mask = bc_targets != -100
         if valid_mask.any():
             logits_list.append(bc_logit_pos[valid_mask].float().cpu().numpy())
-            targets_list.append(bc_targets[valid_mask].float().cpu().numpy())
+            targets_list.append((bc_targets[valid_mask] == 1).float().cpu().numpy())
+        for b in range(codes.shape[0]):
+            user_vad = None
+            if batch.vad_targets is not None:
+                user_vad = batch.vad_targets[b, 0].float().cpu().numpy()
+            sequences.append({
+                "probs": bc_probs[b].cpu().numpy(),
+                "targets": (bc_targets[b] == 1).cpu().numpy(),
+                "valid": valid_mask[b].cpu().numpy(),
+                "user_vad": user_vad,
+            })
 
         n_batches += 1
         if n_batches % 10 == 0:
@@ -464,7 +530,7 @@ def collect_predictions(
     logits_all  = np.concatenate(logits_list,  axis=0)
     targets_all = np.concatenate(targets_list, axis=0)
     logger.info(f"Collected {len(logits_all):,} frames from {n_batches} batches.")
-    return logits_all, targets_all
+    return logits_all, targets_all, sequences
 
 
 # ---------------------------------------------------------------------------
@@ -491,14 +557,15 @@ def parse_args():
                    help="Path to a checkpoint directory containing consolidated/")
     p.add_argument("--config", type=str, default=None,
                    help="Path to args.yaml. Defaults to checkpoint_dir/../../args.yaml")
-    p.add_argument("--eval_data", type=str,
-                   default="./data/stereo_ami_balanced_test/data_with_voice_sample.jsonl",
-                   help="Eval data path (JSONL). Defaults to the AMI test split.")
+    p.add_argument("--eval_data", type=str, default=None,
+                   help="Eval data path (JSONL). Defaults to data.eval_data from config.")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_batches", type=int, default=0,
                    help="Max number of eval batches (set 0 for unlimited)")
     p.add_argument("--threshold", type=float, default=0.5,
                    help="Decision threshold for binary classification metrics")
+    p.add_argument("--tolerance_frames", type=int, default=5,
+                   help="BC onset match tolerance. 5 frames = +/-400 ms at 12.5 fps")
     p.add_argument("--device", type=str, default=None,
                    help="CUDA device (e.g. cuda:1). Defaults to GPU with most free memory.")
     p.add_argument("--curves", action="store_true",
@@ -510,6 +577,8 @@ def parse_args():
 
 def main():
     cli = parse_args()
+    if cli.tolerance_frames < 0:
+        raise ValueError("--tolerance_frames must be >= 0")
 
     checkpoint_dir = Path(cli.checkpoint_dir)
     if not checkpoint_dir.exists():
@@ -535,6 +604,12 @@ def main():
 
     device = cli.device or pick_free_gpu()
     torch.cuda.set_device(device)
+    logger.info(
+        "Using evaluation device: %s (current CUDA device=%d, name=%s)",
+        device,
+        torch.cuda.current_device(),
+        torch.cuda.get_device_name(torch.cuda.current_device()),
+    )
     param_dtype = torch.bfloat16 if args.param_dtype == "bfloat16" else torch.float32
 
     # Compute exact batch count from the eval JSONL so the loop is always finite.
@@ -581,6 +656,11 @@ def main():
         lm_config["backchannel_gumbel_temp_init"] = args.backchannel.gumbel_temp_init
         lm_config["backchannel_gumbel_temp_min"] = args.backchannel.gumbel_temp_min
         lm_config["backchannel_gumbel_anneal_rate"] = args.backchannel.gumbel_anneal_rate
+        lm_config["backchannel_fusion_trainable"] = args.backchannel.fusion_trainable
+        lm_config["backchannel_fusion_bc_init"] = args.backchannel.fusion_bc_init
+        lm_config["backchannel_fusion_vap_init"] = args.backchannel.fusion_vap_init
+        lm_config["backchannel_fusion_vad_init"] = args.backchannel.fusion_vad_init
+        lm_config["backchannel_fusion_bias_init"] = args.backchannel.fusion_bias_init
         if args.backchannel.pad_token_id is not None:
             lm_config["backchannel_pad_token_id"] = args.backchannel.pad_token_id
         if args.backchannel.epad_token_id is not None:
@@ -644,7 +724,7 @@ def main():
     # ── Collect predictions ─────────────────────────────────────────────
     limit_str = str(cli.max_batches) if cli.max_batches > 0 else "unlimited"
     logger.info(f"Running inference (batches={limit_str}, batch_size={cli.batch_size})...")
-    logits_all, targets_all = collect_predictions(
+    logits_all, targets_all, sequences = collect_predictions(
         model=model,
         data_loader=eval_loader,
         args=args,
@@ -663,6 +743,9 @@ def main():
         threshold=cli.threshold,
         gamma=args.backchannel.bc_focal_gamma,
         pos_weight=args.backchannel.bc_focal_pos_weight,
+        sequences=sequences,
+        tolerance_frames=cli.tolerance_frames,
+        frame_rate=float(mimi.frame_rate),
     )
 
     # ── Report ──────────────────────────────────────────────────────────
@@ -670,6 +753,7 @@ def main():
     print("  BC-Event Prediction Evaluation")
     print(f"  checkpoint : {checkpoint_dir}")
     print(f"  eval_data  : {args.data.eval_data}")
+    print(f"  target mode: {args.backchannel.bc_target_mode}")
     print("=" * 62)
     print(f"  Frames evaluated      : {metrics['n_samples']:>12,}")
     print(f"  True positive rate    : {metrics['pos_rate']:>12.4f}  ({metrics['pos_rate']*100:.2f}%)")
@@ -690,6 +774,15 @@ def main():
     print("  [ Threshold-independent ]")
     print(f"  AUROC                 : {metrics['auroc']:>12.4f}")
     print(f"  AUPRC                 : {metrics['auprc']:>12.4f}")
+    print("-" * 62)
+    print(f"  [ Onset events @ +/-{cli.tolerance_frames} frames ]")
+    print(f"  Pred / target / match : {metrics['n_predicted_events']:>6} / {metrics['n_target_events']:>6} / {metrics['n_matched_events']:>6}")
+    print(f"  Event precision       : {metrics['event_precision']:>12.4f}")
+    print(f"  Event recall          : {metrics['event_recall']:>12.4f}")
+    print(f"  Event F1              : {metrics['event_f1']:>12.4f}")
+    print(f"  Onset MAE             : {metrics['event_onset_mae_ms']:>10.1f} ms")
+    print(f"  Early / late rate     : {metrics['event_early_rate']:>6.4f} / {metrics['event_late_rate']:>6.4f}")
+    print(f"  Interruption rate     : {metrics['interruption_rate']:>12.4f}")
     print("=" * 62 + "\n")
 
     if cli.curves:
@@ -707,11 +800,14 @@ def main():
     results = {
         "checkpoint_dir": str(checkpoint_dir),
         "eval_data": args.data.eval_data,
+        "bc_target_mode": args.backchannel.bc_target_mode,
         "batch_size": cli.batch_size,
         "max_batches": cli.max_batches,
         "threshold": cli.threshold,
+        "tolerance_frames": cli.tolerance_frames,
         "focal_gamma": args.backchannel.bc_focal_gamma,
         "focal_pos_weight": args.backchannel.bc_focal_pos_weight,
+        "fusion": fusion_state(model),
         "metrics": metrics,
     }
     if cli.curves:

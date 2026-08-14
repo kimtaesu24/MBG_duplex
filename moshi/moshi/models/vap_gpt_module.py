@@ -520,7 +520,9 @@ def _load_vap_state_dict(path: str) -> dict:
             drop 'VAP.codebook' entries, rename
             'vap_head.projection_head' → 'vap_head'.
     """
-    raw = torch.load(path, map_location="cpu")
+    # VapGPT checkpoints used here contain tensors and primitive metadata only.
+    # Explicit weights_only avoids unsafe pickle fallback and the PyTorch warning.
+    raw = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(raw, dict) and "state_dict" in raw:
         sd = raw["state_dict"]
         cleaned = {}
