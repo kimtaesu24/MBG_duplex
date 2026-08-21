@@ -331,20 +331,22 @@ class LMModel(StreamingContainer):
             face_module_detach_llm_features
         )
         self.backchannel_fusion_trainable = bool(backchannel_fusion_trainable)
+        # Shape (1,) rather than a 0-dim scalar: FSDP's flat-param sharding
+        # rejects scalar parameters outright.
         self.backchannel_fusion_bc_weight = torch.nn.Parameter(
-            torch.tensor(float(backchannel_fusion_bc_init)),
+            torch.tensor([float(backchannel_fusion_bc_init)]),
             requires_grad=self.backchannel_fusion_trainable,
         )
         self.backchannel_fusion_vap_weight = torch.nn.Parameter(
-            torch.tensor(float(backchannel_fusion_vap_init)),
+            torch.tensor([float(backchannel_fusion_vap_init)]),
             requires_grad=self.backchannel_fusion_trainable,
         )
         self.backchannel_fusion_vad_weight = torch.nn.Parameter(
-            torch.tensor(float(backchannel_fusion_vad_init)),
+            torch.tensor([float(backchannel_fusion_vad_init)]),
             requires_grad=self.backchannel_fusion_trainable,
         )
         self.backchannel_fusion_bias = torch.nn.Parameter(
-            torch.tensor(float(backchannel_fusion_bias_init)),
+            torch.tensor([float(backchannel_fusion_bias_init)]),
             requires_grad=self.backchannel_fusion_trainable,
         )
         assert len(delays) == self.num_codebooks, "unexpected number of delays"
@@ -432,6 +434,13 @@ class LMModel(StreamingContainer):
 
         # ── Backchannel VAP Module ────────────────────────────────────────
         self.backchannel_enabled = backchannel_enabled
+        # Recorded here rather than probed with isinstance() later: FSDP and
+        # activation checkpointing replace self.backchannel with a wrapper, so
+        # an isinstance() check at call time sees the wrapper and silently
+        # reports False.
+        self.backchannel_needs_audio_feats = (
+            backchannel_enabled and backchannel_module_type == "vap_gpt"
+        )
         if backchannel_enabled:
             # Default to the model's actual text PAD/EPAD token IDs when not explicitly set.
             # text_padding_token_id = existing_text_padding_id (= 3 for Personaplex).
@@ -883,9 +892,12 @@ class LMModel(StreamingContainer):
         if self.backchannel is not None:
             target_codes = delayed_codes[:, :, 1:]
             # Auto-extract per-speaker Mimi latents when not provided externally.
-            # This keeps eval/inference self-contained: callers only need to pass mimi.
+            # This keeps inference self-contained: callers only need to pass mimi.
+            # Callers that prepend a text-prompt prefix to `codes` must instead
+            # pass bc_audio_feats themselves with the prefix zeroed — decoding
+            # the prefix's zero_token_id here yields a real latent, not silence.
             if (bc_audio_feats is None and mimi is not None
-                    and isinstance(self.backchannel, VapGPTBackchannelModule)):
+                    and self.backchannel_needs_audio_feats):
                 with torch.no_grad():
                     _max = self.card - 1
                     _a = mimi.decode_latent(codes[:, 1:9].clamp(0, _max)).transpose(1, 2)
@@ -961,7 +973,11 @@ class LMModel(StreamingContainer):
                 + self.backchannel_fusion_vad_weight.float() * user_quiet_log_odds
                 + self.backchannel_fusion_bias.float()
             )
-            text_logits = text_logits.float().clone()
+            # .float() already allocates a fresh fp32 tensor (the source is bf16)
+            # and nothing else aliases it, so the in-place add below is safe.
+            # An extra .clone() here doubled a [B, 1, T, text_card] fp32 buffer —
+            # several GB at training batch sizes — for no reason.
+            text_logits = text_logits.float()
             text_logits[:, 0, :, self.end_of_text_padding_id] += fusion_residual
 
             if bc_stats is not None:
@@ -1509,7 +1525,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
         # Compute explicit turn-taking evidence before text sampling.
         if lm_model.backchannel is not None:
-            is_vapgpt = isinstance(lm_model.backchannel, VapGPTBackchannelModule)
+            is_vapgpt = lm_model.backchannel_needs_audio_feats
             agent_af = None
             user_af = None
             if is_vapgpt and self.mimi is not None and input_codes is not None:
