@@ -101,13 +101,11 @@ def evaluate(
                 voice_prompt_embs = voice_prompt_embs.to(codes.device, non_blocking=True)
 
             # ── Face generation inputs ────────────────────────────────────
-            # mimi is passed directly to the model for VapGPT bc_audio_feats
-            # extraction (handled inside lm.forward_train).
             # For face gen, we mirror train.py: teacher-forced audio_feat is
             # precomputed here; generated-audio mode passes mimi to the model.
             audio_feat = None
             gt_face_motion = batch.face_motion_gt
-            mimi_for_model = mimi  # always pass mimi so VapGPT bc can auto-extract
+            mimi_for_model = mimi  # needed for face gen's generated-audio mode
 
             if args.face_gen.enable and mimi is not None:
                 if args.face_gen.use_generated_audio_feat:
@@ -135,12 +133,34 @@ def evaluate(
                         )
                         gt_face_motion = torch.cat([zero_motion, gt_face_motion], dim=1)
 
+            # ── Per-speaker Mimi features for VapGPT backchannel ──────────
+            # Computed here rather than left to lm.forward_train's auto-extract
+            # so eval matches train.py exactly: the T_p prompt prefix must be
+            # zero features. Auto-extract would instead decode the prefix's
+            # zero_token_id codes into a real (non-zero) latent, and since the
+            # VapGPT module is causal that skew leaks into the scored frames.
+            bc_audio_feats = None
+            if (args.backchannel.enable
+                    and args.backchannel.module_type == "vap_gpt"
+                    and mimi is not None):
+                with torch.no_grad():
+                    _agent = mimi.decode_latent(codes[:, 1:9].clamp(min=0)).transpose(1, 2)
+                    _user  = mimi.decode_latent(codes[:, 9:17].clamp(min=0)).transpose(1, 2)
+                    _agent = _agent.to(dtype=param_dtype)
+                    _user  = _user.to(dtype=param_dtype)
+                    if T_p:
+                        _zero = torch.zeros(codes.shape[0], T_p, _agent.shape[2],
+                                            device=_agent.device, dtype=_agent.dtype)
+                        _agent = torch.cat([_zero, _agent], dim=1)
+                        _user  = torch.cat([_zero, _user],  dim=1)
+                bc_audio_feats = (_agent, _user)
+
             output = model(codes_in, step=state.step,
                            voice_prompt_embs=voice_prompt_embs,
                            audio_feat=audio_feat,
                            gt_face_motion=gt_face_motion,
                            mimi=mimi_for_model,
-                           bc_audio_feats=None)  # auto-extracted inside lm when mimi is set
+                           bc_audio_feats=bc_audio_feats)
 
             # Slice off T_p prompt-prefix frames — loss is on the conversation only.
             text_mask  = output.text_mask[:, :, T_p:]
