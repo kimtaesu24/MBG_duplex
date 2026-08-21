@@ -1282,10 +1282,14 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
         self.mimi = mimi  # optional; used to auto-extract bc_audio_feats for VapGPT backchannel
+        # backchannel은 있지만 fusion이 학습되지 않은 checkpoint(no_fusion ablation 등)도
+        # 그대로 생성할 수 있다. train.py의 LMModel.forward가 fusion_trainable=False일 때
+        # EPAD 로짓에 residual을 더하지 않으므로, process_transformer_output도 동일하게
+        # residual을 건너뛴다. BC/VAP/VAD 예측 자체는 로깅용으로 계속 계산된다.
         if lm_model.backchannel is not None and not lm_model.backchannel_fusion_trainable:
-            raise ValueError(
-                "Inference requires the train.py fusion path: enable "
-                "backchannel.fusion_trainable and load its checkpoint parameters."
+            logger.info(
+                "backchannel_fusion_trainable=False: generating without the fusion "
+                "residual, matching the training-time forward path."
             )
         # Rolling-window history for the VapGPT backchannel module: its GPT layers have no
         # KV cache, so at inference we replay the same causal context seen during training
@@ -1596,19 +1600,27 @@ class LMGen(StreamingModule[_LMGenState]):
             # vad_logits[..., 0] is the user-active log-odds, therefore its
             # negative is exactly the user-quiet log-odds.
             user_quiet_log_odds = -bc_result.vad_logits[:, -1, 0].float()
-            explicit_residual = (
-                lm_model.backchannel_fusion_bc_weight.float() * explicit_log_odds
-                + lm_model.backchannel_fusion_vap_weight.float() * vap_log_odds
-                + lm_model.backchannel_fusion_vad_weight.float() * user_quiet_log_odds
-                + lm_model.backchannel_fusion_bias.float()
-            )
+            # LMModel.forward는 fusion_trainable일 때만 residual을 더한다. fusion이
+            # 학습되지 않았다면(no_fusion) 여기서도 backbone 로짓을 그대로 써야
+            # 학습과 같은 조건이 된다. 이때 fusion 파라미터는 config의 init 값에
+            # 머물러 있으므로 residual로 쓰면 학습된 적 없는 보정이 섞인다.
+            if lm_model.backchannel_fusion_trainable:
+                explicit_residual = (
+                    lm_model.backchannel_fusion_bc_weight.float() * explicit_log_odds
+                    + lm_model.backchannel_fusion_vap_weight.float() * vap_log_odds
+                    + lm_model.backchannel_fusion_vad_weight.float() * user_quiet_log_odds
+                    + lm_model.backchannel_fusion_bias.float()
+                )
+                # text_logits가 CUDA graph의 static buffer를 가리킬 수 있어 in-place
+                # 덧셈 전에 복사한다.
+                text_logits_for_sampling = text_logits.float().clone()
+                text_logits_for_sampling[:, 0, 0, lm_model.end_of_text_padding_id] += (
+                    explicit_residual
+                )
+            else:
+                explicit_residual = torch.zeros_like(implicit_log_odds)
             fusion_score = implicit_log_odds + explicit_residual
             fusion_prob = torch.sigmoid(fusion_score)
-
-            text_logits_for_sampling = text_logits.float().clone()
-            text_logits_for_sampling[:, 0, 0, lm_model.end_of_text_padding_id] += (
-                explicit_residual
-            )
             gate_fires = torch.zeros_like(pred_cls, dtype=torch.bool)
 
             # Expose only the current frame so external logging stays per-step.
