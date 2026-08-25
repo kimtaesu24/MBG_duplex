@@ -170,7 +170,10 @@ class OptimArgs(Serializable):
 @dataclass
 class ContinualLearningArgs(Serializable):
     """Frozen PersonaPlex online-teacher distillation settings."""
-    enable: bool = False
+    # New training default: retain the original PersonaPlex behaviour with an
+    # online frozen teacher. Ablation launchers still write this field
+    # explicitly so CL-off controls cannot change when defaults change again.
+    enable: bool = True
     # None uses moshi_paths.moshi_path, i.e. the original PersonaPlex weights.
     # 로컬 파일 경로, 체크포인트 디렉터리, 또는 HF repo id("org/name") 모두 허용.
     teacher_checkpoint: str | None = None
