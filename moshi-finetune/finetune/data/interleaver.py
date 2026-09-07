@@ -466,6 +466,16 @@ class InterleavedTokenizer:
         vad_targets = None
         if self.vap_lookup:
             vap_targets = torch.full((1, self.num_audio_frames), -100, dtype=torch.long, device=codes.device)
+            if self.vad_lookup:
+                # Allocated unconditionally, mirroring vap_targets above: unmatched
+                # frames stay -100 and are dropped by the BCE mask at loss time.
+                # Leaving this None for an unmatched file instead would make
+                # Batch.collate's all() discard the targets for the WHOLE batch —
+                # at a ~93% per-sample match rate that silently disables vad_loss
+                # for all but 1 batch in ~11,000.
+                vad_targets = torch.full(
+                    (1, 2, self.num_audio_frames), -100.0, dtype=torch.float32
+                )
             raw_file_id = os.path.splitext(os.path.basename(path))[0]
             is_ami_switched = (
                 is_ami_stereo and raw_file_id.endswith("_switch_stereo")
@@ -559,6 +569,8 @@ class InterleavedTokenizer:
                     va_full[0, known] = user[known]
                     va_full[1, known] = agent[known]
                     vad_targets = torch.from_numpy(va_full).unsqueeze(0)  # [1, 2, T]
+            # else: vad_targets keeps its all -100 fill — the sample contributes no
+            # VAD frames, but the rest of the batch still does.
 
         # ── Binary BC timing target (vectorized) ─────────────────────────────
         # Agent (spk1) speaks in next 200ms AND user (spk0) is silent.
