@@ -13,6 +13,15 @@ logger = logging.getLogger(__name__)
 
 _SENTINEL = object()
 
+# mimi.encode's transient activation buffer scales with the number of clips it is
+# handed — measured ~0.23 GiB per 10s clip on this checkpoint.  Encoding a whole
+# 256-clip batch in one call therefore spikes ~59 GiB, on the prefetch stream's
+# own allocator pool, to produce a few MB of codes.  That spike was the dominant
+# source of VRAM oscillation during training.  Chunking caps it at ~8 GiB.
+# Keep this fixed: the chunk size perturbs VQ tie-breaking slightly, so a stable
+# value keeps tokenization consistent for the whole run.
+_ENCODE_CHUNK = 32
+
 
 class PrefetchDataLoader:
     """
@@ -119,9 +128,8 @@ def build_data_loader(
                 continue
 
             # ── Batched mimi encoding ─────────────────────────────────────
-            # Prepare: wav [C, T] or [T] → [C, 1, T]; cat all into [C*B, 1, T].
-            # mimi.encode processes C*B mono clips in one kernel launch instead of
-            # B separate calls, keeping encode time roughly constant w.r.t batch size.
+            # Prepare: wav [C, T] or [T] → [C, 1, T]; cat all into [C*B, 1, T],
+            # then encode in fixed-size chunks (see _ENCODE_CHUNK).
             wav_tensors = []
             for wav, *_ in raw_buf:
                 w = torch.as_tensor(wav, dtype=torch.float32, device="cuda")
@@ -149,7 +157,13 @@ def build_data_loader(
             stacked = torch.cat([w[:, None] for w in wav_tensors], dim=0)  # [B*C, 1, T]
 
             with torch.no_grad():
-                all_tokens = mimi.encode(stacked)  # [B*C, K, T_enc]
+                all_tokens = torch.cat(
+                    [
+                        mimi.encode(stacked[i:i + _ENCODE_CHUNK])
+                        for i in range(0, stacked.shape[0], _ENCODE_CHUNK)
+                    ],
+                    dim=0,
+                )  # [B*C, K, T_enc]
 
             # Reshape to [B, C, K, T_enc] so sample i gets all_tokens[i]: [C, K, T_enc]
             all_tokens = all_tokens.view(B, C, *all_tokens.shape[1:])
