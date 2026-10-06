@@ -40,6 +40,7 @@ class Checkpointer:
         full_finetuning: bool = False,
         keep_best_metric: str | None = None,
         keep_best_n: int = 3,
+        save_backchannel_only: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -52,6 +53,7 @@ class Checkpointer:
         # Best-checkpoint 유지: keep_best_metric 설정 시 점수 상위 keep_best_n개만 보존.
         self.keep_best_metric = keep_best_metric
         self.keep_best_n = keep_best_n
+        self.save_backchannel_only = save_backchannel_only
 
     @property
     def ckpt_dir(self) -> Path:
@@ -210,7 +212,52 @@ class Checkpointer:
                     module._merge_lora_handle.remove()  # type: ignore
 
         offload_to_cpu = get_world_size() > 1
-        if save_only_lora:
+        if self.save_backchannel_only:
+            assert not save_only_lora, (
+                "Backchannel-only saving and LoRA-only saving are mutually exclusive."
+            )
+            assert (
+                isinstance(self.model, FullyShardedDataParallel)
+                or get_world_size() == 1
+            )
+
+            def keep_dtype(key: str, value: torch.Tensor) -> torch.dtype:
+                # fp32 fusion scalars (backchannel.fusion_fp32) are stored as fp32.
+                if "backchannel_fusion_" in key and value.dtype == torch.float32:
+                    return torch.float32
+                return save_dtype
+
+            def is_backchannel_key(key: str) -> bool:
+                segments = key.split(".")
+                return any(
+                    segment == "backchannel"
+                    or segment.startswith("backchannel_fusion_")
+                    for segment in segments
+                )
+
+            if get_world_size() > 1:
+                with self.model.summon_full_params(
+                    self.model, writeback=True, offload_to_cpu=offload_to_cpu
+                ):
+                    full_sd = self.model.state_dict()
+                    states = {
+                        key: value.to(dtype=keep_dtype(key, value))
+                        for key, value in full_sd.items()
+                        if is_backchannel_key(key)
+                    }
+            else:
+                full_sd = self.model.state_dict()
+                states = {
+                    key: value.to(device="cpu", dtype=keep_dtype(key, value))
+                    for key, value in full_sd.items()
+                    if is_backchannel_key(key)
+                }
+            if not states:
+                raise RuntimeError("Backchannel-only checkpoint selected no tensors")
+            main_logger_info(
+                f"[Checkpointer] Backchannel-only save: {len(states)} tensors"
+            )
+        elif save_only_lora:
             # ── Hybrid mode: LoRA backbone + full-finetune face/VAP ──────────
             # Collect trainable state-dict keys by inspecting the state_dict
             # directly (avoids FSDP flat-param name mismatch).

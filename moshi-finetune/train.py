@@ -30,6 +30,7 @@ from torch.nn import functional as F
 
 from finetune.args import TrainArgs
 from finetune.checkpointing import Checkpointer
+from finetune.fusion_dynamics import FusionDynamicsMonitor
 from finetune.data.data_loader import build_data_loader
 from finetune.data.interleaver import InterleavedTokenizer, Interleaver
 from finetune.distributed import (
@@ -471,6 +472,12 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         lm_config["backchannel_fusion_vap_init"] = args.backchannel.fusion_vap_init
         lm_config["backchannel_fusion_vad_init"] = args.backchannel.fusion_vad_init
         lm_config["backchannel_fusion_bias_init"] = args.backchannel.fusion_bias_init
+        lm_config["backchannel_fusion_evidence"] = args.backchannel.fusion_evidence
+        lm_config["backchannel_fusion_calibration"] = args.backchannel.fusion_calibration
+        lm_config["backchannel_fusion_calibration_init"] = args.backchannel.fusion_calibration_init
+        lm_config["backchannel_decision_head"] = args.backchannel.decision_head
+        lm_config["backchannel_decision_hidden"] = args.backchannel.decision_hidden
+        lm_config["backchannel_aux_to_trunk"] = args.backchannel.aux_to_trunk
         if args.backchannel.pad_token_id is not None:
             lm_config["backchannel_pad_token_id"] = args.backchannel.pad_token_id
         if args.backchannel.epad_token_id is not None:
@@ -648,6 +655,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     # ── 10. 옵티마이저 & 스케줄러 ─────────────────────────────────────────
     base_params = []
     fusion_params = []
+    decision_params = []
     face_core_params = []
     face_llm_proj_params = []
     for name, param in model.named_parameters():
@@ -655,6 +663,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             continue
         if "backchannel_fusion_" in name:
             fusion_params.append(param)
+        elif "backchannel.decision_head" in name:
+            decision_params.append(param)
         elif "face_module" not in name:
             base_params.append(param)
         elif "llm_proj" in name:
@@ -684,6 +694,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             f"vad={args.backchannel.fusion_vad_init:.3f}, "
             f"bias={args.backchannel.fusion_bias_init:.3f}"
         )
+    if decision_params:
+        decision_lr = args.backchannel.decision_lr or args.optim.lr
+        param_groups.append({"params": decision_params, "lr": decision_lr, "group_name": "decision"})
+        max_lrs.append(decision_lr)
+        main_logger_info(f"Decision head: lr={decision_lr:.2e}, aux_to_trunk={args.backchannel.aux_to_trunk}")
     if args.face_gen.enable:
         face_core_lr = args.face_gen.core_lr or args.optim.lr
         face_llm_proj_lr = args.face_gen.llm_proj_lr or args.optim.lr
@@ -729,6 +744,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             full_finetuning=args.full_finetuning,
             keep_best_metric=args.ckpt_keep_best_metric,
             keep_best_n=args.ckpt_keep_best_n,
+            save_backchannel_only=args.freeze_backbone,
         )
 
     # ── 12. 학습 준비 ──────────────────────────────────────────────────────
@@ -747,10 +763,18 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     # the network's raw logits approximate prior-free scores and plain argmax at
     # inference is the intended (τ-tempered balanced) rule — no post-hoc correction.
     bc_class_counts = torch.ones(3, device="cuda", dtype=torch.float64)
+    fusion_monitor = None
+    if args.fusion_dynamics.enable:
+        fusion_monitor = FusionDynamicsMonitor(model, optimizer, args, run_dir)
+        model.fusion_dynamics_diagnostics = True
+        model.fusion_dynamics_prompt_length = T_p
 
     while state.step < args.max_steps:
         state.start_step()
         is_last_step = state.step == args.max_steps
+        dynamics_stop = False
+        aux_coverage = {key: 0 for key in ("vap", "vad", "bc")}
+        aux_mode = {key: "missing_labels" for key in ("vap", "vad", "bc")}
 
         loss = torch.tensor([0.0], device="cuda")
         vap_loss_val = torch.tensor([0.0], device="cuda")
@@ -988,6 +1012,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                         if vap_targets_tensor is not None:
                             flat_targets = vap_targets_tensor.view(-1).long()
                             n_valid = (flat_targets != -100).sum().item()
+                            if fusion_monitor is not None:
+                                aux_coverage["vap"] += n_valid
+                                aux_mode["vap"] = "labels"
                             if n_valid > 0:
                                 num_vap_classes = vap_logits.shape[-1]
                                 flat_targets = flat_targets.clamp(-100, num_vap_classes - 1)
@@ -1005,6 +1032,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                             vap_probs = F.softmax(vap_logits, dim=-1)
                             vap_entropy = -(vap_probs * (vap_probs + 1e-8).log()).sum(dim=-1).mean()
                             vap_loss = -vap_entropy
+                            if fusion_monitor is not None:
+                                aux_mode["vap"] = "entropy_fallback"
                             mb_loss = mb_loss + args.backchannel.vap_loss_weight * vap_loss
                             vap_loss_val += vap_loss.detach()
 
@@ -1021,7 +1050,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 # Both share this head, the ±K boundary-ignore band, and the
                 # Logit-Adjustment CE below. See build_bc_targets() for label details.
                 if (args.backchannel.enable
-                        and args.backchannel.bc_event_loss_weight > 0
+                        and (args.backchannel.bc_event_loss_weight > 0 or fusion_monitor is not None)
                         and output.bc_logits is not None):
                     cls_tgt = build_bc_targets(
                         mode=args.backchannel.bc_target_mode,
@@ -1037,6 +1066,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     )
                     bc_logits_c = output.bc_logits[:, T_p:]  # [B, T, 3] — strip prompt prefix
                     if (cls_tgt != -100).any():
+                        if fusion_monitor is not None:
+                            aux_coverage["bc"] += int((cls_tgt != -100).sum().item())
+                            aux_mode["bc"] = "labels"
                         # Logit-Adjustment loss (Menon et al., ICLR 2021): CE on
                         # (logits + τ·log π) instead of class-weighted CE. Unlike
                         # pos_weight (which multiplies rare-class gradients and
@@ -1067,7 +1099,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 # manifest's cur_va_int (row0=user, row1=agent, -100 where the manifest
                 # has no entry for that frame).
                 if (args.backchannel.enable
-                        and args.backchannel.vad_loss_weight > 0
+                        and (args.backchannel.vad_loss_weight > 0 or fusion_monitor is not None)
                         and output.vad_logits is not None
                         and batch.vad_targets is not None):
                     vad_t = batch.vad_targets.to(codes.device)         # [B, 2, T]
@@ -1076,6 +1108,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     if batch.valid_mask is not None:
                         vmask = vmask & batch.valid_mask.to(codes.device).unsqueeze(1).expand_as(vad_t)
                     if vmask.any():
+                        if fusion_monitor is not None:
+                            aux_coverage["vad"] += int(vmask.sum().item())
+                            aux_mode["vad"] = "labels"
                         vad_loss = F.binary_cross_entropy_with_logits(
                             vad_l[vmask].float(), vad_t[vmask].float(),
                         )
@@ -1145,6 +1180,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     torch.sum(text_mask).item() + torch.sum(audio_mask).item()
                 )
 
+                if fusion_monitor is not None and not torch.isfinite(mb_loss).all():
+                    fusion_monitor.fail("failed_nonfinite", f"Nonfinite loss at step {state.step}")
                 mb_loss.backward()
 
             loss += mb_loss.detach()
@@ -1184,6 +1221,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     p.grad.div_(args.num_microbatches)
 
         # 그래디언트 클리핑
+        if fusion_monitor is not None:
+            fusion_monitor.before_clip()
         torch.nn.utils.clip_grad_norm_(list(model.parameters()), args.max_norm)
 
         if args.face_gen.enable and args.face_gen.warmup_steps > 0:
@@ -1213,7 +1252,21 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             if state.step == args.backchannel.bc_warmup_steps and get_rank() == 0:
                 logger.info(f"[step {state.step}] VapGPT warm-up done — GPT/vap_head gradients re-enabled.")
 
+        if fusion_monitor is not None:
+            fusion_monitor.before_update()
         optimizer.step()
+        if fusion_monitor is not None:
+            raw_aux = {"vap": float(vap_loss_val.item()), "vad": float(silence_loss_val.item()),
+                       "bc": float(bc_event_loss_val.item())}
+            coefficients = {"vap": args.backchannel.vap_loss_weight,
+                            "vad": args.backchannel.vad_loss_weight,
+                            "bc": args.backchannel.bc_event_loss_weight}
+            auxiliary = {k: {"raw": raw_aux[k], "weighted": raw_aux[k] * coefficients[k],
+                             "coefficient": coefficients[k], "valid_label_count": aux_coverage[k],
+                             "target_mode": aux_mode[k]} for k in raw_aux}
+            dynamics_stop = fusion_monitor.after_update(state.step, auxiliary)
+            # Make the gate a normal evaluation/checkpoint boundary before exiting.
+            is_last_step = is_last_step or dynamics_stop
         optimizer.zero_grad(set_to_none=True)  # 메모리 즉시 해제
 
         current_lrs = scheduler.get_last_lr()
@@ -1237,7 +1290,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 instruct_tokenizer=interleaved_tokenizer,
                 args=args.data,
                 batch_size=args.batch_size,
-                seed=None,
+                seed=args.seed if fusion_monitor is not None else None,
                 rank=get_rank(),
                 world_size=get_world_size(),
                 is_eval=True,
@@ -1259,6 +1312,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 eval_logs.update(state.this_eval_epad_metrics)
             main_logger_info(eval_log_msg(eval_logs))
             eval_logger.log(eval_logs, step=state.step)
+            if fusion_monitor is not None:
+                fusion_monitor.record_validation(state.step, state.this_text_loss,
+                                                 getattr(state, "this_fusion_diagnostics", {}))
 
         # 타이밍
         state.end_step(n_batch_tokens)
@@ -1383,6 +1439,11 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 dtype=param_dtype,
                 score=epad_score,
             )
+        if fusion_monitor is not None and (dynamics_stop or state.step == args.max_steps):
+            fusion_monitor.finish(state.step, dynamics_stop)
+            if dynamics_stop:
+                main_logger_info("Fusion dynamics: static at step 500; checkpoint saved, advancing queue")
+            break
 
     main_logger_info("학습 완료!")
 

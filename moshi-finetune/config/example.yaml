@@ -12,19 +12,19 @@
 
 
 # check
-run_dir: ./output/example_0813_switch
+run_dir: ./output/example_0907_listener
 overwrite_run_dir: true
 
 wandb:
   project: "personaplex_finetune_AAAI"
-  run_name: "test_run_0813_switch"
+  run_name: "test_run_0907_listener"
 
 # ── 데이터 설정 ─────────────────────────────────────────────────────────────
 data:
-  train_data: ./data/stereo_ami_balanced_train/data_with_voice_sample_amplified.jsonl
+  train_data: ./data/stereo_ami_ood_train_noswitch/data_with_voice_sample_amplified.jsonl
   # train_data: ./data/dualtalk/train/data.jsonl
   shuffle: true
-  eval_data: ./data/stereo_ami_balanced_valid/data_with_voice_sample_amplified.jsonl
+  eval_data: ./data/stereo_ami_ood_valid_noswitch/data_with_voice_sample_amplified.jsonl
   # eval_data: ./data/dualtalk/test/data.jsonl
   vap_manifest: /home2/s20235100/Conversational-AI/vap_dataset/manifest.json
 
@@ -33,9 +33,9 @@ moshi_paths:
   hf_repo_id: nvidia/personaplex-7b-v1
 
 # ── 학습 설정 ─────────────────────────────────────────────────────────────
-max_steps: 2000
-batch_size: 4
-num_microbatches: 32
+max_steps: 1000
+batch_size: 2
+num_microbatches: 64
 duration_sec: 10
 
 # Full finetuning (LM + VapGPT + FaceModule 전체 학습)
@@ -44,7 +44,7 @@ lora:
   rank: 64
   scaling: 2.0
 full_finetuning: false
-freeze_depformer: true
+freeze_depformer: false
 
 param_dtype: bfloat16
 gradient_checkpointing: true
@@ -65,7 +65,7 @@ ckpt_keep_best_n: 10
 optim:
   lr: 2.0e-5
   weight_decay: 0.1
-  pct_start: 0.05
+  pct_start: 0.1
 
 # ── 손실 가중치 ───────────────────────────────────────────────────────────
 text_padding_weight: 0.5   # PAD 토큰 손실 가중치 (낮을수록 PAD에 집중 감소)
@@ -76,7 +76,7 @@ first_codebook_weight_multiplier: 1.0
 # inference의 lm_gen.text_prompt_tokens 와 동일한 문자열을 설정합니다.
 # 빈 문자열("")이면 프롬프트 없이 학습합니다.
 # text_prompt: "<system> [Attentive Mode] You are an attentive and supportive listener. You specialize in active listening, providing calm and consistent backchannels to support the speaker's flow without leading the conversation. <system>"
-text_prompt: "<system> [Casual Mode] You are a warm and reactive partner. You talk like a close friend, using enthusiastic backchannels and contributing small talk to keep the mood light and fun. <system>"
+text_prompt: "<system> You are a warm and reactive partner. You talk like a close friend, using enthusiastic backchannels and contributing small talk to keep the mood light and fun. <system>"
 
 # ── Backchannel VAP (VapGPT, LM 내부) ────────────────────────────────────
 backchannel:
@@ -85,15 +85,15 @@ backchannel:
   pad_token_id: 3
   epad_token_id: 0
 
-  vap_loss_weight: 0.5
-  bc_event_loss_weight: 1.0
-  vad_loss_weight: 0.3
+  vap_loss_weight: 0.25
+  bc_event_loss_weight: 0.1
+  vad_loss_weight: 0.1
   commitment_loss_weight: 0.0
   silence_loss_weight: 0.0
   bc_focal_gamma: 2.0
   bc_focal_pos_weight: 15.0
   bc_warmup_steps: 200
-  bc_la_tau: 0.75
+  bc_la_tau: 0.5
 
   # ── Learnable START-vs-rest EPAD fusion ───────────────────────────────
   fusion_trainable: true
@@ -179,11 +179,11 @@ face_gen:
 #   gate_loss_jaw_weight: 4.0
 #   gate_loss_neck_weight: 1.0
 
-# continual_learning:
-#   enable: true
-#   hf_repo_id: nvidia/personaplex-7b-v1
-#   temperature: 2.0
-#   text_kd_weight: 0.35
-#   speech_activity_kd_weight: 1.0
-#   turn_boundary_kd_weight: 0.25
-#   hidden_kd_weight: 0.05
+continual_learning:
+  enable: false
+  # hf_repo_id: nvidia/personaplex-7b-v1
+  # temperature: 2.0
+  # text_kd_weight: 0.35
+  # speech_activity_kd_weight: 1.0
+  # turn_boundary_kd_weight: 0.25
+  # hidden_kd_weight: 0.05

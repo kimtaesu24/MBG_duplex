@@ -58,6 +58,8 @@ def evaluate(
 
     max_eval_batches = max(40 // get_world_size(), 1)
     model.eval()
+    if args.fusion_dynamics.enable:
+        state.this_fusion_diagnostics = {}
 
     for batch in eval_data_loader:
         if num_samples.item() >= max_eval_batches:
@@ -161,6 +163,11 @@ def evaluate(
                            gt_face_motion=gt_face_motion,
                            mimi=mimi_for_model,
                            bc_audio_feats=bc_audio_feats)
+            if args.fusion_dynamics.enable and num_samples.item() == 0 and output.bc_stats is not None:
+                state.this_fusion_diagnostics = {
+                    key: float(value.detach().float().item())
+                    for key, value in output.bc_stats.items() if key.startswith("fusion/")
+                }
 
             # Slice off T_p prompt-prefix frames — loss is on the conversation only.
             text_mask  = output.text_mask[:, :, T_p:]

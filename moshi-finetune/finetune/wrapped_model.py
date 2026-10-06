@@ -233,6 +233,17 @@ def get_fsdp_model(
                 param.requires_grad = False
         main_logger_info(f"Depformer 동결: {frozen:,}개 파라미터")
 
+    if args.backchannel.enable and args.backchannel.fusion_fp32:
+        # The fusion scalars are tiny and updated with a large LR; in bf16 most Adam
+        # steps round to zero. Keep them (and only them) in fp32.
+        if get_world_size() != 1:
+            raise ValueError("backchannel.fusion_fp32 is supported on a single GPU only "
+                             "(FSDP flat parameters need one dtype)")
+        for name, param in model.named_parameters():
+            if "backchannel_fusion_" in name:
+                param.data = param.data.float()
+        main_logger_info("Fusion parameters kept in fp32")
+
     if get_world_size() == 1:
         model = model.cuda()
 

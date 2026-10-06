@@ -181,6 +181,36 @@ def _select_user_audio(audio: np.ndarray, audio_path: str) -> np.ndarray:
     return audio[1:2]
 
 
+def backchannel_extension_kwargs(bc_cfg: dict) -> dict:
+    """LMModel kwargs of the fusion/decision-head options (defaults = original method)."""
+    return {
+        "backchannel_fusion_evidence": bc_cfg.get("fusion_evidence", "bc,vap,vad"),
+        "backchannel_fusion_calibration": bool(bc_cfg.get("fusion_calibration", False)),
+        "backchannel_fusion_calibration_init": float(bc_cfg.get("fusion_calibration_init", 1.0)),
+        "backchannel_decision_head": bool(bc_cfg.get("decision_head", False)),
+        "backchannel_decision_hidden": int(bc_cfg.get("decision_hidden", 128)),
+        "backchannel_aux_to_trunk": bc_cfg.get("aux_to_trunk", "full"),
+    }
+
+
+def apply_inference_fusion_overrides(lm_gen, bc_cfg: dict) -> None:
+    """Inference-only EPAD-fusion overrides (LMGen.fusion_*); absent keys keep the trained model.
+
+    backchannel.infer_gate_frames:   no residual while the agent spoke within this many frames
+    backchannel.infer_bias_shift:    constant added to the residual
+    backchannel.infer_u_only_table:  JSON {"edges": [...], "means": [...]} of g(s); uses d - g(s), a = 1
+    """
+    lm_gen.fusion_gate_frames = int(bc_cfg.get("infer_gate_frames", 0) or 0)
+    lm_gen.fusion_bias_shift = float(bc_cfg.get("infer_bias_shift", 0.0) or 0.0)
+    table = bc_cfg.get("infer_u_only_table")
+    if table:
+        t = json.load(open(table))
+        lm_gen.fusion_u_only = (torch.tensor(t["edges"], dtype=torch.float32),
+                                torch.tensor(t["means"], dtype=torch.float32))
+    log("info", f"fusion overrides: gate_frames={lm_gen.fusion_gate_frames} "
+                f"bias_shift={lm_gen.fusion_bias_shift} u_only={'yes' if table else 'no'}")
+
+
 def _strip_peft_prefixes(state_dict: dict) -> dict:
     """Strip training wrapper prefixes so keys match the bare LMModel namespace.
 
@@ -222,6 +252,12 @@ def load_checkpoint(
     """Loads the finetuned checkpoint (consolidated or lora-only)."""
     consolidated_path = os.path.join(ckpt_dir, "consolidated", "consolidated.safetensors")
     lora_path = os.path.join(ckpt_dir, "consolidated", "lora.safetensors")
+
+    # Fusion scalars are always evaluated in fp32 (the residual is computed in fp32);
+    # making the parameters fp32 before loading keeps fp32 checkpoint values exact.
+    for _name, _param in lm.named_parameters():
+        if "backchannel_fusion_" in _name:
+            _param.data = _param.data.float()
 
     if os.path.exists(consolidated_path):
         log("info", f"Loading full checkpoint from {consolidated_path}")
@@ -611,6 +647,7 @@ def run_test_inference(args):
         loaders._lm_kwargs["backchannel_fusion_vap_init"] = bc_cfg.get("fusion_vap_init", 0.0)
         loaders._lm_kwargs["backchannel_fusion_vad_init"] = bc_cfg.get("fusion_vad_init", 0.0)
         loaders._lm_kwargs["backchannel_fusion_bias_init"] = bc_cfg.get("fusion_bias_init", 0.0)
+        loaders._lm_kwargs.update(backchannel_extension_kwargs(bc_cfg))
         loaders._lm_kwargs["backchannel_pad_token_id"] = bc_cfg.get("pad_token_id", 3)
         loaders._lm_kwargs["backchannel_epad_token_id"] = bc_cfg.get("epad_token_id", 0)
         if bc_cfg.get("module_type", "mlp") == "vap_gpt":
