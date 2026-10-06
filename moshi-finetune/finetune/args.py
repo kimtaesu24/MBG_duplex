@@ -55,6 +55,21 @@ class BackchannelArgs(Serializable):
     fusion_vad_init: float = 0.0
     fusion_bias_init: float = 0.0
     fusion_lr: float = 1e-3
+    # Keep backchannel_fusion_* in fp32 (bf16 rounding silently drops small Adam
+    # updates of these scalars). Single-GPU only.
+    fusion_fp32: bool = False
+    # Listener outputs that enter the EPAD residual: comma list of bc, vap, vad, decision.
+    fusion_evidence: str = "bc,vap,vad"
+    # Learned scale a on the backbone EPAD-vs-PAD log-odds: residual += (a - 1) * s.
+    fusion_calibration: bool = False
+    fusion_calibration_init: float = 1.0
+    # Decision head: listener evidence trained only by the fused EPAD loss.
+    decision_head: bool = False
+    decision_hidden: int = 128
+    decision_lr: float | None = None   # None → optim.lr
+    # "full": VAP/VAD/BC losses also update the shared listener trunk (original).
+    # "detach": they train only their own heads; the trunk follows the EPAD loss.
+    aux_to_trunk: str = "full"
 
     # v2.1 BC target: boundary-ignore radius (frames). PAD frames within ±K of a
     # true [EPAD] token are set to ignore (-100) in the 3-class CE — onset labels
@@ -142,6 +157,13 @@ class BackchannelArgs(Serializable):
                 f"backchannel.bc_vap_horizon_bins must be in [1, 4], "
                 f"got {self.bc_vap_horizon_bins}"
             )
+        ev = {e.strip() for e in self.fusion_evidence.split(",") if e.strip()}
+        if ev - {"bc", "vap", "vad", "decision"}:
+            raise ValueError(f"backchannel.fusion_evidence has unknown entries: {self.fusion_evidence!r}")
+        if "decision" in ev and not self.decision_head:
+            raise ValueError("backchannel.fusion_evidence 'decision' requires backchannel.decision_head=true")
+        if self.aux_to_trunk not in ("full", "detach"):
+            raise ValueError(f"backchannel.aux_to_trunk must be 'full' or 'detach', got {self.aux_to_trunk!r}")
 
 
 @dataclass
@@ -319,6 +341,18 @@ class FaceGenArgs(Serializable):
 
 
 @dataclass
+class FusionDynamicsArgs(Serializable):
+    """Opt-in diagnostics; existing training runs keep their original behavior."""
+    enable: bool = False
+    gate_step: int = 500
+    static_excursion: float = 0.02
+    static_late_range: float = 0.01
+    dynamic_excursion: float = 0.05
+    dynamic_end_shift: float = 0.02
+    stable_tail: float = 0.02
+
+
+@dataclass
 class TrainArgs(Serializable):
     data: DataArgs
 
@@ -389,6 +423,7 @@ class TrainArgs(Serializable):
 
     # Backchannel VAP
     backchannel: BackchannelArgs = field(default_factory=BackchannelArgs)
+    fusion_dynamics: FusionDynamicsArgs = field(default_factory=FusionDynamicsArgs)
 
     # Face generation (inference-only; not used during training)
     face_gen: FaceGenArgs = field(default_factory=FaceGenArgs)
@@ -409,6 +444,18 @@ class TrainArgs(Serializable):
 
         assert self.num_microbatches >= 1
         assert self.num_ckpt_keep is None or self.num_ckpt_keep >= 1
+        if self.fusion_dynamics.enable:
+            if self.world_size != 1:
+                raise ValueError("Fusion dynamics monitoring currently requires WORLD_SIZE=1")
+            if not self.backchannel.enable or not self.backchannel.fusion_trainable:
+                raise ValueError("Fusion dynamics requires enabled, trainable backchannel fusion")
+            if self.max_steps != 1000 or self.fusion_dynamics.gate_step != 500:
+                raise ValueError("Fusion dynamics uses the reviewed 1000-step horizon and 500-step gate")
+            if not self.do_ckpt or self.ckpt_keep_best_metric is not None:
+                raise ValueError("Fusion dynamics requires periodic checkpoints, not best-only pruning")
+            if self.ckpt_freq != 100 or self.num_ckpt_keep is None or self.num_ckpt_keep < 10:
+                raise ValueError("Fusion dynamics requires 100-step checkpoints and retention >=10")
+
 
         # Personaplex: LoRA 및 full_finetuning 지원
         if (

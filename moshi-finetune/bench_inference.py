@@ -44,6 +44,8 @@ from moshi.offline import warmup
 from inference import (
     LMGen,
     _repair_config_paths,
+    apply_inference_fusion_overrides,
+    backchannel_extension_kwargs,
     _wrap_with_system_tags,
     infer_one,
     load_checkpoint,
@@ -170,6 +172,7 @@ def run(args):
         loaders._lm_kwargs["backchannel_fusion_vap_init"] = bc_cfg.get("fusion_vap_init", 0.0)
         loaders._lm_kwargs["backchannel_fusion_vad_init"] = bc_cfg.get("fusion_vad_init", 0.0)
         loaders._lm_kwargs["backchannel_fusion_bias_init"] = bc_cfg.get("fusion_bias_init", 0.0)
+        loaders._lm_kwargs.update(backchannel_extension_kwargs(bc_cfg))
         if bc_cfg.get("module_type", "mlp") == "vap_gpt":
             loaders._lm_kwargs["backchannel_vap_repo_path"] = bc_cfg.get("vap_gpt_repo_path", "")
             loaders._lm_kwargs["backchannel_vap_checkpoint"] = bc_cfg.get("vap_gpt_checkpoint", None)
@@ -247,6 +250,7 @@ def run(args):
         ),
     )
     log_fusion_state(lm)
+    apply_inference_fusion_overrides(lm_gen, config.get("backchannel", {}) or {})
     if getattr(lm, "backchannel_fusion_trainable", False):
         log(
             "info",

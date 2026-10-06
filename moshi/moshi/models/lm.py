@@ -77,6 +77,7 @@ class LMOutput:
     vad_logits: Optional[torch.Tensor] = None  # [B, T, 2] — CURRENT-frame VA logits (0=user, 1=agent), BCE-supervised
     transformer_out: Optional[torch.Tensor] = None  # [B, T, D], for online-teacher KD
     fusion_residual: Optional[torch.Tensor] = None  # [B, T], learned EPAD residual
+    decision_logits: Optional[torch.Tensor] = None  # [B, T], decision-head evidence (if enabled)
 
 
 def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
@@ -287,6 +288,16 @@ class LMModel(StreamingContainer):
         backchannel_fusion_vap_init: float = 0.0,
         backchannel_fusion_vad_init: float = 0.0,
         backchannel_fusion_bias_init: float = 0.0,
+        # Which listener outputs enter the EPAD residual: any of bc, vap, vad, decision.
+        backchannel_fusion_evidence: str = "bc,vap,vad",
+        # Learned scale a on the backbone's own EPAD-vs-PAD log-odds: residual += (a-1)*s.
+        backchannel_fusion_calibration: bool = False,
+        backchannel_fusion_calibration_init: float = 1.0,
+        # Decision head (evidence trained only by the fused EPAD loss) and whether the
+        # auxiliary VAP/VAD/BC losses may update the shared listener trunk.
+        backchannel_decision_head: bool = False,
+        backchannel_decision_hidden: int = 128,
+        backchannel_aux_to_trunk: str = "full",
         # VapGPT-specific params (used when backchannel_module_type == "vap_gpt")
         backchannel_vap_repo_path: str = "",
         backchannel_vap_checkpoint: Optional[str] = None,
@@ -349,6 +360,19 @@ class LMModel(StreamingContainer):
             torch.tensor([float(backchannel_fusion_bias_init)]),
             requires_grad=self.backchannel_fusion_trainable,
         )
+        self.backchannel_fusion_evidence = frozenset(
+            e.strip() for e in str(backchannel_fusion_evidence).split(",") if e.strip())
+        unknown = self.backchannel_fusion_evidence - {"bc", "vap", "vad", "decision"}
+        if unknown:
+            raise ValueError(f"unknown backchannel_fusion_evidence entries: {sorted(unknown)}")
+        if "decision" in self.backchannel_fusion_evidence and not backchannel_decision_head:
+            raise ValueError("fusion evidence 'decision' needs backchannel_decision_head=True")
+        self.backchannel_fusion_calibration = bool(backchannel_fusion_calibration)
+        if self.backchannel_fusion_calibration:
+            self.backchannel_fusion_implicit_scale = torch.nn.Parameter(
+                torch.tensor([float(backchannel_fusion_calibration_init)]),
+                requires_grad=self.backchannel_fusion_trainable,
+            )
         assert len(delays) == self.num_codebooks, "unexpected number of delays"
         self.delays = delays
         self.dim = dim
@@ -468,6 +492,9 @@ class LMModel(StreamingContainer):
                     gumbel_temp_init=backchannel_gumbel_temp_init,
                     gumbel_temp_min=backchannel_gumbel_temp_min,
                     gumbel_anneal_rate=backchannel_gumbel_anneal_rate,
+                    decision_head=backchannel_decision_head,
+                    decision_hidden=backchannel_decision_hidden,
+                    aux_to_trunk=backchannel_aux_to_trunk,
                 )
             else:  # "mlp"
                 self.backchannel = BackchannelModule(
@@ -678,6 +705,35 @@ class LMModel(StreamingContainer):
         text_emb = self.text_emb(input_sequence[:, 0])
         input_ = text_emb if input_ is None else input_ + text_emb
         return input_
+
+    # ── EPAD fusion (shared by training forward and streaming generation) ──
+    def fusion_evidences(self, bc_logits, vap_logits, vad_logits) -> dict:
+        """Per-frame listener evidences as log-odds (fp32), any leading shape."""
+        bc = bc_logits.float()
+        start = bc[..., 1] - torch.logsumexp(bc[..., [0, 2]], dim=-1)  # START vs (PAD ∪ WORD)
+        vap = torch.zeros_like(start)
+        if vap_logits is not None:  # P(agent speaks in the nearest VAP bin), marginalised
+            v = vap_logits.float()
+            near = (torch.arange(v.shape[-1], device=v.device) & 0x08) != 0
+            vap = torch.logsumexp(v[..., near], dim=-1) - torch.logsumexp(v[..., ~near], dim=-1)
+        user_quiet = -vad_logits[..., 0].float()  # vad_logits[..., 0] = user-active log-odds
+        return {"bc": start, "vap": vap, "vad": user_quiet}
+
+    def fusion_residual(self, evidences: dict, implicit: torch.Tensor, decision_logits=None) -> torch.Tensor:
+        """Residual added to the EPAD logit. implicit = backbone ℓ[EPAD] − ℓ[PAD] (fp32)."""
+        ev_set = self.backchannel_fusion_evidence
+        r = self.backchannel_fusion_bias.float().expand_as(implicit)
+        if "bc" in ev_set:
+            r = r + self.backchannel_fusion_bc_weight.float() * evidences["bc"]
+        if "vap" in ev_set:
+            r = r + self.backchannel_fusion_vap_weight.float() * evidences["vap"]
+        if "vad" in ev_set:
+            r = r + self.backchannel_fusion_vad_weight.float() * evidences["vad"]
+        if "decision" in ev_set and decision_logits is not None:
+            r = r + decision_logits.float()
+        if self.backchannel_fusion_calibration:
+            r = r + (self.backchannel_fusion_implicit_scale.float() - 1.0) * implicit
+        return r
 
     def forward_codes(
         self,
@@ -952,32 +1008,14 @@ class LMModel(StreamingContainer):
         # decision: the regular text CE and sampler retain the final decision.
         fusion_residual = None
         if self.backchannel_fusion_trainable and bc_result is not None:
-            bc = bc_result.bc_logits.float()
-            start_log_odds = bc[..., 1] - torch.logsumexp(bc[..., [0, 2]], dim=-1)
-
-            vap_log_odds = torch.zeros_like(start_log_odds)
-            if bc_result.vap_logits is not None:
-                vap = bc_result.vap_logits.float()
-                class_ids = torch.arange(vap.shape[-1], device=vap.device)
-                near = (class_ids & 0x08) != 0
-                vap_log_odds = (
-                    torch.logsumexp(vap[..., near], dim=-1)
-                    - torch.logsumexp(vap[..., ~near], dim=-1)
-                )
-
-            # vad_logits[..., 0] is user-active log-odds.
-            user_quiet_log_odds = -bc_result.vad_logits[..., 0].float()
-            fusion_residual = (
-                self.backchannel_fusion_bc_weight.float() * start_log_odds
-                + self.backchannel_fusion_vap_weight.float() * vap_log_odds
-                + self.backchannel_fusion_vad_weight.float() * user_quiet_log_odds
-                + self.backchannel_fusion_bias.float()
-            )
-            # .float() already allocates a fresh fp32 tensor (the source is bf16)
-            # and nothing else aliases it, so the in-place add below is safe.
-            # An extra .clone() here doubled a [B, 1, T, text_card] fp32 buffer —
-            # several GB at training batch sizes — for no reason.
+            # .float() allocates a fresh fp32 tensor (the source is bf16) that nothing
+            # else aliases, so the in-place add below is safe (no extra .clone()).
             text_logits = text_logits.float()
+            implicit_log_odds = (text_logits[:, 0, :, self.end_of_text_padding_id]
+                                 - text_logits[:, 0, :, self.text_padding_token_id])
+            evidences = self.fusion_evidences(bc_result.bc_logits, bc_result.vap_logits, bc_result.vad_logits)
+            start_log_odds, vap_log_odds, user_quiet_log_odds = evidences["bc"], evidences["vap"], evidences["vad"]
+            fusion_residual = self.fusion_residual(evidences, implicit_log_odds, bc_result.decision_logits)
             text_logits[:, 0, :, self.end_of_text_padding_id] += fusion_residual
 
             if bc_stats is not None:
@@ -988,6 +1026,27 @@ class LMModel(StreamingContainer):
                     "fusion/vad_weight": self.backchannel_fusion_vad_weight.detach().float(),
                     "fusion/bias": self.backchannel_fusion_bias.detach().float(),
                 })
+                if self.backchannel_fusion_calibration:
+                    bc_stats["fusion/implicit_scale"] = self.backchannel_fusion_implicit_scale.detach().float()
+                if bc_result.decision_logits is not None:
+                    bc_stats["fusion/decision_mean"] = bc_result.decision_logits.detach().float().mean()
+                    bc_stats["fusion/decision_std"] = bc_result.decision_logits.detach().float().std()
+                if getattr(self, "fusion_dynamics_diagnostics", False):
+                    with torch.no_grad():
+                        valid = text_logits_mask[:, 0].bool().clone()
+                        valid[:, :getattr(self, "fusion_dynamics_prompt_length", 0)] = False
+                        terms = {"bc": start_log_odds, "vap": vap_log_odds,
+                                 "vad": user_quiet_log_odds}
+                        weights = {"bc": self.backchannel_fusion_bc_weight,
+                                   "vap": self.backchannel_fusion_vap_weight,
+                                   "vad": self.backchannel_fusion_vad_weight}
+                        bc_stats["fusion/evidence_frames"] = valid.sum().float()
+                        for name, term in terms.items():
+                            values = term.detach()[valid]
+                            coefficient = weights[name].detach().float()
+                            for label, data in (("evidence", values), ("contribution", values * coefficient)):
+                                bc_stats[f"fusion/{name}_{label}_mean"] = data.mean() if data.numel() else term.new_zeros(())
+                                bc_stats[f"fusion/{name}_{label}_std"] = data.std(unbiased=False) if data.numel() else term.new_zeros(())
 
         # ── Face Generation Module (server logic) ────────────────────────────
         #
@@ -1147,7 +1206,8 @@ class LMModel(StreamingContainer):
             bc_logits=bc_result.bc_logits if bc_result is not None else None,
             vad_logits=vad_logits,
             transformer_out=transformer_out,
-            fusion_residual=fusion_residual)
+            fusion_residual=fusion_residual,
+            decision_logits=bc_result.decision_logits if bc_result is not None else None)
 
 @dataclass
 class _LMGenState:
@@ -1317,11 +1377,40 @@ class LMGen(StreamingModule[_LMGenState]):
         self._bc_hist_tout: Optional[torch.Tensor] = None
         self._bc_hist_agent: Optional[torch.Tensor] = None
         self._bc_hist_user: Optional[torch.Tensor] = None
+        # Inference-only overrides of the EPAD fusion (analysis of 2026-10-06). The defaults
+        # reproduce the trained model exactly; set them after construction.
+        #   fusion_gate_frames > 0: add no residual while the agent emitted a non-PAD text
+        #       token within the last fusion_gate_frames frames (= it is mid-utterance).
+        #   fusion_bias_shift: constant added to the residual (e.g. -log 4 undoes the
+        #       EPAD 2.0 / PAD 0.5 loss weighting).
+        #   fusion_u_only = (edges, means): drop the calibration term (a = 1) and subtract
+        #       g(s) = means[bin of s] from the decision head output, keeping only d - g(s).
+        self.fusion_gate_frames: int = 0
+        self.fusion_bias_shift: float = 0.0
+        self.fusion_u_only: Optional[tuple] = None
+        self._frames_since_text: Optional[torch.Tensor] = None
 
     def _reset_bc_history(self) -> None:
         self._bc_hist_tout = None
         self._bc_hist_agent = None
         self._bc_hist_user = None
+        self._frames_since_text = None
+
+    def _inference_residual(self, lm_model, evidences, implicit, decision):
+        """lm_model.fusion_residual plus the inference-only overrides above."""
+        r = lm_model.fusion_residual(evidences, implicit, decision)
+        if self.fusion_u_only is not None and decision is not None:
+            edges, means = self.fusion_u_only
+            edges, means = edges.to(implicit.device), means.to(implicit.device)
+            idx = (torch.bucketize(implicit, edges, right=True) - 1).clamp(0, means.numel() - 1)
+            r = r - means[idx]
+            if lm_model.backchannel_fusion_calibration:
+                r = r - (lm_model.backchannel_fusion_implicit_scale.float() - 1.0) * implicit
+        if self.fusion_bias_shift:
+            r = r + self.fusion_bias_shift
+        if self.fusion_gate_frames > 0 and self._frames_since_text is not None:
+            r = torch.where(self._frames_since_text < self.fusion_gate_frames, torch.zeros_like(r), r)
+        return r
 
     def reset_streaming(self):
         # reset_streaming() only calls state.reset() (not _init_streaming_state), so the
@@ -1594,39 +1683,21 @@ class LMGen(StreamingModule[_LMGenState]):
             #   log(P(START) / (P(PAD) + P(WORD))).
             # Computing it from logits via logsumexp is numerically stable and
             # avoids materialising probabilities.
-            bc_now_float = bc_now.float()
-            explicit_log_odds = (
-                bc_now_float[:, 1]
-                - torch.logsumexp(bc_now_float[:, [0, 2]], dim=-1)
-            )
-
-            # Marginalise the 256 VAP classes instead of taking their argmax.
-            # Normalised training labels use spk0=user in bits [7:4] and
-            # spk1=agent in bits [3:0]. Bit 3 is the agent's nearest future bin.
-            vap_agent_near = implicit_log_odds.new_full(implicit_log_odds.shape, 0.5)
-            vap_log_odds = implicit_log_odds.new_zeros(implicit_log_odds.shape)
-            if bc_result.vap_logits is not None:
-                vap_probs = bc_result.vap_logits[:, -1].float().softmax(dim=-1)
-                class_ids = torch.arange(256, device=vap_probs.device)
-                agent_near_mask = (class_ids & 0x08) != 0
-                vap_agent_near = vap_probs[:, agent_near_mask].sum(dim=-1)
-                vap_agent_near = vap_agent_near.clamp(1e-6, 1.0 - 1e-6)
-                vap_log_odds = torch.logit(vap_agent_near)
-
-            # vad_logits[..., 0] is the user-active log-odds, therefore its
-            # negative is exactly the user-quiet log-odds.
-            user_quiet_log_odds = -bc_result.vad_logits[:, -1, 0].float()
+            # Same evidences and residual as LMModel.forward (fusion_evidences /
+            # fusion_residual), evaluated on the current frame only.
+            evidences = lm_model.fusion_evidences(
+                bc_result.bc_logits[:, -1],
+                bc_result.vap_logits[:, -1] if bc_result.vap_logits is not None else None,
+                bc_result.vad_logits[:, -1])
+            explicit_log_odds = evidences["bc"]  # START vs (PAD ∪ WORD), for logging
+            vap_agent_near = torch.sigmoid(evidences["vap"])
+            decision_now = (bc_result.decision_logits[:, -1]
+                            if bc_result.decision_logits is not None else None)
             # LMModel.forward는 fusion_trainable일 때만 residual을 더한다. fusion이
             # 학습되지 않았다면(no_fusion) 여기서도 backbone 로짓을 그대로 써야
-            # 학습과 같은 조건이 된다. 이때 fusion 파라미터는 config의 init 값에
-            # 머물러 있으므로 residual로 쓰면 학습된 적 없는 보정이 섞인다.
+            # 학습과 같은 조건이 된다.
             if lm_model.backchannel_fusion_trainable:
-                explicit_residual = (
-                    lm_model.backchannel_fusion_bc_weight.float() * explicit_log_odds
-                    + lm_model.backchannel_fusion_vap_weight.float() * vap_log_odds
-                    + lm_model.backchannel_fusion_vad_weight.float() * user_quiet_log_odds
-                    + lm_model.backchannel_fusion_bias.float()
-                )
+                explicit_residual = self._inference_residual(lm_model, evidences, implicit_log_odds, decision_now)
                 # text_logits가 CUDA graph의 static buffer를 가리킬 수 있어 in-place
                 # 덧셈 전에 복사한다.
                 text_logits_for_sampling = text_logits.float().clone()
@@ -1651,6 +1722,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 vap_agent_near=vap_agent_near.unsqueeze(1),
                 fusion_score=fusion_score.unsqueeze(1),
                 fusion_prob=fusion_prob.unsqueeze(1),
+                decision_logits=(decision_now.unsqueeze(1) if decision_now is not None else None),
             )
 
         # Shape: [B, K_text=1, T=1, Card_text]. This is the only text sampling
@@ -1672,6 +1744,13 @@ class LMGen(StreamingModule[_LMGenState]):
             ).unsqueeze(1)
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
+        if lm_model.backchannel is not None and self.fusion_gate_frames > 0:
+            spoke = ((next_text_token != lm_model.text_padding_token_id)
+                     & (next_text_token != lm_model.zero_token_id) & (next_text_token >= 0))
+            if self._frames_since_text is None:
+                self._frames_since_text = torch.full_like(next_text_token, 1_000_000)
+            self._frames_since_text = torch.where(spoke, torch.zeros_like(self._frames_since_text),
+                                                  self._frames_since_text + 1)
 
         if self.return_logits:
             sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]

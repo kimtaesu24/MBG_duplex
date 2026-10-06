@@ -510,6 +510,8 @@ class BackchannelOutput2:
     vap_agent_near: Optional[torch.Tensor] = None
     fusion_score: Optional[torch.Tensor] = None
     fusion_prob: Optional[torch.Tensor] = None
+    # [B, T] decision evidence for the EPAD fusion (only when decision_head=True).
+    decision_logits: Optional[torch.Tensor] = None
 
 
 def _load_vap_state_dict(path: str) -> dict:
@@ -585,8 +587,18 @@ class VapGPTBackchannelModule(nn.Module):
         gumbel_temp_min: float = 0.5,
         gumbel_anneal_rate: float = 0.0001,
         use_silence_ctx_proj: bool = True,
+        decision_head: bool = False,
+        decision_hidden: int = 128,
+        aux_to_trunk: str = "full",
     ):
         super().__init__()
+        if aux_to_trunk not in ("full", "detach"):
+            raise ValueError(f"aux_to_trunk must be 'full' or 'detach', got {aux_to_trunk!r}")
+        # aux_to_trunk="detach": the VAP / VAD / BC heads still learn from their own
+        # labels, but their gradients stop at the head inputs, so the shared trunk
+        # (proj_audio, ar_channel, ar, z_ctx_proj) is shaped only by the EPAD
+        # objective that reaches it through the decision head.
+        self.aux_to_trunk = aux_to_trunk
 
         self.lm_dim = lm_dim
         self.depformer_dim = depformer_dim
@@ -662,6 +674,17 @@ class VapGPTBackchannelModule(nn.Module):
         self.bc_z_head = nn.Linear(vap_dim, 3, bias=False)
         nn.init.zeros_(self.bc_z_head.weight)
 
+        # Decision head: evidence trained only through the fused EPAD text loss
+        # (no auxiliary label). Reads the cross-speaker audio state and the LM
+        # context. Last layer zero-initialised → the module starts exactly as the
+        # model without it, while the head's own weights still get gradients.
+        self.decision_head = None
+        if decision_head:
+            self.decision_head = nn.Sequential(
+                nn.Linear(2 * vap_dim, decision_hidden), nn.GELU(), nn.Linear(decision_hidden, 1))
+            nn.init.zeros_(self.decision_head[2].weight)
+            nn.init.zeros_(self.decision_head[2].bias)
+
         # ── Load pretrained VapGPT weights (GPT layers + vap_head) ───────
         if checkpoint_path is not None:
             self._load_pretrained(checkpoint_path)
@@ -726,24 +749,34 @@ class VapGPTBackchannelModule(nn.Module):
 
         out = self.ar(h_user, h_agent)  # {"x", "x1", "x2"}
 
-        # VAD: purely acoustic per-stream heads (z_s intentionally excluded —
-        # current-frame VA is solvable from audio; keeps this head untangled).
-        v1 = self.va_classifier(out["x1"])
-        v2 = self.va_classifier(out["x2"])
-        vad_logits = torch.cat((v1, v2), dim=-1)
-
         # z_s stream (head-level late fusion): shared projected LM context, added
         # as zero-init residuals so training starts at the pretrained audio-only
         # behaviour and vap/bc losses backprop into the LM backbone through z_s.
         z_ctx = self.z_ctx_norm(self.z_ctx_proj(z_s))               # [B, T, vap_dim]
 
-        vap_logits = self.vap_head(out["x"]) + self.vap_z_head(z_ctx)  # [B, T, 256]
-        bc_logits = self.bc_head(out["x"]) + self.bc_z_head(z_ctx)     # [B, T, 3]
+        # Inputs of the auxiliary (label-supervised) heads; detached when the trunk
+        # should be trained only by the EPAD objective.
+        if self.aux_to_trunk == "detach":
+            x_aux, x1_aux, x2_aux, z_aux = out["x"].detach(), out["x1"].detach(), out["x2"].detach(), z_ctx.detach()
+        else:
+            x_aux, x1_aux, x2_aux, z_aux = out["x"], out["x1"], out["x2"], z_ctx
 
+        # VAD: purely acoustic per-stream heads (z_s intentionally excluded —
+        # current-frame VA is solvable from audio; keeps this head untangled).
+        v1 = self.va_classifier(x1_aux)
+        v2 = self.va_classifier(x2_aux)
+        vad_logits = torch.cat((v1, v2), dim=-1)
 
+        vap_logits = self.vap_head(x_aux) + self.vap_z_head(z_aux)  # [B, T, 256]
+        bc_logits = self.bc_head(x_aux) + self.bc_z_head(z_aux)     # [B, T, 3]
+
+        decision_logits = None
+        if self.decision_head is not None:
+            decision_logits = self.decision_head(torch.cat((out["x"], z_ctx), dim=-1)).squeeze(-1)  # [B, T]
 
         return BackchannelOutput2(
             vap_logits=vap_logits,
             vad_logits=vad_logits,
             bc_logits=bc_logits,
+            decision_logits=decision_logits,
         )

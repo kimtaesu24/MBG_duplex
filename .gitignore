@@ -197,3 +197,4 @@ moshi-finetune/result
 
 moshi-finetune/mimi_codec_50000.pt
 moshi-finetune/mimi_stats.json
+*.ckpt
