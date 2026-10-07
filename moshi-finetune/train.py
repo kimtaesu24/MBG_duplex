@@ -49,6 +49,7 @@ from finetune.loss import (
     compute_face_loss,
     epad_confusion_counts,
     epad_metrics_from_counts,
+    turn_end_mask,
 )
 from finetune.monitoring.metrics_logger import (
     MetricsLogger,
@@ -478,6 +479,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         lm_config["backchannel_decision_head"] = args.backchannel.decision_head
         lm_config["backchannel_decision_hidden"] = args.backchannel.decision_hidden
         lm_config["backchannel_aux_to_trunk"] = args.backchannel.aux_to_trunk
+        lm_config["backchannel_fusion_gate_frames"] = args.backchannel.fusion_gate_frames
         if args.backchannel.pad_token_id is not None:
             lm_config["backchannel_pad_token_id"] = args.backchannel.pad_token_id
         if args.backchannel.epad_token_id is not None:
@@ -793,6 +795,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         }
         bc_event_loss_val = torch.tensor([0.0], device="cuda")
         silence_loss_val = torch.tensor([0.0], device="cuda")
+        turn_end_floor_val = torch.tensor([0.0], device="cuda")
+        turn_end_frac_val = torch.tensor([0.0], device="cuda")
         kd_vals = {
             name: torch.tensor([0.0], device="cuda")
             for name in ("text", "speech_activity", "turn_boundary", "hidden")
@@ -1117,6 +1121,25 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                         mb_loss = mb_loss + args.backchannel.vad_loss_weight * vad_loss
                         silence_loss_val += vad_loss.detach()  # reuse tracker; logged as vad_loss
 
+                # ── Turn-end floor: the listener may raise but not lower EPAD right after
+                # the user stops (agent silent), leaving the backbone's turn starts intact.
+                if (args.backchannel.enable and args.backchannel.turn_end_floor_weight > 0
+                        and output.fusion_residual is not None and batch.vad_targets is not None):
+                    # agent silent = no non-PAD text token in the previous gate window (6 if no gate)
+                    agent_speaking = model.fusion_speaking_mask(
+                        codes[:, 0], args.backchannel.fusion_gate_frames or 6)
+                    te_mask = turn_end_mask(
+                        batch.vad_targets.to(codes.device)[:, 0], agent_speaking,
+                        args.backchannel.turn_end_window,
+                        batch.valid_mask.to(codes.device) if batch.valid_mask is not None else None,
+                    )
+                    if te_mask.any():
+                        r_conv = output.fusion_residual[:, T_p:].float()
+                        floor_loss = torch.relu(-r_conv[te_mask]).mean()
+                        mb_loss = mb_loss + args.backchannel.turn_end_floor_weight * floor_loss
+                        turn_end_floor_val += floor_loss.detach()
+                    turn_end_frac_val += te_mask.float().mean().detach()
+
                 # ── Face motion reconstruction loss (full reference loss) ──
                 face_loss = None
                 if args.face_gen.enable:
@@ -1206,6 +1229,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 # commitment_loss_val /= args.num_microbatches
                 bc_event_loss_val /= args.num_microbatches
                 silence_loss_val /= args.num_microbatches
+                turn_end_floor_val /= args.num_microbatches
+                turn_end_frac_val /= args.num_microbatches
                 if bc_stats_accum is not None:
                     for k in bc_stats_accum:
                         bc_stats_accum[k] = bc_stats_accum[k] / args.num_microbatches
@@ -1379,6 +1404,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     )
                 if args.backchannel.vad_loss_weight > 0:
                     train_logs["vad_loss"] = avg_aggregate(silence_loss_val.item())
+                if args.backchannel.turn_end_floor_weight > 0:
+                    train_logs["turn_end_floor_loss"] = avg_aggregate(turn_end_floor_val.item())
+                    train_logs["turn_end_frame_frac"] = avg_aggregate(turn_end_frac_val.item())
             if args.face_gen.enable:
                 # Raw face-loss components make imbalance/collapse visible in W&B.
                 # avg_aggregate performs a distributed collective, so every rank

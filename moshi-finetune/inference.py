@@ -190,6 +190,7 @@ def backchannel_extension_kwargs(bc_cfg: dict) -> dict:
         "backchannel_decision_head": bool(bc_cfg.get("decision_head", False)),
         "backchannel_decision_hidden": int(bc_cfg.get("decision_hidden", 128)),
         "backchannel_aux_to_trunk": bc_cfg.get("aux_to_trunk", "full"),
+        "backchannel_fusion_gate_frames": int(bc_cfg.get("fusion_gate_frames", 0) or 0),
     }
 
 
@@ -200,7 +201,9 @@ def apply_inference_fusion_overrides(lm_gen, bc_cfg: dict) -> None:
     backchannel.infer_bias_shift:    constant added to the residual
     backchannel.infer_u_only_table:  JSON {"edges": [...], "means": [...]} of g(s); uses d - g(s), a = 1
     """
-    lm_gen.fusion_gate_frames = int(bc_cfg.get("infer_gate_frames", 0) or 0)
+    # Without infer_gate_frames, keep the trained gate (LMGen copies backchannel.fusion_gate_frames).
+    if bc_cfg.get("infer_gate_frames") is not None:
+        lm_gen.fusion_gate_frames = int(bc_cfg["infer_gate_frames"])
     lm_gen.fusion_bias_shift = float(bc_cfg.get("infer_bias_shift", 0.0) or 0.0)
     table = bc_cfg.get("infer_u_only_table")
     if table:
@@ -729,6 +732,7 @@ def run_test_inference(args):
     if not original_personaplex:
         log_fusion_state(lm)
         log("info", f"Fusion context_frames={lm_gen.bc_context_frames}")
+        apply_inference_fusion_overrides(lm_gen, config.get("backchannel", {}) or {})
     
     # Set streaming mode (critical for LMGen to work)
     mimi.streaming_forever(1)
