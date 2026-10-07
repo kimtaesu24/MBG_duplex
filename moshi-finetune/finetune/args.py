@@ -70,6 +70,14 @@ class BackchannelArgs(Serializable):
     # "full": VAP/VAD/BC losses also update the shared listener trunk (original).
     # "detach": they train only their own heads; the trunk follows the EPAD loss.
     aux_to_trunk: str = "full"
+    # > 0: no EPAD residual while the agent is mid-utterance (a non-PAD text token in
+    # the previous N frames); the same gate is applied at generation time.
+    fusion_gate_frames: int = 0
+    # Turn-end floor: hinge penalty weight * mean(relu(-residual)) on frames where the
+    # user stopped speaking within the last turn_end_window frames and the agent is
+    # silent, so the listener cannot learn to veto the backbone's own turn starts.
+    turn_end_floor_weight: float = 0.0
+    turn_end_window: int = 10
 
     # v2.1 BC target: boundary-ignore radius (frames). PAD frames within ±K of a
     # true [EPAD] token are set to ignore (-100) in the 3-class CE — onset labels
@@ -164,6 +172,10 @@ class BackchannelArgs(Serializable):
             raise ValueError("backchannel.fusion_evidence 'decision' requires backchannel.decision_head=true")
         if self.aux_to_trunk not in ("full", "detach"):
             raise ValueError(f"backchannel.aux_to_trunk must be 'full' or 'detach', got {self.aux_to_trunk!r}")
+        if self.fusion_gate_frames < 0 or self.turn_end_window < 1 or self.turn_end_floor_weight < 0:
+            raise ValueError("backchannel.fusion_gate_frames >= 0, turn_end_window >= 1, turn_end_floor_weight >= 0")
+        if self.turn_end_floor_weight > 0 and not self.fusion_trainable:
+            raise ValueError("backchannel.turn_end_floor_weight needs backchannel.fusion_trainable=true")
 
 
 @dataclass

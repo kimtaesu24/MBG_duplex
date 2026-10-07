@@ -298,6 +298,10 @@ class LMModel(StreamingContainer):
         backchannel_decision_head: bool = False,
         backchannel_decision_hidden: int = 128,
         backchannel_aux_to_trunk: str = "full",
+        # > 0: no EPAD residual on frames where the agent emitted a non-PAD text token
+        # within this many previous frames (it is mid-utterance). Applied identically in
+        # training (from the teacher-forced text stream) and in generation (LMGen).
+        backchannel_fusion_gate_frames: int = 0,
         # VapGPT-specific params (used when backchannel_module_type == "vap_gpt")
         backchannel_vap_repo_path: str = "",
         backchannel_vap_checkpoint: Optional[str] = None,
@@ -367,6 +371,7 @@ class LMModel(StreamingContainer):
             raise ValueError(f"unknown backchannel_fusion_evidence entries: {sorted(unknown)}")
         if "decision" in self.backchannel_fusion_evidence and not backchannel_decision_head:
             raise ValueError("fusion evidence 'decision' needs backchannel_decision_head=True")
+        self.backchannel_fusion_gate_frames = int(backchannel_fusion_gate_frames or 0)
         self.backchannel_fusion_calibration = bool(backchannel_fusion_calibration)
         if self.backchannel_fusion_calibration:
             self.backchannel_fusion_implicit_scale = torch.nn.Parameter(
@@ -735,6 +740,19 @@ class LMModel(StreamingContainer):
             r = r + (self.backchannel_fusion_implicit_scale.float() - 1.0) * implicit
         return r
 
+    def fusion_speaking_mask(self, text_tokens: torch.Tensor, frames: int) -> torch.Tensor:
+        """[B, T] bool: a non-PAD text token occurs in positions t-frames .. t-1.
+
+        Same rule as LMGen's frame counter (EPAD and words count as speaking; PAD and the
+        zero/ungenerated token do not), evaluated on a teacher-forced text stream.
+        """
+        spoke = ((text_tokens != self.text_padding_token_id)
+                 & (text_tokens != self.zero_token_id) & (text_tokens >= 0)).to(torch.int32)
+        T = spoke.shape[-1]
+        before = F.pad(spoke.cumsum(-1), (1, 0))[..., :T]          # tokens in 0 .. t-1
+        before_window = F.pad(before, (frames, 0))[..., :T]         # tokens in 0 .. t-frames-1
+        return (before - before_window) > 0
+
     def forward_codes(
         self,
         sequence: torch.Tensor,
@@ -1016,6 +1034,9 @@ class LMModel(StreamingContainer):
             evidences = self.fusion_evidences(bc_result.bc_logits, bc_result.vap_logits, bc_result.vad_logits)
             start_log_odds, vap_log_odds, user_quiet_log_odds = evidences["bc"], evidences["vap"], evidences["vad"]
             fusion_residual = self.fusion_residual(evidences, implicit_log_odds, bc_result.decision_logits)
+            if self.backchannel_fusion_gate_frames > 0:
+                speaking = self.fusion_speaking_mask(codes[:, 0], self.backchannel_fusion_gate_frames)
+                fusion_residual = torch.where(speaking, torch.zeros_like(fusion_residual), fusion_residual)
             text_logits[:, 0, :, self.end_of_text_padding_id] += fusion_residual
 
             if bc_stats is not None:
@@ -1381,11 +1402,12 @@ class LMGen(StreamingModule[_LMGenState]):
         # reproduce the trained model exactly; set them after construction.
         #   fusion_gate_frames > 0: add no residual while the agent emitted a non-PAD text
         #       token within the last fusion_gate_frames frames (= it is mid-utterance).
+        #       Defaults to the model's backchannel_fusion_gate_frames (the training setting).
         #   fusion_bias_shift: constant added to the residual (e.g. -log 4 undoes the
         #       EPAD 2.0 / PAD 0.5 loss weighting).
         #   fusion_u_only = (edges, means): drop the calibration term (a = 1) and subtract
         #       g(s) = means[bin of s] from the decision head output, keeping only d - g(s).
-        self.fusion_gate_frames: int = 0
+        self.fusion_gate_frames: int = int(getattr(lm_model, "backchannel_fusion_gate_frames", 0) or 0)
         self.fusion_bias_shift: float = 0.0
         self.fusion_u_only: Optional[tuple] = None
         self._frames_since_text: Optional[torch.Tensor] = None

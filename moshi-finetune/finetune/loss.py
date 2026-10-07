@@ -212,6 +212,32 @@ def epad_confusion_counts(
     return torch.stack([tp, fp, fn, tn]).float()
 
 
+def turn_end_mask(
+    user_vad: torch.Tensor,
+    agent_speaking: torch.Tensor | None,
+    window: int,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """[B, T] bool: frames right after the user stopped speaking while the agent is silent.
+
+    user_vad:       [B, T] user voice-activity target (1 active, 0 silent, <0 unknown).
+    agent_speaking: [B, T] bool, the agent emitted a non-PAD token recently (or None).
+    window:         the user must have been active in at least one of the previous
+                    `window` frames and be silent now.
+    """
+    known = user_vad >= 0
+    active = (user_vad > 0.5) & known
+    T = active.shape[-1]
+    before = F.pad(active.to(torch.int32).cumsum(-1), (1, 0))[..., :T]   # active frames in 0 .. t-1
+    recent = (before - F.pad(before, (window, 0))[..., :T]) > 0          # ... in t-window .. t-1
+    mask = known & ~active & recent
+    if agent_speaking is not None:
+        mask = mask & ~agent_speaking
+    if valid_mask is not None:
+        mask = mask & valid_mask.bool()
+    return mask
+
+
 BC_CLASS_NAMES = ("pad", "epad", "word")  # index = class id in bc_logits
 
 
